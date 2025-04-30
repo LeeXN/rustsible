@@ -1,0 +1,400 @@
+---
+# Comprehensive test playbook for Rustsible
+# Tests variable templating and all implemented modules
+
+- name: Test All Rustsible Features
+  hosts: test
+  vars:
+    # Basic variables
+    greeting: "Hello"
+    target: "World"
+    full_greeting: "{{ greeting }} {{ target }}"
+    
+    # Numeric variables
+    port: 8080
+    timeout: 30
+    retries: 3
+    
+    # Boolean variables
+    debug_enabled: true
+    cache_enabled: false
+    
+    # Nested objects
+    server:
+      hostname: "app-server"
+      ip: "192.168.1.100"
+      specs:
+        cpu: 4
+        ram: 16
+        disk: 500
+      tags:
+        - "production"
+        - "web"
+        - "secure"
+    
+    # Array/sequence of objects
+    services:
+      - name: "nginx"
+        port: 80
+        enabled: true
+        config_path: "/etc/nginx"
+      - name: "redis"
+        port: 6379
+        enabled: true
+        config_path: "/etc/redis"
+      - name: "mysql"
+        port: 3306
+        enabled: false
+        config_path: "/etc/mysql"
+    
+    # Complex nested structures
+    application:
+      name: "myapp"
+      version: "1.2.3"
+      environments:
+        dev:
+          url: "dev.example.com"
+          database:
+            host: "dev-db.example.com"
+            name: "myapp_dev"
+            user: "dev_user"
+        prod:
+            url: "prod.example.com"
+            database:
+              host: "prod-db.example.com"
+              name: "myapp_prod"
+              user: "prod_user"
+      features:
+        - name: "search"
+          enabled: true
+          config:
+            index_path: "/var/indexes"
+            cache_size: 1024
+        - name: "reporting"
+          enabled: false
+          config:
+            output_dir: "/var/reports"
+    
+    # For conditional testing
+    env_type: "production"
+    maintenance_mode: false
+    user_role: "admin"
+    
+    # Files and paths for file operations
+    base_dir: "/tmp/rustsible_test"
+    config_dir: "{{ base_dir }}/config"
+    templates_dir: "{{ base_dir }}/templates"
+    content_dir: "{{ base_dir }}/content"
+    log_dir: "{{ base_dir }}/logs"
+    config_file: "config.json"
+    log_path: "{{ log_dir }}/app.log"
+    
+    # Content for template testing
+    motd_content: "Welcome to {{ application.name }} v{{ application.version }}\nEnvironment: {{ env_type }}\nServer: {{ server.hostname }}"
+    
+    # Package management
+    packages_to_install:
+      - name: "htop"
+        state: "present"
+      - name: "vim"
+        state: "present"
+      - name: "emacs"
+        state: "absent"
+    
+    # Service configuration 
+    services_to_configure:
+      - name: "firewalld"
+        state: "stopped"
+        enabled: false
+    
+  tasks:
+    # Basic variable templating
+    - name: Display basic variable templating
+      debug:
+        msg: "{{ full_greeting }} from Rustsible!"
+    
+    # Show object properties
+    - name: Display nested object properties
+      debug:
+        msg: "Server: {{ server.hostname }} ({{ server.ip }}) with {{ server.specs.cpu }} CPUs and {{ server.specs.ram }}GB RAM"
+    
+    # Direct variable display
+    - name: Display server variable directly
+      debug:
+        var: server
+    
+    # Array/sequence access
+    - name: Display array element
+      debug:
+        msg: "First service: {{ services[0].name }} running on port {{ services[0].port }}"
+    
+    # Complex nested access
+    - name: Display complex nested variable
+      debug:
+        msg: "{{ application.name }} v{{ application.version }} in production: {{ application.environments.prod.url }} using database {{ application.environments.prod.database.name }}"
+    
+    # Looping over arrays
+    - name: List all services
+      debug:
+        msg: "Service: {{ item.name }} on port {{ item.port }} ({% if item.enabled %}enabled{% else %}disabled{% endif %})"
+      with_items: "{{ services }}"
+    
+    # Conditional expressions in templates
+    - name: Test conditional expressions in templates
+      debug:
+        msg: "Environment is {% if env_type == 'production' %}PRODUCTION{% else %}DEVELOPMENT{% endif %}"
+    
+    # Nested loop variable access
+    - name: Show application features
+      debug:
+        msg: "Feature: {{ item.name }} is {% if item.enabled %}enabled{% else %}disabled{% endif %} with {{ item.config | length }} config options"
+      with_items: "{{ application.features }}"
+    
+    # Loop with conditional
+    - name: Show only enabled services
+      debug:
+        msg: "Enabled service: {{ item.name }} on port {{ item.port }}"
+      with_items: "{{ services }}"
+      when: "item.enabled"
+      ignore_errors: true
+    
+    # Nested with complex condition
+    - name: Complex condition in loop
+      debug:
+        msg: "{{ item.name }} needs attention: {{ item.port < 1000 }}"
+      with_items: "{{ services }}"
+      when: "item.port < 1000 and item.enabled == true"
+    
+    # String concatenation and templating
+    - name: Test string concatenation
+      debug:
+        msg: "Path: {{ base_dir }}/{{ application.name }}-{{ application.version }}/config"
+    
+    # Shell module tests
+    - name: Create base directory using shell module
+      shell: "mkdir -p {{ base_dir }}"
+    
+    - name: Echo complex variable with shell
+      shell: "echo 'App: {{ application.name }} v{{ application.version }}'"
+      register: echo_result
+    
+    - name: Show registered variable from command
+      debug:
+        var: echo_result
+    
+    # Command module test with actual command
+    - name: Test command module
+      command: "ls -la {{ base_dir }}"
+      register: ls_result
+    
+    - name: Show command result
+      debug:
+        var: ls_result
+    
+    # Create a file to test file operations
+    - name: Create test configuration file
+      shell: "echo '{\"app\": \"{{ application.name }}\", \"version\": \"{{ application.version }}\"}' > {{ base_dir }}/{{ config_file }}"
+    
+    # Test shell module with loop
+    - name: Create subdirectories for each service
+      shell: "mkdir -p {{ base_dir }}/{{ item.name }}"
+      with_items: "{{ services }}"
+      when: "item.enabled == true"
+    
+    # File module test - create directory structure
+    - name: Create directory structure for testing
+      file:
+        path: "{{ item }}"
+        state: directory
+        mode: '0755'
+      with_items:
+        - "{{ config_dir }}"
+        - "{{ templates_dir }}"
+        - "{{ content_dir }}"
+        - "{{ log_dir }}"
+    
+    # File module test - create empty file
+    - name: Create empty log file
+      file:
+        path: "{{ log_path }}"
+        state: touch
+        mode: '0644'
+    
+    # File module test - create directory with templated path
+    - name: Create directory for environment-specific config
+      file:
+        path: "{{ config_dir }}/{{ env_type }}"
+        state: directory
+        mode: '0750'
+    
+    # File module test - create symbolic link with templated path
+    - name: Create symbolic link to environment config
+      file:
+        src: "{{ config_dir }}/{{ env_type }}"
+        dest: "{{ base_dir }}/current_env"
+        state: link
+    
+    # File module test - with complex templating in loop
+    - name: Create service directories with complex permissions
+      file:
+        path: "{{ config_dir }}/{{ item.name }}"
+        state: directory
+        mode: "{{ '0700' if item.port < 1000 else '0755' }}"
+      with_items: "{{ services }}"
+      when: "item.enabled == true"
+    
+    # Copy module test - basic copy
+    - name: Copy configuration file to config directory
+      copy:
+        src: "{{ base_dir }}/{{ config_file }}"
+        dest: "{{ config_dir }}/{{ config_file }}"
+        mode: '0644'
+        backup: true
+    
+    # Copy module test - with content
+    - name: Create readme file with inline content
+      copy:
+        content: |
+          # {{ application.name }} Configuration
+          
+          Version: {{ application.version }}
+          Environment: {{ env_type }}
+          
+          This directory contains configuration files for {{ application.name }}.
+          Generated by Rustsible on {{ ansible_date_time.date }}.
+        dest: "{{ config_dir }}/README.md"
+        mode: '0644'
+    
+    # Copy module test - with loop
+    - name: Create configuration files for each service
+      copy:
+        content: |
+          # {{ item.name }} Configuration
+          
+          Port: {{ item.port }}
+          Enabled: {{ item.enabled }}
+          
+          This is a sample configuration for {{ item.name }}.
+        dest: "{{ config_dir }}/{{ item.name }}/config.txt"
+        mode: '0644'
+      with_items: "{{ services }}"
+      when: "item.enabled == true"
+    
+    # Template module test - basic template
+    #- name: Create motd file from template
+    #  template:
+    #    src: "templates/motd.j2"
+    #    dest: "{{ config_dir }}/motd"
+    #    mode: '0644'
+    #  vars:
+    #    template_content: "{{ motd_content }}"
+    
+    # Template module test - inline template
+    #- name: Create environment info file from inline template
+    #  template:
+    #    content: |
+    #      # Environment: {{ env_type }}
+    #      
+    #      Database host: {{ application.environments[env_type].database.host }}
+    #      Database name: {{ application.environments[env_type].database.name }}
+    #      
+    #      Application version: {{ application.version }}
+    #      Maintenance mode: {{ 'ENABLED' if maintenance_mode else 'DISABLED' }}
+    #    dest: "{{ config_dir }}/env_info.txt"
+    #    mode: '0644'
+    
+    ## Template module test - with loop
+    #- name: Create service config files from template
+    #  template:
+    #    content: |
+    #      # {{ item.name | upper }} Configuration
+    #      
+    #      [service]
+    #      name={{ item.name }}
+    #      port={{ item.port }}
+    #      
+    #      [paths]
+    #      config_path={{ item.config_path }}
+    #      log_path=/var/log/{{ item.name }}
+    #      
+    #      [status]
+    #      enabled={{ item.enabled | lower }}
+    #      environment={{ env_type }}
+    #    dest: "{{ config_dir }}/{{ item.name }}/{{ item.name }}.conf"
+    #    mode: '0644'
+    #  with_items: "{{ services }}"
+    #  when: "item.enabled == true"
+    
+    # Package module test - basic install
+    - name: Install basic packages
+      package:
+        name: htop
+        state: present
+      when: "env_type == 'production'"
+    
+    # Package module test - with loop
+    - name: Manage packages with loop
+      package:
+        name: "{{ item.name }}"
+        state: "{{ item.state }}"
+      with_items: "{{ packages_to_install }}"
+    
+    # Service module test - basic service
+    - name: Ensure nginx service is running
+      service:
+        name: nginx
+        state: started
+        enabled: true
+      when: "env_type == 'production'"
+    
+    # Service module test - with loop
+    - name: Configure services with loop
+      service:
+        name: "{{ item.name }}"
+        state: "{{ item.state }}"
+        enabled: "{{ item.enabled }}"
+      with_items: "{{ services_to_configure }}"
+    
+    # Complex variable in command
+    - name: Complex command with nested variables
+      shell: "echo 'Database host for {{ env_type }}: {{ application.environments[env_type].database.host }}'"
+      register: db_echo
+    
+    - name: Show result of complex command
+      debug:
+        var: db_echo
+    
+    # Conditional task execution
+    - name: Task that runs only in production
+      debug:
+        msg: "This is a production-only message"
+      when: "env_type == 'production'"
+    
+    # Conditional with multiple conditions
+    - name: Conditional with AND logic
+      debug:
+        msg: "Admin user in production environment"
+      when: "env_type == 'production' and user_role == 'admin'"
+    
+    # Test variable as loop source
+    - name: Loop over server tags
+      debug:
+        msg: "Server tag: {{ item }}"
+      with_items: "{{ server.tags }}"
+    
+    # Filename with template variable
+    - name: Create file with template in name
+      shell: "touch {{ base_dir }}/config-{{ env_type }}.conf"
+    
+    # Final report with complex templating
+    - name: Generate system report with complex templating
+      debug:
+        msg: |
+          === System Report ===
+          App: {{ application.name }} v{{ application.version }}
+          Environment: {{ env_type }}
+          Server: {{ server.hostname }} ({{ server.ip }})
+          Resources: {{ server.specs.cpu }} CPUs, {{ server.specs.ram }}GB RAM
+          Enabled Services: {{ services | selectattr('enabled', 'equalto', true) | map(attribute='name') | join(', ') }}
+          Features: {{ application.features | length }} configured
+          ----------------------------- 
