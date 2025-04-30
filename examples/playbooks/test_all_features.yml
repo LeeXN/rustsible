@@ -1,0 +1,382 @@
+---
+# Comprehensive test playbook for Rustsible
+# Tests variable templating and all implemented modules
+
+- name: Rustsible Advanced Features Showcase
+  hosts: all
+  become: true
+  vars:
+    app_name: "RustsibleDemo"
+    app_version: "1.0.0"
+    app_environment: "production"
+    base_dir: /opt/rustsible_demo
+    config_dir: "{{ base_dir }}/config"
+    log_dir: "{{ base_dir }}/logs"
+    data_dir: "{{ base_dir }}/data"
+    app_user: rustsible_app
+    app_group: rustsible_app
+    
+    # Complex nested data structures
+    application:
+      name: "{{ app_name }}"
+      version: "{{ app_version }}"
+      environment: "{{ app_environment }}"
+      features:
+        - name: "Authentication"
+          enabled: true
+          config:
+            method: "oauth2"
+            timeout: 300
+        - name: "Logging"
+          enabled: true
+          config:
+            level: "INFO"
+            rotation: "daily"
+        - name: "Monitoring"
+          enabled: false
+          config:
+            endpoint: "http://monitoring.example.com"
+    
+    server:
+      hostname: "{{ ansible_hostname | default('localhost') }}"
+      ip_address: "{{ ansible_default_ipv4.address | default('127.0.0.1') }}"
+      memory_gb: 4
+      cpu_cores: 2
+    
+    databases:
+      - name: "primary"
+        type: "postgresql"
+        host: "db1.example.com"
+        port: 5432
+        ssl: true
+      - name: "cache"
+        type: "redis"
+        host: "cache1.example.com"
+        port: 6379
+        ssl: false
+    
+    # Package lists for different environments
+    packages_by_env:
+      development:
+        - git
+        - vim
+        - htop
+        - curl
+        - wget
+      production:
+        - curl
+        - wget
+        - htop
+      testing:
+        - git
+        - vim
+        - curl
+        - wget
+        - htop
+        - tree
+  
+  tasks:
+    # Conditional execution and facts gathering
+    - name: Display system information
+      debug:
+        msg: |
+          System Information:
+          - Hostname: {{ server.hostname }}
+          - IP Address: {{ server.ip_address }}
+          - OS Family: {{ ansible_os_family | default('Unknown') }}
+          - Architecture: {{ ansible_architecture | default('Unknown') }}
+          - Python Version: {{ ansible_python_version | default('Unknown') }}
+    
+    # User and group management
+    - name: Create application group
+      group:
+        name: "{{ app_group }}"
+        state: present
+      ignore_errors: true
+    
+    - name: Create application user
+      user:
+        name: "{{ app_user }}"
+        group: "{{ app_group }}"
+        system: true
+        shell: /bin/bash
+        home: "{{ base_dir }}"
+        create_home: true
+        comment: "{{ app_name }} Application User"
+        state: present
+    
+    # Directory structure creation with loops
+    - name: Create application directories
+      file:
+        path: "{{ item }}"
+        state: directory
+        owner: "{{ app_user }}"
+        group: "{{ app_group }}"
+        mode: "0755"
+      loop:
+        - "{{ base_dir }}"
+        - "{{ config_dir }}"
+        - "{{ log_dir }}"
+        - "{{ data_dir }}"
+        - "{{ base_dir }}/bin"
+        - "{{ base_dir }}/lib"
+        - "{{ base_dir }}/tmp"
+    
+    # Template rendering with complex variables
+    - name: Generate main configuration file
+      template:
+        content: |
+          # {{ app_name }} Configuration
+          # Generated on {{ ansible_date_time.iso8601 }}
+          # Environment: {{ application.environment }}
+          
+          [application]
+          name = {{ application.name }}
+          version = {{ application.version }}
+          environment = {{ application.environment }}
+          
+          [server]
+          hostname = {{ server.hostname }}
+          ip_address = {{ server.ip_address }}
+          memory_gb = {{ server.memory_gb }}
+          cpu_cores = {{ server.cpu_cores }}
+          
+          [directories]
+          base = {{ base_dir }}
+          config = {{ config_dir }}
+          logs = {{ log_dir }}
+          data = {{ data_dir }}
+          
+          {% for feature in application.features %}
+          [feature.{{ feature.name | lower }}]
+          enabled = {{ feature.enabled | lower }}
+          {% if feature.config %}
+          {% for key, value in feature.config.items() %}
+          {{ key }} = {{ value }}
+          {% endfor %}
+          {% endif %}
+          
+          {% endfor %}
+          {% for db in databases %}
+          [database.{{ db.name }}]
+          type = {{ db.type }}
+          host = {{ db.host }}
+          port = {{ db.port }}
+          ssl = {{ db.ssl | lower }}
+          
+          {% endfor %}
+        dest: "{{ config_dir }}/{{ app_name | lower }}.conf"
+        owner: "{{ app_user }}"
+        group: "{{ app_group }}"
+        mode: "0640"
+    
+    # Line file management with conditions
+    - name: Configure environment-specific settings
+      lineinfile:
+        path: "{{ config_dir }}/{{ app_name | lower }}.conf"
+        regexp: "^debug_mode ="
+        line: "debug_mode = {{ 'true' if application.environment != 'production' else 'false' }}"
+        insertafter: "^environment ="
+        backup: true
+    
+    - name: Add log level based on environment
+      lineinfile:
+        path: "{{ config_dir }}/{{ app_name | lower }}.conf"
+        regexp: "^log_level ="
+        line: "log_level = {{ 'DEBUG' if application.environment == 'development' else 'INFO' }}"
+        insertafter: "^debug_mode ="
+    
+    # Package management with conditional installation
+    - name: Install environment-specific packages
+      package:
+        name: "{{ packages_by_env[application.environment] | default(packages_by_env.production) }}"
+        state: present
+      ignore_errors: true
+    
+    # File copying with conditional content
+    - name: Create environment-specific script
+      copy:
+        content: |
+          #!/bin/bash
+          # {{ app_name }} startup script
+          # Environment: {{ application.environment }}
+          
+          APP_USER="{{ app_user }}"
+          APP_DIR="{{ base_dir }}"
+          CONFIG_FILE="{{ config_dir }}/{{ app_name | lower }}.conf"
+          LOG_DIR="{{ log_dir }}"
+          
+          {% if application.environment == 'development' %}
+          # Development environment settings
+          export DEBUG=1
+          export LOG_LEVEL=DEBUG
+          {% elif application.environment == 'production' %}
+          # Production environment settings
+          export DEBUG=0
+          export LOG_LEVEL=INFO
+          ulimit -n 4096
+          {% endif %}
+          
+          echo "Starting {{ app_name }} v{{ application.version }}"
+          echo "Environment: {{ application.environment }}"
+          echo "User: $APP_USER"
+          echo "Directory: $APP_DIR"
+          echo "Config: $CONFIG_FILE"
+          
+          # Create log file if not exists
+          touch "$LOG_DIR/{{ app_name | lower }}.log"
+          chown "$APP_USER:{{ app_group }}" "$LOG_DIR/{{ app_name | lower }}.log"
+          
+          echo "$(date): {{ app_name }} startup script executed" >> "$LOG_DIR/{{ app_name | lower }}.log"
+        dest: "{{ base_dir }}/bin/start.sh"
+        owner: "{{ app_user }}"
+        group: "{{ app_group }}"
+        mode: "0755"
+    
+    # Complex loops with nested data
+    - name: Create feature-specific configuration files
+      copy:
+        content: |
+          # Feature: {{ item.name }}
+          # Enabled: {{ item.enabled }}
+          
+          {% if item.enabled and item.config %}
+          {% for key, value in item.config.items() %}
+          {{ key }}={{ value }}
+          {% endfor %}
+          {% else %}
+          # Feature disabled
+          {% endif %}
+        dest: "{{ config_dir }}/feature_{{ item.name | lower }}.conf"
+        owner: "{{ app_user }}"
+        group: "{{ app_group }}"
+        mode: "0644"
+      loop: "{{ application.features }}"
+      when: item.name is defined
+    
+    # Database connection testing with loops and conditions
+    - name: Test database connectivity
+      command: timeout 5 bash -c "</dev/tcp/{{ item.host }}/{{ item.port }}"
+      register: db_connectivity
+      ignore_errors: true
+      loop: "{{ databases }}"
+      when: item.type is defined
+    
+    - name: Report database connectivity
+      debug:
+        msg: "Database {{ item.item.name }} ({{ item.item.host }}:{{ item.item.port }}): {{ 'Connected' if item.rc == 0 else 'Failed' }}"
+      loop: "{{ db_connectivity.results }}"
+      when: db_connectivity.results is defined and item.item is defined
+    
+    # Service management with conditions
+    - name: Start application service (simulation)
+      service:
+        name: "{{ app_name | lower }}"
+        state: started
+        enabled: true
+      register: service_result
+      ignore_errors: true
+      when: false  # Set to true to actually try starting a service
+    
+    # File permission and ownership management
+    - name: Set proper permissions on application files
+      file:
+        path: "{{ item.path }}"
+        owner: "{{ app_user }}"
+        group: "{{ app_group }}"
+        mode: "{{ item.mode }}"
+        recurse: "{{ item.recurse | default(false) }}"
+      loop:
+        - { path: "{{ base_dir }}", mode: "0755", recurse: true }
+        - { path: "{{ config_dir }}", mode: "0750" }
+        - { path: "{{ log_dir }}", mode: "0750" }
+        - { path: "{{ data_dir }}", mode: "0750" }
+        - { path: "{{ base_dir }}/bin/start.sh", mode: "0755" }
+    
+    # Log file creation and management
+    - name: Initialize log files
+      copy:
+        content: |
+          # {{ app_name }} Log File
+          # Created: {{ ansible_date_time.iso8601 }}
+          # Environment: {{ application.environment }}
+          
+          {{ ansible_date_time.iso8601 }} [INFO] Application {{ app_name }} v{{ application.version }} initialized
+          {{ ansible_date_time.iso8601 }} [INFO] Environment: {{ application.environment }}
+          {{ ansible_date_time.iso8601 }} [INFO] Server: {{ server.hostname }} ({{ server.ip_address }})
+        dest: "{{ log_dir }}/{{ item }}"
+        owner: "{{ app_user }}"
+        group: "{{ app_group }}"
+        mode: "0644"
+        force: false
+      loop:
+        - "{{ app_name | lower }}.log"
+        - "error.log"
+        - "access.log"
+    
+    # Validation and testing
+    - name: Validate configuration file syntax
+      command: "grep -E '^[[:space:]]*[^#]' {{ config_dir }}/{{ app_name | lower }}.conf"
+      register: config_validation
+      ignore_errors: true
+    
+    - name: Show configuration validation
+      debug:
+        msg: "Configuration file has {{ config_validation.stdout_lines | length }} non-comment lines"
+    
+    - name: Test startup script
+      command: "{{ base_dir }}/bin/start.sh"
+      register: startup_test
+      become_user: "{{ app_user }}"
+      ignore_errors: true
+    
+    - name: Show startup test result
+      debug:
+        var: startup_test.stdout_lines
+    
+    # Cleanup section (optional)
+    - name: Cleanup demo files
+      file:
+        path: "{{ base_dir }}"
+        state: absent
+      when: false  # Set to true to enable cleanup
+    
+    - name: Remove demo user
+      user:
+        name: "{{ app_user }}"
+        state: absent
+        remove: true
+      when: false  # Set to true to enable cleanup
+    
+    # Final status report
+    - name: Generate final report
+      debug:
+        msg: |
+          🎉 Rustsible Advanced Features Showcase Complete!
+          
+          ✅ Features Demonstrated:
+          - Complex variable structures and nested data
+          - Conditional execution with when statements
+          - Template rendering with Tera engine
+          - Loop execution with complex data structures
+          - User and group management
+          - File and directory operations
+          - Package management
+          - Service management simulation
+          - Line file management
+          - Permission and ownership control
+          - Log file initialization
+          - Configuration validation
+          
+          📁 Created Structure:
+          - Base Directory: {{ base_dir }}
+          - Configuration: {{ config_dir }}
+          - Logs: {{ log_dir }}
+          - Data: {{ data_dir }}
+          - Application User: {{ app_user }}
+          
+          🔧 Environment: {{ application.environment }}
+          📦 Application: {{ app_name }} v{{ application.version }}
+          🖥️  Server: {{ server.hostname }} ({{ server.ip_address }})
+          
+          Check the created files and directories to see all features in action!

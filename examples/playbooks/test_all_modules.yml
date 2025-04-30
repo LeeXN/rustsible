@@ -1,0 +1,198 @@
+---
+- name: Test All Rustsible Modules
+  hosts: all
+  become: true
+  vars:
+    test_dir: /tmp/rustsible_test_all
+    test_user: testuser456
+    config_file: "{{ test_dir }}/app.conf"
+    template_vars:
+      app_name: "MyTestApp"
+      version: "2.0.0"
+      environment: "testing"
+  
+  tasks:
+    # File module tests
+    - name: Create test directory
+      file:
+        path: "{{ test_dir }}"
+        state: directory
+        mode: "0755"
+    
+    - name: Create test file
+      file:
+        path: "{{ test_dir }}/testfile.txt"
+        state: touch
+        mode: "0644"
+    
+    # Copy module test
+    - name: Copy configuration template
+      copy:
+        content: |
+          # Application Configuration
+          app_name=placeholder
+          version=placeholder
+          environment=placeholder
+          
+          # Server settings
+          host=0.0.0.0
+          port=8080
+          
+          # Database settings
+          db_host=localhost
+          db_port=5432
+        dest: "{{ config_file }}"
+        mode: "0644"
+    
+    # Lineinfile module tests
+    - name: Update app name in config
+      lineinfile:
+        path: "{{ config_file }}"
+        regexp: "^app_name="
+        line: "app_name={{ template_vars.app_name }}"
+        backup: true
+    
+    - name: Update version in config
+      lineinfile:
+        path: "{{ config_file }}"
+        regexp: "^version="
+        line: "version={{ template_vars.version }}"
+    
+    - name: Update environment in config
+      lineinfile:
+        path: "{{ config_file }}"
+        regexp: "^environment="
+        line: "environment={{ template_vars.environment }}"
+    
+    - name: Add logging configuration
+      lineinfile:
+        path: "{{ config_file }}"
+        line: "log_level=DEBUG"
+        insertafter: "^environment="
+    
+    - name: Add security settings section
+      lineinfile:
+        path: "{{ config_file }}"
+        line: |
+          
+          # Security settings
+          ssl_enabled=true
+          ssl_cert=/etc/ssl/certs/app.crt
+        insertbefore: "EOF"
+    
+    # Template module test
+    - name: Create template file
+      template:
+        content: |
+          #!/bin/bash
+          # Generated script for {{ template_vars.app_name }}
+          # Version: {{ template_vars.version }}
+          # Environment: {{ template_vars.environment }}
+          
+          APP_NAME="{{ template_vars.app_name }}"
+          VERSION="{{ template_vars.version }}"
+          ENV="{{ template_vars.environment }}"
+          
+          echo "Starting $APP_NAME version $VERSION in $ENV environment"
+          echo "Configuration file: {{ config_file }}"
+          echo "Script generated at: $(date)"
+        dest: "{{ test_dir }}/start_app.sh"
+        mode: "0755"
+    
+    # User module tests
+    - name: Create test user
+      user:
+        name: "{{ test_user }}"
+        comment: "Test user for Rustsible modules demo"
+        shell: /bin/bash
+        create_home: true
+        state: present
+    
+    - name: Add user to additional groups
+      user:
+        name: "{{ test_user }}"
+        groups: ["users"]
+        append: true
+        state: present
+      ignore_errors: true  # Some groups might not exist
+    
+    # Command and Debug module tests
+    - name: Show final configuration
+      command: cat {{ config_file }}
+      register: final_config
+    
+    - name: Display configuration content
+      debug:
+        msg: "Configuration file content:"
+    
+    - name: Show config lines
+      debug:
+        var: final_config.stdout_lines
+    
+    - name: Execute generated script
+      command: bash {{ test_dir }}/start_app.sh
+      register: script_output
+    
+    - name: Show script output
+      debug:
+        var: script_output.stdout_lines
+    
+    - name: Check user creation
+      command: id {{ test_user }}
+      register: user_check
+    
+    - name: Display user info
+      debug:
+        var: user_check.stdout
+    
+    # Service module test (if available)
+    - name: Check if systemd is available
+      command: systemctl --version
+      register: systemctl_check
+      ignore_errors: true
+    
+    - name: Show systemd status (if available)
+      debug:
+        msg: "Systemd is available"
+      when: systemctl_check.rc == 0
+    
+    # Package module test (basic check)
+    - name: Check package manager
+      command: which yum || which apt || which dnf || which zypper
+      register: pkg_manager
+      ignore_errors: true
+    
+    - name: Show package manager
+      debug:
+        var: pkg_manager.stdout
+      when: pkg_manager.rc == 0
+    
+    # Cleanup section (optional)
+    - name: Cleanup test user
+      user:
+        name: "{{ test_user }}"
+        state: absent
+        remove: true
+      when: false  # Set to true to enable cleanup
+    
+    - name: Cleanup test directory
+      file:
+        path: "{{ test_dir }}"
+        state: absent
+      when: false  # Set to true to enable cleanup
+    
+    - name: Test completion message
+      debug:
+        msg: |
+          ✅ Rustsible modules test completed successfully!
+          
+          Tested modules:
+          - ✅ file: Created directory and files
+          - ✅ copy: Copied configuration content
+          - ✅ lineinfile: Modified configuration lines
+          - ✅ template: Generated script from template
+          - ✅ user: Created and managed user account
+          - ✅ command: Executed system commands
+          - ✅ debug: Displayed information
+          
+          Check the files in {{ test_dir }} for results. 

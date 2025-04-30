@@ -1,0 +1,48 @@
+---
+- name: Test Lineinfile Module
+  hosts: all
+  become: true
+  vars:
+    config_file: /tmp/test_config.conf
+    backup_enabled: true
+  
+  tasks:
+    - name: Create test configuration file
+      lineinfile:
+        path: "{{ config_file }}"
+        line: "# Test configuration file"
+        create: true
+        mode: "0644"
+    
+    - name: Add server configuration
+      lineinfile:
+        path: "{{ config_file }}"
+        line: "server_name={{ ansible_hostname | default('localhost') }}"
+        regexp: "^server_name="
+        backup: "{{ backup_enabled }}"
+    
+    - name: Add port configuration
+      lineinfile:
+        path: "{{ config_file }}"
+        line: "port=8080"
+        insertafter: "^server_name="
+    
+    - name: Add debug mode configuration
+      lineinfile:
+        path: "{{ config_file }}"
+        line: "debug=true"
+        insertbefore: "EOF"
+    
+    - name: Remove old legacy setting
+      lineinfile:
+        path: "{{ config_file }}"
+        regexp: "^legacy_option="
+        state: absent
+    
+    - name: Display final configuration
+      command: cat {{ config_file }}
+      register: config_content
+    
+    - name: Show configuration content
+      debug:
+        var: config_content.stdout_lines 

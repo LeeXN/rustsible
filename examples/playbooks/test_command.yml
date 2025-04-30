@@ -1,0 +1,94 @@
+---
+- name: Test Command Module
+  hosts: all
+  become: false
+  vars:
+    test_dir: /tmp/command_test
+  
+  tasks:
+    - name: Basic command execution
+      command: whoami
+      register: current_user
+    
+    - name: Show current user
+      debug:
+        msg: "Current user: {{ current_user.stdout }}"
+    
+    - name: Check system information
+      command: uname -a
+      register: system_info
+    
+    - name: Display system information
+      debug:
+        var: system_info.stdout
+    
+    - name: Create test directory
+      command: mkdir -p {{ test_dir }}
+    
+    - name: List directory contents
+      command: ls -la {{ test_dir }}
+      register: dir_contents
+    
+    - name: Show directory contents
+      debug:
+        var: dir_contents.stdout_lines
+    
+    - name: Create test files
+      command: touch {{ test_dir }}/file{{ item }}.txt
+      loop: [1, 2, 3]
+    
+    - name: Count files in directory
+      command: find {{ test_dir }} -type f -name "*.txt"
+      register: txt_files
+    
+    - name: Show created files
+      debug:
+        msg: "Created files:"
+    
+    - name: List each file
+      debug:
+        msg: "{{ item }}"
+      loop: "{{ txt_files.stdout_lines | default([]) }}"
+    
+    - name: Check disk usage
+      command: df -h
+      register: disk_usage
+    
+    - name: Display disk usage
+      debug:
+        var: disk_usage.stdout_lines
+    
+    - name: Check memory usage
+      command: free -h
+      register: memory_usage
+    
+    - name: Display memory usage
+      debug:
+        var: memory_usage.stdout_lines
+    
+    - name: Get current date and time
+      command: date
+      register: current_datetime
+    
+    - name: Show current date and time
+      debug:
+        msg: "Current date and time: {{ current_datetime.stdout }}"
+    
+    - name: Check if a specific command exists
+      command: which git
+      register: git_check
+      ignore_errors: true
+    
+    - name: Show git availability
+      debug:
+        msg: "Git is available at: {{ git_check.stdout }}"
+      when: git_check.rc == 0
+    
+    - name: Show git not available
+      debug:
+        msg: "Git is not installed or not in PATH"
+      when: git_check.rc != 0
+    
+    - name: Cleanup test directory
+      command: rm -rf {{ test_dir }}
+      ignore_errors: true 

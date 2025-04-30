@@ -1,0 +1,23 @@
+# {{ application.name | upper }} Message of the Day
+# ================================================
+
+{{ motd_content }}
+
+Server Information:
+------------------
+Hostname: {{ server.hostname }}
+IP Address: {{ server.ip }}
+CPU Cores: {{ server.specs.cpu }}
+RAM: {{ server.specs.ram }}GB
+
+Environment: {{ env_type | upper }}
+Version: {{ application.version }}
+
+Enabled Services:
+{% for service in services %}
+{% if service.enabled %}
+- {{ service.name }} (port {{ service.port }})
+{% endif %}
+{% endfor %}
+
+Last Updated: {{ ansible_date_time.date }} {{ ansible_date_time.time }} 

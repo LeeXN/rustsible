@@ -1,0 +1,144 @@
+---
+- name: Test Service Module
+  hosts: all
+  become: true
+  vars:
+    test_services: 
+      - name: cron
+        should_be_running: true
+      - name: ssh
+        should_be_running: true
+  
+  tasks:
+    - name: Check if systemd is available
+      command: systemctl --version
+      register: systemd_check
+      ignore_errors: true
+    
+    - name: Show systemd availability
+      debug:
+        msg: "Systemd is available"
+      when: systemd_check.rc == 0
+    
+    - name: Show alternative service manager
+      debug:
+        msg: "Systemd not available, using alternative service manager"
+      when: systemd_check.rc != 0
+    
+    # Test with a common service that should exist
+    - name: Check SSH service status
+      service:
+        name: ssh
+        state: started
+      register: ssh_result
+      ignore_errors: true
+    
+    - name: Show SSH service result
+      debug:
+        var: ssh_result
+      when: ssh_result is defined
+    
+    - name: Try alternative SSH service name
+      service:
+        name: sshd
+        state: started
+      register: sshd_result
+      ignore_errors: true
+      when: ssh_result is failed
+    
+    - name: Show SSHD service result
+      debug:
+        var: sshd_result
+      when: sshd_result is defined and ssh_result is failed
+    
+    # Test with cron service
+    - name: Ensure cron service is running
+      service:
+        name: cron
+        state: started
+        enabled: true
+      register: cron_result
+      ignore_errors: true
+    
+    - name: Show cron service result
+      debug:
+        var: cron_result
+      when: cron_result is defined
+    
+    - name: Try alternative cron service name
+      service:
+        name: crond
+        state: started
+        enabled: true
+      register: crond_result
+      ignore_errors: true
+      when: cron_result is failed
+    
+    - name: Show crond service result
+      debug:
+        var: crond_result
+      when: crond_result is defined and cron_result is failed
+    
+    # List all services (if systemd is available)
+    - name: List all systemd services
+      command: systemctl list-units --type=service --state=active --no-pager
+      register: active_services
+      ignore_errors: true
+      when: systemd_check.rc == 0
+    
+    - name: Show active services count
+      debug:
+        msg: "Found {{ active_services.stdout_lines | length }} active services"
+      when: systemd_check.rc == 0 and active_services.stdout_lines is defined
+    
+    - name: Show first 10 active services
+      debug:
+        msg: "{{ item }}"
+      loop: "{{ active_services.stdout_lines[:10] }}"
+      when: systemd_check.rc == 0 and active_services.stdout_lines is defined
+    
+    # Test service restart (be careful with this)
+    - name: Test service restart with a safe service
+      service:
+        name: "{{ item.name }}"
+        state: restarted
+      loop: "{{ test_services }}"
+      register: restart_results
+      ignore_errors: true
+      when: item.should_be_running
+    
+    - name: Show restart results
+      debug:
+        msg: "Service {{ item.item.name }}: {{ 'Success' if item.rc == 0 else 'Failed' }}"
+      loop: "{{ restart_results.results }}"
+      when: restart_results is defined and item.item is defined
+    
+    # Check service status
+    - name: Check service status
+      command: systemctl is-active {{ item.name }}
+      loop: "{{ test_services }}"
+      register: service_status
+      ignore_errors: true
+      when: systemd_check.rc == 0
+    
+    - name: Show service status
+      debug:
+        msg: "Service {{ item.item.name }} status: {{ item.stdout }}"
+      loop: "{{ service_status.results }}"
+      when: systemd_check.rc == 0 and service_status is defined and item.item is defined
+    
+    # Test enabling/disabling services
+    - name: Test enabling services
+      service:
+        name: "{{ item.name }}"
+        enabled: true
+      loop: "{{ test_services }}"
+      register: enable_results
+      ignore_errors: true
+      when: item.should_be_running
+    
+    - name: Show enable results
+      debug:
+        msg: "Service {{ item.item.name }} enable: {{ 'Success' if item.rc == 0 else 'Failed' }}"
+      loop: "{{ enable_results.results }}"
+      when: enable_results is defined and item.item is defined 

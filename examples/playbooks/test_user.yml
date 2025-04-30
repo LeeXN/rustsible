@@ -1,0 +1,64 @@
+---
+- name: Test User Module
+  hosts: all
+  become: true
+  vars:
+    test_user: testuser123
+    test_groups: ["wheel", "developers"]
+    user_home: /home/{{ test_user }}
+  
+  tasks:
+    - name: Create test user
+      user:
+        name: "{{ test_user }}"
+        comment: "Test user created by Rustsible"
+        shell: /bin/bash
+        home: "{{ user_home }}"
+        create_home: true
+        groups: "{{ test_groups }}"
+        append: true
+        state: present
+    
+    - name: Verify user was created
+      command: id {{ test_user }}
+      register: user_info
+    
+    - name: Show user information
+      debug:
+        var: user_info.stdout
+    
+    - name: Check user home directory
+      command: ls -la {{ user_home }}
+      register: home_content
+      ignore_errors: true
+    
+    - name: Show home directory content
+      debug:
+        var: home_content.stdout_lines
+      when: home_content.rc == 0
+    
+    - name: Modify user shell
+      user:
+        name: "{{ test_user }}"
+        shell: /bin/zsh
+        state: present
+      ignore_errors: true  # zsh might not be installed
+    
+    - name: Create system user example
+      user:
+        name: sysuser123
+        system: true
+        shell: /bin/false
+        create_home: false
+        comment: "System user for testing"
+        state: present
+    
+    - name: Remove test users (cleanup)
+      user:
+        name: "{{ item }}"
+        state: absent
+        remove: true
+      loop:
+        - "{{ test_user }}"
+        - sysuser123
+      when: false  # Set to true to enable cleanup 

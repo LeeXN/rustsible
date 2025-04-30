@@ -1,0 +1,183 @@
+---
+- name: Test Package Module
+  hosts: all
+  become: true
+  vars:
+    common_packages:
+      - curl
+      - wget
+      - vim
+    test_packages:
+      - name: htop
+        should_install: true
+      - name: tree
+        should_install: true
+  
+  tasks:
+    - name: Detect package manager
+      command: "{{ item }}"
+      register: pkg_manager_check
+      ignore_errors: true
+      loop:
+        - "which apt"
+        - "which yum"
+        - "which dnf"
+        - "which zypper"
+        - "which pacman"
+    
+    - name: Show available package managers
+      debug:
+        msg: "Available package managers:"
+    
+    - name: List package managers
+      debug:
+        msg: "{{ item.item | regex_replace('which ', '') }}: {{ 'Available' if item.rc == 0 else 'Not found' }}"
+      loop: "{{ pkg_manager_check.results }}"
+    
+    - name: Set package manager facts
+      set_fact:
+        has_apt: "{{ pkg_manager_check.results[0].rc == 0 }}"
+        has_yum: "{{ pkg_manager_check.results[1].rc == 0 }}"
+        has_dnf: "{{ pkg_manager_check.results[2].rc == 0 }}"
+        has_zypper: "{{ pkg_manager_check.results[3].rc == 0 }}"
+        has_pacman: "{{ pkg_manager_check.results[4].rc == 0 }}"
+    
+    # Test with common packages that should be available
+    - name: Update package cache (APT)
+      command: apt update
+      when: has_apt
+      ignore_errors: true
+    
+    - name: Update package cache (YUM)
+      command: yum makecache
+      when: has_yum and not has_dnf
+      ignore_errors: true
+    
+    - name: Update package cache (DNF)
+      command: dnf makecache
+      when: has_dnf
+      ignore_errors: true
+    
+    - name: Check if curl is installed
+      package:
+        name: curl
+        state: present
+      register: curl_install
+      ignore_errors: true
+    
+    - name: Show curl installation result
+      debug:
+        var: curl_install
+    
+    - name: Test curl installation
+      command: curl --version
+      register: curl_version
+      ignore_errors: true
+    
+    - name: Show curl version
+      debug:
+        msg: "Curl version: {{ curl_version.stdout_lines[0] }}"
+      when: curl_version.rc == 0
+    
+    - name: Install multiple packages
+      package:
+        name: "{{ common_packages }}"
+        state: present
+      register: multi_install
+      ignore_errors: true
+    
+    - name: Show multiple package installation result
+      debug:
+        var: multi_install
+    
+    - name: Check installed packages
+      command: "{{ item.cmd }}"
+      register: package_versions
+      ignore_errors: true
+      loop:
+        - { cmd: "curl --version", name: "curl" }
+        - { cmd: "wget --version", name: "wget" }
+        - { cmd: "vim --version", name: "vim" }
+    
+    - name: Show package versions
+      debug:
+        msg: "{{ item.item.name }}: {{ 'Installed' if item.rc == 0 else 'Not found' }}"
+      loop: "{{ package_versions.results }}"
+    
+    # Test installing optional packages
+    - name: Install test packages
+      package:
+        name: "{{ item.name }}"
+        state: present
+      loop: "{{ test_packages }}"
+      register: test_install
+      ignore_errors: true
+      when: item.should_install
+    
+    - name: Show test package installation results
+      debug:
+        msg: "Package {{ item.item.name }}: {{ 'Success' if item.rc == 0 else 'Failed' }}"
+      loop: "{{ test_install.results }}"
+      when: test_install is defined and item.item is defined
+    
+    # Test package information commands
+    - name: Get package information (APT)
+      command: dpkg -l curl
+      register: apt_package_info
+      ignore_errors: true
+      when: has_apt
+    
+    - name: Show APT package info
+      debug:
+        var: apt_package_info.stdout_lines
+      when: has_apt and apt_package_info.rc == 0
+    
+    - name: Get package information (YUM/DNF)
+      command: "{{ 'dnf' if has_dnf else 'yum' }} info curl"
+      register: yum_package_info
+      ignore_errors: true
+      when: has_yum or has_dnf
+    
+    - name: Show YUM/DNF package info
+      debug:
+        var: yum_package_info.stdout_lines
+      when: (has_yum or has_dnf) and yum_package_info.rc == 0
+    
+    # Test package removal (be careful)
+    - name: Remove test packages (optional)
+      package:
+        name: "{{ item.name }}"
+        state: absent
+      loop: "{{ test_packages }}"
+      register: test_removal
+      ignore_errors: true
+      when: false  # Set to true to enable removal
+    
+    - name: Show test package removal results
+      debug:
+        msg: "Package {{ item.item.name }} removal: {{ 'Success' if item.rc == 0 else 'Failed' }}"
+      loop: "{{ test_removal.results }}"
+      when: test_removal is defined and item.item is defined
+    
+    # List installed packages (sample)
+    - name: List some installed packages (APT)
+      command: dpkg -l | head -20
+      register: apt_packages
+      ignore_errors: true
+      when: has_apt
+    
+    - name: Show some APT packages
+      debug:
+        var: apt_packages.stdout_lines
+      when: has_apt and apt_packages.rc == 0
+    
+    - name: List some installed packages (YUM/DNF)
+      command: "{{ 'dnf' if has_dnf else 'yum' }} list installed | head -20"
+      register: yum_packages
+      ignore_errors: true
+      when: has_yum or has_dnf
+    
+    - name: Show some YUM/DNF packages
+      debug:
+        var: yum_packages.stdout_lines
+      when: (has_yum or has_dnf) and yum_packages.rc == 0 

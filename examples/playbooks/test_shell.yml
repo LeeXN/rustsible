@@ -1,0 +1,71 @@
+---
+- name: Test Shell Module
+  hosts: all
+  become: false
+  vars:
+    log_file: /tmp/shell_test.log
+    search_pattern: "ERROR"
+  
+  tasks:
+    - name: Basic shell command
+      shell: echo "Hello from shell module"
+      register: basic_output
+    
+    - name: Show basic output
+      debug:
+        var: basic_output.stdout
+    
+    - name: Shell with pipes and redirects
+      shell: ps aux | grep -v grep | grep bash | wc -l
+      register: bash_count
+    
+    - name: Display bash process count
+      debug:
+        msg: "Number of bash processes: {{ bash_count.stdout }}"
+    
+    - name: Create test log file
+      shell: |
+        echo "INFO: Application started" > {{ log_file }}
+        echo "ERROR: Database connection failed" >> {{ log_file }}
+        echo "INFO: Retrying connection" >> {{ log_file }}
+        echo "ERROR: Timeout occurred" >> {{ log_file }}
+        echo "INFO: Application stopped" >> {{ log_file }}
+    
+    - name: Search for errors in log
+      shell: grep "{{ search_pattern }}" {{ log_file }} | wc -l
+      register: error_count
+    
+    - name: Show error count
+      debug:
+        msg: "Found {{ error_count.stdout }} error lines in {{ log_file }}"
+    
+    - name: Extract error messages
+      shell: grep "{{ search_pattern }}" {{ log_file }}
+      register: error_messages
+    
+    - name: Display error messages
+      debug:
+        msg: "Error messages:"
+      when: error_messages.stdout != ""
+    
+    - name: Show each error message
+      debug:
+        msg: "{{ item }}"
+      loop: "{{ error_messages.stdout_lines }}"
+      when: error_messages.stdout != ""
+    
+    - name: Complex shell operation with variables
+      shell: |
+        HOSTNAME=$(hostname)
+        DATE=$(date '+%Y-%m-%d %H:%M:%S')
+        echo "Host: $HOSTNAME, Time: $DATE" > /tmp/host_info.txt
+        cat /tmp/host_info.txt
+      register: host_info
+    
+    - name: Show host information
+      debug:
+        var: host_info.stdout
+    
+    - name: Cleanup test files
+      shell: rm -f {{ log_file }} /tmp/host_info.txt
+      ignore_errors: true 
