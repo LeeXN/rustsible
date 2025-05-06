@@ -1,39 +1,24 @@
 use anyhow::{Result, Context};
-use log::{info, error};
+use log::{info, warn};
 use serde_yaml::Value;
 use std::fs;
 use std::path::Path;
 use tempfile::NamedTempFile;
 use tera::{Tera, Context as TeraContext};
+use chrono;
+use serde_yaml::Mapping;
+use serde_json;
 
 use crate::inventory::Host;
 use crate::ssh::connection::SshClient;
 use crate::modules::ModuleResult;
+use crate::modules::param::{get_param, get_optional_param};
+use crate::modules::remote::{set_file_mode, set_ownership};
 
+/// Execute the template module logic: render and upload a template, set permissions/ownership if needed.
 pub fn execute(ssh_client: &SshClient, template_args: &Value, use_become: bool, become_user: &str) -> Result<()> {
-    // Extract src parameter (required)
-    let src = match template_args {
-        Value::Mapping(map) => {
-            if let Some(Value::String(src)) = map.get(&Value::String("src".to_string())) {
-                src.clone()
-            } else {
-                return Err(anyhow::anyhow!("Template module requires a src parameter"));
-            }
-        },
-        _ => return Err(anyhow::anyhow!("Template module requires a mapping of parameters")),
-    };
-    
-    // Extract dest parameter (required)
-    let dest = match template_args {
-        Value::Mapping(map) => {
-            if let Some(Value::String(dest)) = map.get(&Value::String("dest".to_string())) {
-                dest.clone()
-            } else {
-                return Err(anyhow::anyhow!("Template module requires a dest parameter"));
-            }
-        },
-        _ => return Err(anyhow::anyhow!("Template module requires a mapping of parameters")),
-    };
+    let src = get_param::<String>(template_args, "src")?;
+    let dest = get_param::<String>(template_args, "dest")?;
     
     // Extract template variables
     let mut vars = TeraContext::new();
@@ -59,37 +44,13 @@ pub fn execute(ssh_client: &SshClient, template_args: &Value, use_become: bool, 
     }
     
     // Extract mode parameter (optional)
-    let mode = if let Value::Mapping(map) = template_args {
-        if let Some(Value::String(mode_str)) = map.get(&Value::String("mode".to_string())) {
-            Some(mode_str.clone())
-        } else {
-            None
-        }
-    } else {
-        None
-    };
+    let mode = get_optional_param::<String>(template_args, "mode");
     
     // Extract owner parameter (optional)
-    let owner = if let Value::Mapping(map) = template_args {
-        if let Some(Value::String(owner_str)) = map.get(&Value::String("owner".to_string())) {
-            Some(owner_str.clone())
-        } else {
-            None
-        }
-    } else {
-        None
-    };
+    let owner = get_optional_param::<String>(template_args, "owner");
     
     // Extract group parameter (optional)
-    let group = if let Value::Mapping(map) = template_args {
-        if let Some(Value::String(group_str)) = map.get(&Value::String("group".to_string())) {
-            Some(group_str.clone())
-        } else {
-            None
-        }
-    } else {
-        None
-    };
+    let group = get_optional_param::<String>(template_args, "group");
     
     info!("Processing template: {} -> {}", src, dest);
     
@@ -97,6 +58,74 @@ pub fn execute(ssh_client: &SshClient, template_args: &Value, use_become: bool, 
     let src_path = Path::new(&src);
     if !src_path.exists() {
         return Err(anyhow::anyhow!("Template file does not exist: {}", src));
+    }
+    
+    // Add Ansible-like facts
+    // Add ansible_date_time if not already present
+    if !vars.contains_key("ansible_date_time") {
+        let now = chrono::Local::now();
+        let mut date_time_mapping = Mapping::new();
+        
+        date_time_mapping.insert(
+            Value::String("date".to_string()),
+            Value::String(now.format("%Y-%m-%d").to_string())
+        );
+        date_time_mapping.insert(
+            Value::String("time".to_string()),
+            Value::String(now.format("%H:%M:%S").to_string())
+        );
+        date_time_mapping.insert(
+            Value::String("year".to_string()),
+            Value::String(now.format("%Y").to_string())
+        );
+        date_time_mapping.insert(
+            Value::String("month".to_string()),
+            Value::String(now.format("%m").to_string())
+        );
+        date_time_mapping.insert(
+            Value::String("day".to_string()),
+            Value::String(now.format("%d").to_string())
+        );
+        date_time_mapping.insert(
+            Value::String("hour".to_string()),
+            Value::String(now.format("%H").to_string())
+        );
+        date_time_mapping.insert(
+            Value::String("minute".to_string()),
+            Value::String(now.format("%M").to_string())
+        );
+        date_time_mapping.insert(
+            Value::String("second".to_string()),
+            Value::String(now.format("%S").to_string())
+        );
+        date_time_mapping.insert(
+            Value::String("weekday".to_string()),
+            Value::String(now.format("%A").to_string())
+        );
+        date_time_mapping.insert(
+            Value::String("weekday_short".to_string()),
+            Value::String(now.format("%a").to_string())
+        );
+        date_time_mapping.insert(
+            Value::String("epoch".to_string()),
+            Value::String(now.timestamp().to_string())
+        );
+        date_time_mapping.insert(
+            Value::String("iso8601".to_string()),
+            Value::String(now.to_rfc3339())
+        );
+        
+        // Create value and convert to JSON for inserting into TeraContext
+        let date_time_value = Value::Mapping(date_time_mapping);
+        // Convert to JSON first as TeraContext expects JSON serializable values
+        match serde_json::to_value(&date_time_value) {
+            Ok(json_val) => {
+                vars.insert("ansible_date_time", &json_val);
+            },
+            Err(e) => {
+                warn!("Could not convert ansible_date_time to JSON: {}", e);
+            }
+        }
     }
     
     // Read template content
@@ -116,8 +145,8 @@ pub fn execute(ssh_client: &SshClient, template_args: &Value, use_become: bool, 
         .context(format!("Failed to upload rendered template to {}", dest))?;
     
     // Set file mode if specified
-    if let Some(mode_str) = mode {
-        set_file_mode(ssh_client, &dest, &mode_str, use_become, become_user)?;
+    if let Some(mode_str) = mode.as_deref() {
+        set_file_mode(ssh_client, &dest, mode_str, use_become, become_user)?;
     }
     
     // Set ownership if specified
@@ -129,56 +158,14 @@ pub fn execute(ssh_client: &SshClient, template_args: &Value, use_become: bool, 
     Ok(())
 }
 
-fn set_file_mode(ssh_client: &SshClient, path: &str, mode: &str, use_become: bool, become_user: &str) -> Result<()> {
-    info!("Setting file mode: {} -> {}", path, mode);
-    
-    let cmd = format!("chmod {} {}", mode, path);
-    let (exit_code, _, stderr) = if use_become {
-        ssh_client.execute_sudo_command(&cmd, become_user)?
-    } else {
-        ssh_client.execute_command(&cmd)?
-    };
-    
-    if exit_code != 0 {
-        error!("Failed to set file mode: {}", stderr);
-        return Err(anyhow::anyhow!("Failed to set file mode: {}", stderr));
-    }
-    
-    Ok(())
-}
-
-fn set_ownership(ssh_client: &SshClient, path: &str, owner: Option<&str>, group: Option<&str>, use_become: bool, become_user: &str) -> Result<()> {
-    let ownership = match (owner, group) {
-        (Some(o), Some(g)) => format!("{}:{}", o, g),
-        (Some(o), None) => o.to_string(),
-        (None, Some(g)) => format!(":{}", g),
-        (None, None) => return Ok(()),
-    };
-    
-    info!("Setting ownership: {} -> {}", path, ownership);
-    
-    let cmd = format!("chown {} {}", ownership, path);
-    let (exit_code, _, stderr) = if use_become {
-        ssh_client.execute_sudo_command(&cmd, become_user)?
-    } else {
-        ssh_client.execute_command(&cmd)?
-    };
-    
-    if exit_code != 0 {
-        error!("Failed to set ownership: {}", stderr);
-        return Err(anyhow::anyhow!("Failed to set ownership: {}", stderr));
-    }
-    
-    Ok(())
-}
-
+/// Execute the template module in ad-hoc mode for a single host.
 pub fn execute_adhoc(host: &Host, template_args: &Value) -> Result<ModuleResult> {
     info!("Connecting to host: {}", host.name);
     let ssh_client = SshClient::connect(host)?;
     
     // 解析模板源文件和目标文件
-    let src_file = get_param(template_args, "src")?;
-    let dest_file = get_param(template_args, "dest")?;
+    let src_file = get_param::<String>(template_args, "src")?;
+    let dest_file = get_param::<String>(template_args, "dest")?;
     
     execute(&ssh_client, template_args, false, "")?;
     
@@ -190,16 +177,25 @@ pub fn execute_adhoc(host: &Host, template_args: &Value) -> Result<ModuleResult>
     })
 }
 
-// Helper to extract a string parameter from a YAML value
-fn get_param(args: &Value, name: &str) -> Result<String> {
-    match args {
-        Value::Mapping(map) => {
-            if let Some(Value::String(value)) = map.get(&Value::String(name.to_string())) {
-                Ok(value.clone())
-            } else {
-                Err(anyhow::anyhow!("Missing required parameter: {}", name))
-            }
-        },
-        _ => Err(anyhow::anyhow!("Arguments must be a mapping")),
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_yaml::{Value, Mapping};
+
+    #[test]
+    fn test_template_param_extract_ok() {
+        let mut map = Mapping::new();
+        map.insert(Value::String("src".to_string()), Value::String("/tmp/tmpl".to_string()));
+        map.insert(Value::String("dest".to_string()), Value::String("/tmp/out".to_string()));
+        let args = Value::Mapping(map);
+        assert_eq!(crate::modules::param::get_param::<String>(&args, "src").unwrap(), "/tmp/tmpl");
+        assert_eq!(crate::modules::param::get_param::<String>(&args, "dest").unwrap(), "/tmp/out");
+    }
+
+    #[test]
+    fn test_template_param_missing() {
+        let map = Mapping::new();
+        let args = Value::Mapping(map);
+        assert!(crate::modules::param::get_param::<String>(&args, "src").is_err());
     }
 } 

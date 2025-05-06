@@ -1,81 +1,60 @@
 # Rustsible
-Ansible-Compatible, High-Performance IT Automation in Rust
+
+**Ansible-Compatible, High-Performance IT Automation in Rust**
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 
-## Table of Contents
-- [Rustsible](#rustsible)
-  - [Table of Contents](#table-of-contents)
-  - [Introduction](#introduction)
-  - [Features](#features)
-  - [Installation](#installation)
-    - [From Source](#from-source)
-    - [Pre-built Binaries (coming soon)](#pre-built-binaries-coming-soon)
-  - [Usage](#usage)
-    - [Running Playbooks](#running-playbooks)
-    - [Ad-hoc Commands](#ad-hoc-commands)
-  - [Inventory Format](#inventory-format)
-  - [Playbook Format](#playbook-format)
-  - [Supported Modules](#supported-modules)
-  - [Comparison to Ansible](#comparison-to-ansible)
-  - [Examples](#examples)
-  - [Contributing](#contributing)
-  - [License](#license)
-  - [Acknowledgements](#acknowledgements)
+---
 
-## Introduction
+## Overview
 
-Rustsible is a modern, Ansible-compatible automation tool written in Rust. It aims to provide a drop-in replacement for Ansible with improved performance, safety, and ease of use. You can run your existing playbooks and inventories without modification.
+Rustsible is a modern, Ansible-compatible automation tool written in Rust. It aims to be a drop-in replacement for Ansible, providing improved performance, safety, and maintainability. Rustsible leverages Rust's async and concurrency features, and is designed with modularity, type safety, and extensibility in mind.
+
+---
 
 ## Features
 
-- Ansible-compatible playbooks and inventory support
-- Blazing-fast execution powered by Rust
-- Parallel task execution across multiple hosts
-- Minimal external dependencies (standalone binary)
-- Secure by default with Rust’s memory safety guarantees
-- Variable substitution via Jinja2-style (`{{ var }}`) and shell-style (`$var`)
-- Privilege escalation (`become`/`sudo`) support
-- Batch execution using the `serial` parameter
-- Cross-platform: Linux, macOS, and Windows
+- **Ansible-Compatible**: Supports standard Ansible playbooks and inventory formats.
+- **High Performance**: Built with Rust, optimized for speed and memory safety.
+- **Async & Concurrency**: Uses `tokio` for async task execution and efficient resource management.
+- **Modular Architecture**: Each module (e.g., file, copy, template) is cleanly separated and reusable.
+- **Type-Safe Parameter Extraction**: Generic, type-safe parameter extraction utilities for robust module development.
+- **Minimal Dependencies**: Distributed as a single binary, no Python or external runtime required.
+- **Cross-Platform**: Works on Linux, macOS, and Windows.
 
-## Installation
+---
 
-### From Source
+## Quick Start
 
-```bash
+### Build from Source
+
+```sh
 # Clone the repository
-git clone git@github.com:LeeXN/rustsible.git
+git clone https://github.com/LeeXN/rustsible.git
 cd rustsible
-# Build release binary with Cargo
+# Build release binary
 cargo build --release
 ```
 
-The compiled binary will be available at `target/release/rustsible`.
+The binary will be at `target/release/rustsible`.
 
-### Pre-built Binaries (coming soon)
+### Usage
 
-We plan to provide pre-built releases for major platforms under the [Releases](https://github.com/yourusername/rustsible/releases) page.
+#### Run a Playbook
 
-## Usage
-
-Rustsible follows command-line conventions similar to Ansible.
-
-### Running Playbooks
-
-```bash
+```sh
 rustsible playbook <playbook.yml> -i <inventory>
 ```
 
-### Ad-hoc Commands
+#### Run an Ad-hoc Command
 
-```bash
+```sh
 rustsible ad-hoc <pattern> -m command -a "uptime" -i <inventory>
 ```
 
-## Inventory Format
+---
 
-Rustsible uses the same inventory file format as Ansible.
+## Inventory Example
 
 ```ini
 [webservers]
@@ -90,28 +69,25 @@ db2.example.com
 ansible_user=admin
 ```
 
-## Playbook Format
-
-Rustsible supports standard Ansible YAML playbooks.
+## Playbook Example
 
 ```yaml
----
 - name: Deploy web application
   hosts: webservers
   become: true
-
   tasks:
     - name: Create document root directory
       file:
         path: /var/www/html
         state: directory
         mode: '0755'
-
     - name: Copy index.html
       copy:
         src: files/index.html
         dest: /var/www/html/index.html
 ```
+
+---
 
 ## Supported Modules
 
@@ -125,33 +101,38 @@ Rustsible supports standard Ansible YAML playbooks.
 - `local`: Execute tasks on the local machine
 - `debug`: Print debug messages during playbook execution
 
-## Comparison to Ansible
+---
 
-- **Compiled Binary**: Rustsible is distributed as a single compiled executable, whereas Ansible is a Python application.
-- **Parallelism by Default**: Tasks run in parallel across hosts unless overridden.
-- **Performance**: Rustsible leverages Rust’s performance characteristics for faster task execution.
-- **Feature Parity**: Most common Ansible features are implemented; some advanced modules or plugins may not be available yet.
+## Architecture Highlights
 
-## Examples
+- **Async Runtime**: All remote operations are async, using `tokio` for concurrency and efficiency.
+- **Channel-Based Communication**: Uses `tokio::sync` channels for task coordination.
+- **Type-Safe Parameter Extraction**: See `src/modules/param.rs` for generic, type-safe parameter utilities:
 
-Browse the `examples/` directory for sample playbooks and usage patterns. You can run these samples as:
-
-```bash
-rustsible playbook examples/sample-playbook.yml -i examples/inventory
+```rust
+let path: String = get_param(args, "path")?;
+let mode: Option<String> = get_optional_param(args, "mode");
 ```
+
+- **Error Handling**: All modules use `anyhow::Result` and propagate errors with context.
+- **Extensible Modules**: Add new modules by implementing the required trait and registering in `src/modules/mod.rs`.
+
+---
 
 ## Contributing
 
-Contributions are welcome! Please follow these guidelines:
-
 1. Fork the repository and create a feature branch.
-2. Write tests for new functionality or bug fixes.
-3. Follow the project’s coding conventions and format with `rustfmt`.
-4. Open a Pull Request describing your changes.
+2. Write tests for new features or bug fixes.
+3. Follow Rust best practices and format code with `rustfmt`.
+4. Open a Pull Request with a clear description of your changes.
+
+---
 
 ## License
 
-This project is licensed under the [GPL-3.0 License](LICENSE).
+This project is licensed under the [MIT License](LICENSE).
+
+---
 
 ## Acknowledgements
 

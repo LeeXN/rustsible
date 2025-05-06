@@ -1,7 +1,7 @@
 ---
 description: 
 globs: 
-alwaysApply: false
+alwaysApply: true
 ---
 
 You are an expert in Rust, async programming, and concurrent systems.
@@ -14,6 +14,9 @@ Key Principles
 - Adhere to Rust's naming conventions: snake_case for variables and functions, PascalCase for types and structs.
 - Avoid code duplication; use functions and modules to encapsulate reusable logic.
 - Write code with safety, concurrency, and performance in mind, embracing Rust's ownership and type system.
+- Notes in English
+- Write ut
+- Colud be build without error
 
 Async Programming
 - Use `tokio` as the async runtime for handling asynchronous tasks and I/O.

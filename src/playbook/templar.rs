@@ -3,6 +3,8 @@ use log::{debug, warn};
 use std::collections::HashMap;
 use serde_yaml::Value;
 use tera::{Tera, Context as TeraContext};
+use uuid::Uuid;
+use std::error::Error;
 
 const MAX_TEMPLATE_RECURSION: usize = 10;
 
@@ -12,22 +14,46 @@ const MAX_TEMPLATE_RECURSION: usize = 10;
 /// * `input` - The string potentially containing Tera expressions.
 /// * `tera` - A reference to the Tera instance.
 /// * `context` - The Tera context containing variables.
-pub fn render_value(input: &str, tera: &mut Tera, context: &TeraContext) -> Result<Value> {
+/// * `force_string` - A boolean indicating whether to return the result as a string.
+pub fn render_value(input: &str, tera: &mut Tera, context: &TeraContext, force_string: bool) -> Result<Value> {
     debug!("Rendering value with Tera (initial): {}", input);
     let mut current_str = input.to_string();
     let mut depth = 0;
 
+    // 多行模板渲染时，每次都新建 Tera 实例
+    if force_string && input.contains('\n') {
+        let mut local_tera = Tera::default();
+        // 注册自定义 filter
+        local_tera.register_filter("selectattr", crate::playbook::task::SelectAttrFilter {});
+        local_tera.register_filter("map", crate::playbook::task::MapAttributeFilter {});
+        let template_name = format!("__inline_content_{}", Uuid::new_v4());
+        match local_tera.add_raw_template(&template_name, input) {
+            Ok(_) => {},
+            Err(e) => {
+                warn!("add_raw_template failed: {} (template_name: {})", e, template_name);
+                if let Some(source) = e.source() {
+                    warn!("add_raw_template error source: {}", source);
+                }
+                return Err(anyhow!("add_raw_template failed: {}", e));
+            }
+        }
+        match local_tera.render(&template_name, context) {
+            Ok(rendered) => return Ok(Value::String(rendered)),
+            Err(e) => {
+                warn!("Tera render failed: {} (template_name: {})", e, template_name);
+                if let Some(source) = e.source() {
+                    warn!("Tera render error source: {}", source);
+                }
+                return Err(anyhow!("Tera render failed: {}", e));
+            }
+        }
+    }
+
     // Loop for recursive rendering
     while depth < MAX_TEMPLATE_RECURSION {
-        // Removed check for specific markers: rely on fixed-point check below
-        /* if !current_str.contains("{{") || !current_str.contains("}}") {
-            debug!("No more template markers found at depth {}", depth);
-            break;
-        }*/
-
         depth += 1;
         debug!("Rendering value (depth {}): {}", depth, current_str);
-        let last_str = current_str.clone(); // Store previous value to detect no change
+        let last_str = current_str.clone();
 
         match tera.render_str(&current_str, context) {
             Ok(rendered) => {
@@ -38,10 +64,6 @@ pub fn render_value(input: &str, tera: &mut Tera, context: &TeraContext) -> Resu
                 current_str = rendered;
             },
             Err(e) => {
-                // If rendering fails at any depth, return the error
-                // Check if the error is because a variable is undefined *in this specific pass*
-                // If the original input didn't contain this variable, it might be okay?
-                // For now, let's be strict: any render error is an error.
                 warn!("Error rendering Tera template '{}' at depth {}: {}", input, depth, e);
                 return Err(anyhow!("Tera rendering error for '{}' at depth {}: {}", input, depth, e));
             }
@@ -53,16 +75,17 @@ pub fn render_value(input: &str, tera: &mut Tera, context: &TeraContext) -> Resu
             "Template rendering exceeded maximum recursion depth ({}) for input: {}. Final string: {}",
             MAX_TEMPLATE_RECURSION, input, current_str
         );
-        // Return the last successfully rendered string, even if recursion limit hit
     }
 
     debug!("Final rendered string after recursion: {}", current_str);
 
+    if force_string {
+        return Ok(Value::String(current_str));
+    }
+
     // --- Logic to parse the final string (JSON/YAML or fallback to string) ---
-    // Try parsing as JSON first (more standard for filter outputs or rendered results)
     match serde_json::from_str::<serde_json::Value>(&current_str) {
         Ok(json_value) => {
-            // Convert serde_json::Value to serde_yaml::Value
             match serde_yaml::to_value(json_value) {
                 Ok(yaml_value) => Ok(yaml_value),
                 Err(e) => {
@@ -72,11 +95,9 @@ pub fn render_value(input: &str, tera: &mut Tera, context: &TeraContext) -> Resu
             }
         },
         Err(_) => {
-            // If JSON fails, try YAML (might handle bare strings like 'true'/'false' differently)
             match serde_yaml::from_str(&current_str) {
                 Ok(yaml_value) => Ok(yaml_value),
                 Err(_) => {
-                     // If both JSON and YAML parsing fail, return as plain string
                     Ok(Value::String(current_str))
                 }
             }
@@ -112,7 +133,7 @@ pub fn evaluate_condition(condition: &str, tera: &mut Tera, context: &TeraContex
 
     // Render the condition expression directly
     let template = format!("{{{{ {} }}}}", condition);
-    match render_value(&template, tera, context) {
+    match render_value(&template, tera, context, false) {
         Ok(result_value) => {
             // Evaluate truthiness of the resulting Value
             Ok(evaluate_truthiness(&result_value))
@@ -165,7 +186,7 @@ mod tests {
         vars.insert("name".to_string(), Value::String("World".to_string()));
         let context = create_test_context_from_map(&vars);
 
-        let result = render_value("Hello {{ name }}!", &mut tera, &context).unwrap();
+        let result = render_value("Hello {{ name }}!", &mut tera, &context, false).unwrap();
         assert_eq!(result, Value::String("Hello World!".to_string()));
     }
 
@@ -177,7 +198,7 @@ mod tests {
          vars.insert("b".to_string(), Value::Number(3.into()));
          let context = create_test_context_from_map(&vars);
 
-         let result = render_value("{{ a + b * 2 }}", &mut tera, &context).unwrap();
+         let result = render_value("{{ a + b * 2 }}", &mut tera, &context, false).unwrap();
          // Tera should evaluate this to 11
          assert_eq!(result, Value::Number(serde_yaml::Number::from(11)));
      }
@@ -189,13 +210,13 @@ mod tests {
          vars.insert("use_prod".to_string(), Value::Bool(true));
          let context = create_test_context_from_map(&vars);
 
-         let result = render_value("{% if use_prod %}production{% else %}staging{% endif %}", &mut tera, &context).unwrap();
+         let result = render_value("{% if use_prod %}production{% else %}staging{% endif %}", &mut tera, &context, false).unwrap();
          assert_eq!(result, Value::String("production".to_string()));
 
          let mut vars2 = HashMap::new();
          vars2.insert("use_prod".to_string(), Value::Bool(false));
          let context2 = create_test_context_from_map(&vars2);
-         let result2 = render_value("{% if use_prod %}production{% else %}staging{% endif %}", &mut tera, &context2).unwrap();
+         let result2 = render_value("{% if use_prod %}production{% else %}staging{% endif %}", &mut tera, &context2, false).unwrap();
          assert_eq!(result2, Value::String("staging".to_string()));
      }
 
