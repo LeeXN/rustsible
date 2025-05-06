@@ -7,6 +7,8 @@ pub mod service;
 pub mod package;
 pub mod debug;
 pub mod local;
+pub mod param;
+pub mod remote;
 
 use anyhow::Result;
 use serde_yaml::Value;

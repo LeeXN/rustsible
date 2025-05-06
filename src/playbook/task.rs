@@ -1,6 +1,6 @@
 use anyhow::Result;
 use anyhow::anyhow;
-use log::{info, debug, warn};
+use log::{info, debug, warn, error};
 use serde_yaml::{Value, Mapping};
 use std::collections::HashMap;
 use std::time::Instant;
@@ -130,7 +130,7 @@ fn get_nested_value<'a>(
 // --- Custom Tera Filters --- 
 
 // Simplified selectattr filter (handles 'equalto' test, attempts YAML fallback)
-struct SelectAttrFilter;
+pub(crate) struct SelectAttrFilter;
 impl Filter for SelectAttrFilter {
     fn filter(&self, value: &tera::Value, args: &HashMap<String, tera::Value>) -> tera::Result<tera::Value> {
         debug!("SelectAttrFilter: Input value: {:?}", value);
@@ -199,7 +199,7 @@ impl Filter for SelectAttrFilter {
 }
 
 // Simplified map(attribute=...) filter (attempts YAML fallback)
-struct MapAttributeFilter;
+pub(crate) struct MapAttributeFilter;
 impl Filter for MapAttributeFilter {
      fn filter(&self, value: &tera::Value, args: &HashMap<String, tera::Value>) -> tera::Result<tera::Value> {
         let arr = try_get_value!("map", "value", Vec<tera::Value>, value);
@@ -249,6 +249,8 @@ impl Task {
         info!("TASK [{}] on host {}", self.name, host.name);
         
         let mut tera = Tera::default();
+        tera.register_filter("selectattr", SelectAttrFilter {});
+        tera.register_filter("map", MapAttributeFilter {});
         let mut results = Vec::new();
         
         if let Some(items) = &self.loop_items {
@@ -295,7 +297,7 @@ impl Task {
                 let mut iter_task = self.clone();
                 iter_task.loop_items = None;
                 
-                let result = iter_task.execute_module(host, &mut tera, &iter_context, vars)?;
+                let result = iter_task.execute_module(host, &mut tera, &iter_context, &iter_vars)?;
                 
                 let elapsed = start_time.elapsed();
                 let execution_time = format!("{:.2}s", elapsed.as_secs_f64());
@@ -363,10 +365,74 @@ impl Task {
         Ok(final_result)
     }
     
-    fn execute_module(&self, host: &Host, tera: &mut Tera, context: &TeraContext, vars: &HashMap<String, Value>) -> Result<TaskResult> {
+    fn execute_module(&self, host: &Host, tera: &mut Tera, _context: &TeraContext, vars: &HashMap<String, Value>) -> Result<TaskResult> {
         debug!("Executing module '{}' for task '{}'", self.module, self.name);
         
-        let mut resolved_args = self.resolve_args(tera, context, vars)?;
+        // Add ansible_date_time variable if it doesn't exist in vars
+        let mut vars_with_date = vars.clone();
+        if !vars_with_date.contains_key("ansible_date_time") {
+            let now = chrono::Local::now();
+            let mut date_time_mapping = Mapping::new();
+            
+            date_time_mapping.insert(
+                Value::String("date".to_string()),
+                Value::String(now.format("%Y-%m-%d").to_string())
+            );
+            date_time_mapping.insert(
+                Value::String("time".to_string()),
+                Value::String(now.format("%H:%M:%S").to_string())
+            );
+            date_time_mapping.insert(
+                Value::String("year".to_string()),
+                Value::String(now.format("%Y").to_string())
+            );
+            date_time_mapping.insert(
+                Value::String("month".to_string()),
+                Value::String(now.format("%m").to_string())
+            );
+            date_time_mapping.insert(
+                Value::String("day".to_string()),
+                Value::String(now.format("%d").to_string())
+            );
+            date_time_mapping.insert(
+                Value::String("hour".to_string()),
+                Value::String(now.format("%H").to_string())
+            );
+            date_time_mapping.insert(
+                Value::String("minute".to_string()),
+                Value::String(now.format("%M").to_string())
+            );
+            date_time_mapping.insert(
+                Value::String("second".to_string()),
+                Value::String(now.format("%S").to_string())
+            );
+            date_time_mapping.insert(
+                Value::String("weekday".to_string()),
+                Value::String(now.format("%A").to_string())
+            );
+            date_time_mapping.insert(
+                Value::String("weekday_short".to_string()),
+                Value::String(now.format("%a").to_string())
+            );
+            date_time_mapping.insert(
+                Value::String("epoch".to_string()),
+                Value::String(now.timestamp().to_string())
+            );
+            date_time_mapping.insert(
+                Value::String("iso8601".to_string()),
+                Value::String(now.to_rfc3339())
+            );
+            
+            vars_with_date.insert(
+                "ansible_date_time".to_string(),
+                Value::Mapping(date_time_mapping)
+            );
+        }
+        
+        // Create a new context with the updated vars
+        let context_with_date = crate::playbook::templar::create_tera_context(&vars_with_date);
+        
+        let mut resolved_args = self.resolve_args(tera, &context_with_date, &vars_with_date)?;
         
         let is_local = host.hostname == "localhost" || host.hostname == "127.0.0.1";
         
@@ -377,12 +443,22 @@ impl Task {
             );
             let module_result = match self.module.as_str() {
                 "command" | "shell" => {
-                    let cmd = self.get_string_arg(&resolved_args, "_raw_params")?;
+                    let raw_param_value = resolved_args.get(&Value::String("_raw_params".to_string())).cloned().unwrap_or(Value::Null);
+                    let cmd = match raw_param_value {
+                        Value::String(ref s) => s.clone(),
+                        _ => serde_yaml::to_string(&raw_param_value).unwrap_or_default(),
+                    };
                     let (exit_code, stdout, stderr) = crate::modules::local::execute_local_command(&cmd)?;
                     self.process_command_result(exit_code, stdout, stderr)
                 },
                 "debug" => {
                     crate::modules::debug::execute_adhoc(host, &Value::Mapping(resolved_args))?
+                },
+                "package" => {
+                    crate::modules::package::execute_adhoc(host, &Value::Mapping(resolved_args))?
+                },
+                "service" => {
+                    crate::modules::service::execute_adhoc(host, &Value::Mapping(resolved_args))?
                 },
                 _ => {
                     let mut result = ModuleResult::default();
@@ -406,7 +482,11 @@ impl Task {
         
         let module_result = match self.module.as_str() {
             "command" | "shell" => {
-                 let cmd = self.get_string_arg(&resolved_args, "_raw_params")?;
+                 let raw_param_value = resolved_args.get(&Value::String("_raw_params".to_string())).cloned().unwrap_or(Value::Null);
+                 let cmd = match raw_param_value {
+                     Value::String(ref s) => s.clone(),
+                     _ => serde_yaml::to_string(&raw_param_value).unwrap_or_default(),
+                 };
                  let (exit_code, stdout, stderr) = if self.is_become {
                     client.execute_sudo_command(&cmd, &self.become_user)?
                  } else {
@@ -479,6 +559,7 @@ impl Task {
 
                 // Declare variables needed for message formatting outside match
                 let mut src_path: Option<String> = None;
+                #[allow(unused_assignments)]
                 let mut dest_path: Option<String> = None;
                 let cmd = match state.as_str() {
                      "link" => {
@@ -540,54 +621,79 @@ impl Task {
                 result
             },
             "template" => {
-                let src = self.get_string_arg(&resolved_args, "src")?;
                 let dest = self.get_string_arg(&resolved_args, "dest")?;
-                // Optional: Get mode, owner, group if needed later
-                // let mode = self.get_string_arg(&resolved_args, "mode").ok(); 
+                #[allow(unused_assignments)]
+                let mut src_display_for_log = "<unknown_source>".to_string(); 
 
-                debug!("Template module: src='{}', dest='{}'", src, dest);
+                let template_string_to_render: String;
 
-                // Read the local template file content
-                let template_content = match std::fs::read_to_string(&src) {
-                    Ok(content) => content,
-                    Err(e) => {
-                        return Err(anyhow!("Failed to read template file '{}': {}", src, e));
-                    }
-                };
-
-                // Create a dedicated Tera instance for rendering this template
-                let mut template_tera = Tera::default();
-                 // Register necessary filters (ensure these structs are accessible)
-                 template_tera.register_filter("selectattr", SelectAttrFilter {});
-                 template_tera.register_filter("map", MapAttributeFilter {});
-                // Add other filters like 'lower', 'upper' if needed, though some are built-in
-
-                // ** Manually build context for template rendering **
-                let mut template_context = TeraContext::new();
-                for (key, value) in vars {
-                    match serde_json::to_value(value) {
-                        Ok(json_val) => template_context.insert(key, &json_val),
+                if let Some(Value::String(inline_content_val)) = resolved_args.get(&Value::String("content".to_string())) {
+                    debug!("Template module: using inline content for dest '{}'", dest);
+                    template_string_to_render = inline_content_val.clone();
+                    src_display_for_log = "<inline_template>".to_string();
+                } else if let Some(Value::String(src_path_val)) = resolved_args.get(&Value::String("src".to_string())) {
+                    debug!("Template module: using src path '{}' for dest '{}'", src_path_val, dest);
+                    src_display_for_log = src_path_val.clone();
+                    match std::fs::read_to_string(src_path_val) {
+                        Ok(file_content) => {
+                            template_string_to_render = file_content;
+                        }
                         Err(e) => {
-                             warn!("Template Module: Could not convert variable '{}' for context: {}", key, e);
+                            return Err(anyhow!("Failed to read template file '{}' (for dest '{}'): {}", src_path_val, dest, e));
                         }
                     }
+                } else if resolved_args.contains_key(&Value::String("content".to_string())) {
+                    return Err(anyhow!("Template module 'content' argument must be a string for dest '{}'. Found: {:?}", dest, resolved_args.get(&Value::String("content".to_string())) ));
+                } else if resolved_args.contains_key(&Value::String("src".to_string())) {
+                     return Err(anyhow!("Template module 'src' argument must be a string for dest '{}'. Found: {:?}", dest, resolved_args.get(&Value::String("src".to_string())) ));
+                } else {
+                    return Err(anyhow!("Template module requires either 'src' or 'content' string argument for dest '{}'", dest));
                 }
 
-                // Render the template using the manually built context
-                let rendered_content = match template_tera.render_str(&template_content, &template_context) { // Use template_context
-                    Ok(content) => content,
+                debug!("Template module: Effective source is '{}'. Content before rendering for dest '{}':\\n---\\n{}\\n---", src_display_for_log, dest, template_string_to_render);
+
+                let mut template_tera_instance = Tera::default();
+                // TEMPORARILY COMMENT OUT custom filter registration for diagnosis
+                // template_tera_instance.register_filter("selectattr", SelectAttrFilter {});
+                // template_tera_instance.register_filter("map", MapAttributeFilter {});
+
+                // context_with_date is already a TeraContext created in execute_module
+                let final_rendered_template_value = match crate::playbook::templar::render_value(
+                    &template_string_to_render,
+                    &mut template_tera_instance,
+                    &context_with_date,
+                    false
+                ) {
+                    Ok(value) => value,
                     Err(e) => {
-                        // Include context details in the error if possible
-                        return Err(anyhow!("Failed to render template '{}': {}\nContext: {:?}", src, e, template_context));
+                        error!(
+                            "Problematic template (from '{}') for dest '{}'. Initial content:\\n---\\n{}\n---",
+                            src_display_for_log, dest, template_string_to_render
+                        );
+                        return Err(anyhow!(
+                            "Failed to render template from '{}' for dest '{}': {}\\nContext: {:?}",
+                            src_display_for_log, dest, e, context_with_date
+                        ));
+                    }
+                };
+                
+                let fully_rendered_content_str = match final_rendered_template_value {
+                    Value::String(s) => s,
+                    Value::Null => String::new(), 
+                    other => {
+                        warn!(
+                            "Template from '{}' for dest '{}' rendered to a non-string value: {:?}. Using its string representation.",
+                            src_display_for_log, dest, other
+                        );
+                        // Attempt to serialize to YAML string as a common, readable format
+                        serde_yaml::to_string(&other).unwrap_or_else(|_| format!("{:?}", other))
                     }
                 };
 
-                // Escape content and build command (similar to copy module's content logic)
-                let escaped_content = rendered_content.replace('\'', "'\\\''");
+                let escaped_content = fully_rendered_content_str.replace('\'', "'\\\\\\''");
                 let cmd = format!("echo '{}' | tee {}", escaped_content, dest);
-                // TODO: Add mode/owner/group setting logic if needed using chmod/chown commands after tee
-
-                debug!("Template module: executing command: {}", cmd);
+                
+                debug!("Template module: executing command for dest '{}': {}", dest, cmd);
 
                 let (exit_code, stdout, stderr) = if self.is_become {
                     client.execute_sudo_command(&cmd, &self.become_user)?
@@ -598,11 +704,45 @@ impl Task {
                 let mut result = ModuleResult { stdout, stderr, ..Default::default() };
                 if exit_code == 0 {
                     result.changed = true;
-                    result.msg = format!("Template {} rendered and copied to {}", src, dest);
+                    result.msg = format!("Template {} rendered and copied to {}", src_display_for_log, dest);
                 } else {
-                    result.msg = format!("Failed to write rendered template {} to {} (exit code: {})", src, dest, exit_code);
+                    result.msg = format!("Failed to write rendered template {} to {} (exit code: {})", src_display_for_log, dest, exit_code);
                 }
                 result
+            },
+            "package" => {
+                let result = crate::modules::package::execute(&client, &Value::Mapping(resolved_args), self.is_become, &self.become_user);
+                match result {
+                    Ok(_) => {
+                        let mut r = ModuleResult::default();
+                        r.changed = true;
+                        r.msg = "Package operation completed".to_string();
+                        r
+                    }
+                    Err(e) => {
+                        let mut r = ModuleResult::default();
+                        r.msg = format!("Package module failed: {}", e);
+                        r.stderr = e.to_string();
+                        r
+                    }
+                }
+            },
+            "service" => {
+                let result = crate::modules::service::execute(&client, &Value::Mapping(resolved_args), self.is_become, &self.become_user);
+                match result {
+                    Ok(_) => {
+                        let mut r = ModuleResult::default();
+                        r.changed = true;
+                        r.msg = "Service operation completed".to_string();
+                        r
+                    }
+                    Err(e) => {
+                        let mut r = ModuleResult::default();
+                        r.msg = format!("Service module failed: {}", e);
+                        r.stderr = e.to_string();
+                        r
+                    }
+                }
             },
             _ => {
                 let mut result = ModuleResult::default();
@@ -712,7 +852,7 @@ impl Task {
                     "RESOLVE_LOOP: Falling back to rendering loop items from string: {}",
                     var_name
                 );
-                match crate::playbook::templar::render_value(var_name, tera, context) {
+                match crate::playbook::templar::render_value(var_name, tera, context, false) {
                     Ok(Value::Sequence(resolved_seq)) => Ok(Some(resolved_seq)),
                     Ok(Value::String(s))
                         if !var_name.contains("{{") && !var_name.contains("{%") =>
@@ -763,8 +903,9 @@ impl Task {
         let mut arg_tera = Tera::default(); 
 
         // Register custom filters needed for Ansible compatibility
-        arg_tera.register_filter("selectattr", SelectAttrFilter {});
-        arg_tera.register_filter("map", MapAttributeFilter {});
+        // TEMPORARILY COMMENT OUT for diagnosing the __tera_one_off issue
+        // arg_tera.register_filter("selectattr", SelectAttrFilter {});
+        // arg_tera.register_filter("map", MapAttributeFilter {});
         // Add other common filters if needed (e.g., length is built-in, join is built-in)
 
         for (key, value) in &self.args {
@@ -775,8 +916,10 @@ impl Task {
                         key,
                         s
                     );
-                    // Use the local arg_tera instance with custom filters
-                    match crate::playbook::templar::render_value(s, &mut arg_tera, context) {
+                    // 对 template.content、debug.msg、debug.var 强制字符串渲染
+                    let force_string = (self.module == "template" && key == "content")
+                        || (self.module == "debug" && (key == "msg" || key == "var"));
+                    match crate::playbook::templar::render_value(s, &mut arg_tera, context, force_string) {
                         Ok(rendered_value) => {
                             debug!(
                                 "RESOLVE_ARGS: Rendered key {:?} to value: {:?}",

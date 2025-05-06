@@ -76,7 +76,7 @@
             output_dir: "/var/reports"
     
     # For conditional testing
-    env_type: "production"
+    env_type: "dev"
     maintenance_mode: false
     user_role: "admin"
     
@@ -281,49 +281,49 @@
       when: "item.enabled == true"
     
     # Template module test - basic template
-    #- name: Create motd file from template
-    #  template:
-    #    src: "templates/motd.j2"
-    #    dest: "{{ config_dir }}/motd"
-    #    mode: '0644'
-    #  vars:
-    #    template_content: "{{ motd_content }}"
+    - name: Create motd file from template
+      template:
+        src: "templates/motd.j2"
+        dest: "{{ config_dir }}/motd"
+        mode: '0644'
+      vars:
+        template_content: "{{ motd_content }}"
     
     # Template module test - inline template
-    #- name: Create environment info file from inline template
-    #  template:
-    #    content: |
-    #      # Environment: {{ env_type }}
-    #      
-    #      Database host: {{ application.environments[env_type].database.host }}
-    #      Database name: {{ application.environments[env_type].database.name }}
-    #      
-    #      Application version: {{ application.version }}
-    #      Maintenance mode: {{ 'ENABLED' if maintenance_mode else 'DISABLED' }}
-    #    dest: "{{ config_dir }}/env_info.txt"
-    #    mode: '0644'
+    - name: Create environment info file from inline template
+      template:
+        content: |
+          # Environment: {{ env_type }}
+          
+          Database host: {{ application.environments[env_type].database.host }}
+          Database name: {{ application.environments[env_type].database.name }}
+          
+          Application version: {{ application.version }}
+          Maintenance mode: {% if maintenance_mode %}ENABLED{% else %}DISABLED{% endif %}
+        dest: "{{ config_dir }}/env_info.txt"
+        mode: '0644'
     
-    ## Template module test - with loop
-    #- name: Create service config files from template
-    #  template:
-    #    content: |
-    #      # {{ item.name | upper }} Configuration
-    #      
-    #      [service]
-    #      name={{ item.name }}
-    #      port={{ item.port }}
-    #      
-    #      [paths]
-    #      config_path={{ item.config_path }}
-    #      log_path=/var/log/{{ item.name }}
-    #      
-    #      [status]
-    #      enabled={{ item.enabled | lower }}
-    #      environment={{ env_type }}
-    #    dest: "{{ config_dir }}/{{ item.name }}/{{ item.name }}.conf"
-    #    mode: '0644'
-    #  with_items: "{{ services }}"
-    #  when: "item.enabled == true"
+    # Template module test - with loop
+    - name: Create service config files from template
+      template:
+        content: |
+          # {{ item.name | upper }} Configuration
+          
+          [service]
+          name={{ item.name }}
+          port={{ item.port }}
+          
+          [paths]
+          config_path={{ item.config_path }}
+          log_path=/var/log/{{ item.name }}
+          
+          [status]
+          enabled={{ item.enabled }}
+          environment={{ env_type }}
+        dest: "{{ config_dir }}/{{ item.name }}/{{ item.name }}.conf"
+        mode: '0644'
+      with_items: "{{ services }}"
+      when: "item.enabled == true"
     
     # Package module test - basic install
     - name: Install basic packages
@@ -357,7 +357,7 @@
     
     # Complex variable in command
     - name: Complex command with nested variables
-      shell: "echo 'Database host for {{ env_type }}: {{ application.environments[env_type].database.host }}'"
+      shell: "echo \"'Database host for {{ env_type }}: {{ application.environments[env_type].database.host }}'\""
       register: db_echo
     
     - name: Show result of complex command
@@ -389,12 +389,12 @@
     # Final report with complex templating
     - name: Generate system report with complex templating
       debug:
-        msg: |
-          === System Report ===
-          App: {{ application.name }} v{{ application.version }}
-          Environment: {{ env_type }}
-          Server: {{ server.hostname }} ({{ server.ip }})
-          Resources: {{ server.specs.cpu }} CPUs, {{ server.specs.ram }}GB RAM
-          Enabled Services: {{ services | selectattr('enabled', 'equalto', true) | map(attribute='name') | join(', ') }}
-          Features: {{ application.features | length }} configured
-          ----------------------------- 
+         msg: |
+           === System Report ===
+           App: {{ application.name }} v{{ application.version }}
+           Environment: {{ env_type }}
+           Server: {{ server.hostname }} ({{ server.ip }})
+           Resources: {{ server.specs.cpu }} CPUs, {{ server.specs.ram }}GB RAM
+           Features: {{ application.features | length }} configured
+           Enabled Services: {{ services | selectattr(key='enabled', test='equalto', value=true) | map(attribute='name') | join(sep=', ') }}
+           -----------------------------

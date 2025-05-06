@@ -16,6 +16,10 @@ db2.example.com:2222 ansible_ssh_user=dbadmin
 db1 ansible_host=192.168.1.201 ansible_user=admin
 db2 ansible_host=192.168.1.202 ansible_user=admin
 
+# Test group for testing features
+[test]
+10.121.219.191 ansible_ssh_user=root ansible_ssh_pass=Lenovo_ops@2020
+
 # Group variables
 [webservers:vars]
 http_port=80
