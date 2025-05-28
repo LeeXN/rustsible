@@ -204,32 +204,7 @@ impl SshClient {
         } else {
             debug!("Set temporary file mode to: {}", temp_mode);
         }
-        
-        // Step 3: Move the temporary file to the target location with sudo
-        let move_cmd = format!("mv {} {}", temp_filename, remote_path);
-        let (exit_code, _, stderr) = self.execute_sudo_command(&move_cmd, "")?;
-        if exit_code != 0 {
-            // Clean up temp file if move failed
-            let _ = self.execute_command(&format!("rm -f {}", temp_filename));
-            return Err(anyhow!("Failed to move file to target location: {}", stderr));
-        }
-        
-        // Step 4: Ensure file permissions are correct after move
-        // Determine the final mode: explicit mode > original mode > default 644
-        let final_mode = mode
-            .map(|m| m.to_string())
-            .or(original_mode)
-            .unwrap_or_else(|| "644".to_string());
-            
-        let chmod_cmd = format!("chmod {} {}", final_mode, remote_path);
-        let (chmod_exit_code, _, chmod_stderr) = self.execute_sudo_command(&chmod_cmd, "")?;
-        if chmod_exit_code != 0 {
-            warn!("Failed to set file mode: {}", chmod_stderr);
-        } else {
-            debug!("Set final file mode to: {}", final_mode);
-        }
-        
-        // Step 5: Set file ownership - use explicit params if provided, otherwise preserve original
+        // set the temporary file to have same owner as target ( or default to original owner)
         let target_owner = owner.map(|o| o.to_string()).or(original_owner);
         let target_group = group.map(|g| g.to_string()).or(original_group);
         
@@ -242,7 +217,7 @@ impl SshClient {
             };
             
             if !ownership.is_empty() {
-                let chown_cmd = format!("chown {} {}", ownership, remote_path);
+                let chown_cmd = format!("chown {} {}", ownership, temp_filename);
                 let (chown_exit_code, _, chown_stderr) = self.execute_sudo_command(&chown_cmd, "")?;
                 if chown_exit_code != 0 {
                     warn!("Failed to set file ownership: {}", chown_stderr);
@@ -250,6 +225,15 @@ impl SshClient {
                     debug!("Set file ownership to: {}", ownership);
                 }
             }
+        }
+
+        // Step 3: Move the temporary file to the target location with sudo
+        let move_cmd = format!("mv {} {}", temp_filename, remote_path);
+        let (exit_code, _, stderr) = self.execute_sudo_command(&move_cmd, "")?;
+        if exit_code != 0 {
+            // Clean up temp file if move failed
+            let _ = self.execute_command(&format!("rm -f {}", temp_filename));
+            return Err(anyhow!("Failed to move file to target location: {}", stderr));
         }
         
         info!("Successfully wrote file {} with sudo privileges", remote_path);
