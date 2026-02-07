@@ -69,6 +69,106 @@ rustsible ad-hoc all -m lineinfile -a "path=/etc/hosts line='127.0.0.1 test.loca
 
 ---
 
+## Testing
+
+Rustsible includes comprehensive unit tests to ensure code quality and prevent regressions.
+
+### Running Tests
+
+```bash
+# Run all tests
+cargo test
+
+# Run tests with output
+cargo test -- --nocapture
+
+# Run specific test module
+cargo test modules::file
+
+# Run tests with coverage (requires cargo-tarpaulin)
+cargo tarpaulin --out Html
+```
+
+### Test Organization
+
+Tests are organized as follows:
+- **Module tests**: Unit tests within each module file (e.g., `src/modules/file.rs`) using `#[cfg(test)]` modules
+- **Integration tests**: System-level tests in `tests/` directory for multi-module workflows
+- **Shared utilities**: Common test helpers in `src/testing/mod.rs` for reducing duplication
+- **Fixtures**: Test data in `tests/fixtures/` for sample playbooks and inventory files
+
+### Test Patterns
+
+#### Async Code Testing
+
+All async functions use `#[tokio::test]` attribute:
+
+```rust
+#[tokio::test]
+async fn test_async_function() {
+    // Test async code here
+}
+```
+
+For time-dependent tests, use `tokio::time::pause` for deterministic behavior.
+
+#### Using Mocks
+
+External dependencies (SSH, filesystem) are mocked using `mockall`:
+
+```rust
+use mockall::mock;
+use crate::ssh::connection::SshClient;
+
+#[mock]
+trait SshClientMock {
+    fn connect(host: &Host) -> Result<SshClient>;
+}
+```
+
+#### Parameter Testing
+
+Test module parameters using the `testing` module helpers:
+
+```rust
+use crate::testing::{create_test_host, create_test_mapping};
+
+#[test]
+fn test_module_with_params() {
+    let args = create_test_mapping(vec![
+        ("path", Value::String("/tmp/test".to_string())),
+        ("mode", Value::String("0644".to_string())),
+    ]);
+    // Test with args...
+}
+```
+
+#### Property-Based Testing
+
+For functions with complex logic, use `proptest` to generate test cases:
+
+```rust
+use proptest::prelude::*;
+
+proptest! {
+    #[test]
+    fn prop_parameter_type_coersion(input in ".*") {
+        // Test with generated inputs...
+    }
+}
+```
+
+### Test Coverage
+
+Target: 80%+ overall coverage, 90%+ for critical modules (SSH, playbook execution).
+
+Generate coverage report:
+```bash
+cargo tarpaulin --out Html --output-dir coverage
+```
+
+---
+
 ## Inventory Example
 
 ```ini

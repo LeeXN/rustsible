@@ -1,6 +1,6 @@
+use log::debug;
 use std::collections::{HashMap, HashSet};
 use std::hash::{Hash, Hasher};
-use log::debug;
 
 #[derive(Debug, Clone)]
 pub struct Host {
@@ -22,7 +22,7 @@ impl Host {
         };
 
         debug!("Creating new host: {}", cleaned_name);
-        
+
         Host {
             name: cleaned_name.to_string(),
             hostname: cleaned_name.to_string(),
@@ -31,51 +31,57 @@ impl Host {
             inherited_variables: HashMap::new(),
         }
     }
-    
+
     pub fn with_port(mut self, port: u16) -> Self {
         self.port = port;
         self
     }
-    
+
     pub fn add_inherited_variable(&mut self, key: &str, value: &str) -> bool {
         if !self.variables.contains_key(key) {
-            self.inherited_variables.insert(key.to_string(), value.to_string());
+            self.inherited_variables
+                .insert(key.to_string(), value.to_string());
             true
         } else {
             false
         }
     }
-    
+
     pub fn get_variable(&self, key: &str) -> Option<&String> {
-        self.variables.get(key).or_else(|| self.inherited_variables.get(key))
+        self.variables
+            .get(key)
+            .or_else(|| self.inherited_variables.get(key))
     }
-    
+
     pub fn set_variable(&mut self, key: &str, value: &str) {
-        debug!("Setting variable for host {}: {} = {}", self.name, key, value);
-        
+        debug!(
+            "Setting variable for host {}: {} = {}",
+            self.name, key, value
+        );
+
         // 处理特殊的Ansible变量
         match key {
             "ansible_host" | "ansible_ssh_host" => {
                 self.hostname = value.to_string();
                 debug!("Set hostname to {} from {}", value, key);
-            },
+            }
             "ansible_port" | "ansible_ssh_port" => {
                 if let Ok(port_num) = value.parse::<u16>() {
                     self.port = port_num;
                     debug!("Set port to {} from {}", port_num, key);
                 }
-            },
+            }
             _ => {}
         }
-        
+
         self.variables.insert(key.to_string(), value.to_string());
     }
-    
+
     pub fn get_ssh_user(&self) -> Option<&String> {
         self.get_variable("ansible_user")
             .or_else(|| self.get_variable("ansible_ssh_user"))
     }
-    
+
     pub fn get_ssh_password(&self) -> Option<&String> {
         self.get_variable("ansible_password")
             .or_else(|| self.get_variable("ansible_ssh_pass"))
@@ -84,7 +90,7 @@ impl Host {
         self.get_variable("ansible_sudo_pass")
             .or_else(|| self.get_variable("ansible_ssh_sudo_pass"))
     }
-    
+
     pub fn get_ssh_private_key(&self) -> Option<&String> {
         self.get_variable("ansible_ssh_private_key_file")
     }
@@ -124,24 +130,24 @@ impl HostGroup {
             children: HashSet::new(),
         }
     }
-    
+
     pub fn with_parent(mut self, parent: &str) -> Self {
         self.parent = Some(parent.to_string());
         self
     }
-    
+
     pub fn add_child(&mut self, child: &str) -> bool {
         self.children.insert(child.to_string())
     }
-    
+
     pub fn add_host(&mut self, host: &str) -> bool {
         self.hosts.insert(host.to_string())
     }
-    
+
     pub fn add_variable(&mut self, key: &str, value: &str) {
         self.variables.insert(key.to_string(), value.to_string());
     }
-    
+
     pub fn set_variable(&mut self, key: &str, value: &str) {
         self.variables.insert(key.to_string(), value.to_string());
     }
@@ -196,4 +202,4 @@ mod tests {
         assert_eq!(host.get_ssh_password(), Some(&"pass1".to_string()));
         assert_eq!(host.get_ssh_private_key(), Some(&"/key".to_string()));
     }
-} 
+}

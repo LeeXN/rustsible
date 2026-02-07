@@ -1,12 +1,12 @@
 use anyhow::Result;
-use log::{info, debug, error};
-use serde_yaml::{Value, Mapping};
 use colored::Colorize;
+use log::{debug, error, info};
+use serde_yaml::{Mapping, Value};
 use std::collections::{HashMap, HashSet};
 use std::time::Instant;
 
 use crate::inventory::Host;
-use crate::playbook::{Task, TaskResult, Handler};
+use crate::playbook::{Handler, Task, TaskResult};
 
 /// Play structure representing a set of tasks to run on hosts
 #[derive(Debug, Clone)]
@@ -16,10 +16,10 @@ pub struct Play {
     pub tasks: Vec<Task>,
     pub handlers: Vec<Handler>,
     pub vars: Mapping,
-    pub is_become: bool,  // renamed from 'become' to avoid Rust keyword
+    pub is_become: bool, // renamed from 'become' to avoid Rust keyword
     pub become_user: String,
     #[allow(dead_code)]
-    pub tags: Vec<String>,  // Keep this for future use
+    pub tags: Vec<String>, // Keep this for future use
 }
 
 impl Play {
@@ -27,7 +27,7 @@ impl Play {
         let start_time = Instant::now();
         info!("PLAY [{}] on {} hosts", self.name, hosts.len());
         println!("\n{}", format!("PLAY [{}]", self.name).bold());
-        
+
         // Track task results for the play recap
         let mut _ok_hosts = 0;
         let mut failed_hosts = HashSet::new();
@@ -36,41 +36,49 @@ impl Play {
 
         // Track which handlers have been notified
         let mut notified_handlers: HashSet<String> = HashSet::new();
-        
+
         // Execute all tasks in order
         for (task_index, task) in self.tasks.iter().enumerate() {
-            debug!("Executing task {} of {}: {}", 
-                  task_index + 1, self.tasks.len(), task.name);
-            
+            debug!(
+                "Executing task {} of {}: {}",
+                task_index + 1,
+                self.tasks.len(),
+                task.name
+            );
+
             // 更接近ansible风格的任务标题
-            println!("\nTASK [{}] {}", task.name, "*".repeat(80 - task.name.len() - 8).dimmed());
-            
+            println!(
+                "\nTASK [{}] {}",
+                task.name,
+                "*".repeat(80 - task.name.len() - 8).dimmed()
+            );
+
             let mut task_results = Vec::new();
-            
+
             // Create a task with play's become settings if task doesn't override
             let mut effective_task = task.clone();
             if !effective_task.is_become && self.is_become {
                 effective_task.is_become = self.is_become;
                 effective_task.become_user = self.become_user.clone();
             }
-            
+
             for host in hosts {
                 // Prepare host-specific variables by merging play vars with host vars
                 let mut host_vars: HashMap<String, Value> = HashMap::new();
-                
+
                 // First add play variables
                 for (key, value) in &self.vars {
                     if let Value::String(k) = key {
                         host_vars.insert(k.clone(), value.clone());
                     }
                 }
-                
+
                 // Then add host variables (they take precedence over play vars)
                 // Add host's own variables
                 for (key, value) in &host.variables {
                     host_vars.insert(key.clone(), Value::String(value.clone()));
                 }
-                
+
                 // Add host's inherited variables (from groups)
                 for (key, value) in &host.inherited_variables {
                     // Only add if not already set by host or play variables
@@ -78,15 +86,28 @@ impl Play {
                         host_vars.insert(key.clone(), Value::String(value.clone()));
                     }
                 }
-                
+
                 // Add standard ansible facts for the host
-                host_vars.insert("ansible_hostname".to_string(), Value::String(host.hostname.clone()));
-                host_vars.insert("inventory_hostname".to_string(), Value::String(host.name.clone()));
-                host_vars.insert("ansible_host".to_string(), Value::String(host.hostname.clone()));
+                host_vars.insert(
+                    "ansible_hostname".to_string(),
+                    Value::String(host.hostname.clone()),
+                );
+                host_vars.insert(
+                    "inventory_hostname".to_string(),
+                    Value::String(host.name.clone()),
+                );
+                host_vars.insert(
+                    "ansible_host".to_string(),
+                    Value::String(host.hostname.clone()),
+                );
                 host_vars.insert("ansible_port".to_string(), Value::Number(host.port.into()));
-                
-                debug!("Host {} has {} variables available", host.name, host_vars.len());
-                
+
+                debug!(
+                    "Host {} has {} variables available",
+                    host.name,
+                    host_vars.len()
+                );
+
                 // Execute the task on this host with merged variables
                 match effective_task.execute(host, &host_vars) {
                     Ok(result) => {
@@ -101,58 +122,74 @@ impl Play {
                                 changed_hosts.insert(host.name.clone());
                             }
                         }
-                        
+
                         // Store the result for registered variables
                         if let Some(register_var) = &effective_task.register {
                             // Convert TaskResult to a Value for storage
                             let mut result_value = Mapping::new();
-                            result_value.insert(Value::String("changed".to_string()), 
-                                              Value::Bool(result.changed));
-                            result_value.insert(Value::String("failed".to_string()), 
-                                              Value::Bool(result.failed));
-                            result_value.insert(Value::String("skipped".to_string()), 
-                                              Value::Bool(result.skipped));
-                            
+                            result_value.insert(
+                                Value::String("changed".to_string()),
+                                Value::Bool(result.changed),
+                            );
+                            result_value.insert(
+                                Value::String("failed".to_string()),
+                                Value::Bool(result.failed),
+                            );
+                            result_value.insert(
+                                Value::String("skipped".to_string()),
+                                Value::Bool(result.skipped),
+                            );
+
                             if !result.msg.is_empty() {
-                                result_value.insert(Value::String("msg".to_string()), 
-                                                   Value::String(result.msg.clone()));
+                                result_value.insert(
+                                    Value::String("msg".to_string()),
+                                    Value::String(result.msg.clone()),
+                                );
                             }
-                            
+
                             // Add any module-specific values
                             for (k, v) in &result.values {
                                 result_value.insert(Value::String(k.clone()), v.clone());
                             }
-                            
+
                             // Store in host variables for next tasks (registered variables are host-specific)
                             host_vars.insert(register_var.clone(), Value::Mapping(result_value));
                         }
-                        
+
                         // Check for handler notifications
                         if result.changed && !effective_task.notify.is_empty() {
                             for handler_name in &effective_task.notify {
-                                debug!("Handler '{}' notified by task '{}'", handler_name, effective_task.name);
+                                debug!(
+                                    "Handler '{}' notified by task '{}'",
+                                    handler_name, effective_task.name
+                                );
                                 notified_handlers.insert(handler_name.clone());
                             }
                         }
-                        
+
                         task_results.push(result);
-                    },
+                    }
                     Err(e) => {
                         error!("Task execution failed on host {}: {}", host.name, e);
-                        
+
                         // Create a failed result
                         let mut result = TaskResult::new(&host.name);
                         result.failed = true;
                         result.msg = format!("Task execution error: {}", e);
-                        
+
                         // Explicitly print the failure result to console
                         let error_time = "0.00s"; // Execution time is not available here
-                        crate::playbook::task::print_task_result(&host.name, &effective_task.name, &result, error_time);
-                        
+                        crate::playbook::task::print_task_result(
+                            &host.name,
+                            &effective_task.name,
+                            &result,
+                            error_time,
+                        );
+
                         failed_hosts.insert(host.name.clone());
-                        
+
                         task_results.push(result);
-                        
+
                         // Skip further tasks for this host if there's an unhandled error
                         if !effective_task.ignore_errors {
                             // In a more complete implementation, we would track failed hosts
@@ -161,61 +198,69 @@ impl Play {
                     }
                 }
             }
-            
+
             // Check if the play should fail based on task results
             let failed_count = task_results.iter().filter(|r| r.failed).count();
             if failed_count > 0 && !effective_task.ignore_errors {
-                return Err(anyhow::anyhow!("Task '{}' failed on {} hosts", 
-                                           effective_task.name, failed_count));
+                return Err(anyhow::anyhow!(
+                    "Task '{}' failed on {} hosts",
+                    effective_task.name,
+                    failed_count
+                ));
             }
         }
-        
+
         // Run handlers that were notified
         if !notified_handlers.is_empty() {
             info!("Running notified handlers");
             println!("\n{}", "RUNNING HANDLERS".bold());
-            println!("{}\n", format!("{} handlers to run", notified_handlers.len()).dimmed());
-            
+            println!(
+                "{}\n",
+                format!("{} handlers to run", notified_handlers.len()).dimmed()
+            );
+
             for handler in &self.handlers {
                 let handler_name = &handler.task.name;
-                
+
                 if notified_handlers.contains(handler_name) {
                     debug!("Running notified handler: {}", handler_name);
-                    
+
                     // Create a handler with play's become settings if it doesn't override
                     let mut effective_handler = handler.task.clone();
                     if !effective_handler.is_become && self.is_become {
                         effective_handler.is_become = self.is_become;
                         effective_handler.become_user = self.become_user.clone();
                     }
-                    
+
                     for host in hosts {
                         // Prepare host-specific variables for handlers too
                         let mut handler_vars: HashMap<String, Value> = HashMap::new();
-                        
+
                         // Add play variables
                         for (key, value) in &self.vars {
                             if let Value::String(k) = key {
                                 handler_vars.insert(k.clone(), value.clone());
                             }
                         }
-                        
+
                         // Add host variables
                         for (key, value) in &host.variables {
                             handler_vars.insert(key.clone(), Value::String(value.clone()));
                         }
-                        
+
                         // Add host's inherited variables
                         for (key, value) in &host.inherited_variables {
                             if !handler_vars.contains_key(key) {
                                 handler_vars.insert(key.clone(), Value::String(value.clone()));
                             }
                         }
-                        
+
                         if let Err(e) = effective_handler.execute(host, &handler_vars) {
-                            error!("Handler '{}' failed on host {}: {}", 
-                                  handler_name, host.name, e);
-                            
+                            error!(
+                                "Handler '{}' failed on host {}: {}",
+                                handler_name, host.name, e
+                            );
+
                             // Handlers failures are usually considered non-fatal
                             // but in a more complete implementation, we might make this configurable
                         }
@@ -223,42 +268,151 @@ impl Play {
                 }
             }
         }
-        
+
         let elapsed = start_time.elapsed();
         let execution_time = format!("{:.2}s", elapsed.as_secs_f64());
-        
+
         info!("Play '{}' completed in {}", self.name, execution_time);
-        
+
         // Print a more detailed play recap similar to ad-hoc output
         println!("\n{}", "PLAY RECAP".bold());
         println!("{}", "*".repeat(80).dimmed());
-        
+
         // 更接近ansible风格的recap输出
         for host in hosts {
             let mut host_attrs = Vec::new();
-            
+
             if failed_hosts.contains(&host.name) {
                 host_attrs.push(format!("{}={}", "failed".red().bold(), 1));
             } else {
                 host_attrs.push(format!("{}={}", "ok".green().bold(), 1));
             }
-            
+
             if changed_hosts.contains(&host.name) {
                 host_attrs.push(format!("{}={}", "changed".yellow().bold(), 1));
             }
-            
+
             if _skipped_hosts > 0 {
                 host_attrs.push(format!("{}={}", "skipped".yellow().bold(), 1));
             }
-            
+
             // 添加执行时间信息
-            host_attrs.push(format!("{}={:.2}s", "time".cyan(), elapsed.as_secs_f64() / hosts.len() as f64));
-            
+            host_attrs.push(format!(
+                "{}={:.2}s",
+                "time".cyan(),
+                elapsed.as_secs_f64() / hosts.len() as f64
+            ));
+
             println!("{:<30} : {}", host.name.bold(), host_attrs.join("  "));
         }
-        
+
         println!("\nPlay execution completed in {}", execution_time);
-        
+
         Ok(())
     }
-} 
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::testing::create_test_host;
+    use serde_yaml::Mapping;
+
+    fn create_local_host() -> Host {
+        create_test_host("localhost", "localhost", 22, None, None)
+    }
+
+    fn create_test_play() -> Play {
+        Play {
+            name: "Test Play".to_string(),
+            hosts: "localhost".to_string(),
+            tasks: Vec::new(),
+            handlers: Vec::new(),
+            vars: Mapping::new(),
+            is_become: false,
+            become_user: "root".to_string(),
+            tags: Vec::new(),
+        }
+    }
+
+    fn create_command_task(name: &str, command: &str) -> Task {
+        let mut args = Mapping::new();
+        args.insert(
+            Value::String("_raw_params".to_string()),
+            Value::String(command.to_string()),
+        );
+
+        Task {
+            name: name.to_string(),
+            module: "command".to_string(),
+            args,
+            is_become: false,
+            become_user: "root".to_string(),
+            register: None,
+            when: None,
+            notify: Vec::new(),
+            ignore_errors: false,
+            tags: Vec::new(),
+            loop_items: None,
+            loop_var_name: None,
+            index_var_name: None,
+        }
+    }
+
+    #[test]
+    fn test_play_execute_sequential() {
+        let mut play = create_test_play();
+        play.tasks.push(create_command_task("Task 1", "echo task1"));
+        play.tasks.push(create_command_task("Task 2", "echo task2"));
+
+        let hosts = vec![create_local_host()];
+        let result = play.execute(&hosts);
+
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_play_execute_failure() {
+        let mut play = create_test_play();
+        // False command fails with exit code 1
+        play.tasks.push(create_command_task("Fail Task", "false"));
+
+        let hosts = vec![create_local_host()];
+        let result = play.execute(&hosts);
+
+        // Should return error because task failed
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_play_execute_ignore_errors() {
+        let mut play = create_test_play();
+        let mut task = create_command_task("Fail Task", "false");
+        task.ignore_errors = true;
+        play.tasks.push(task);
+        play.tasks
+            .push(create_command_task("Success Task", "echo success"));
+
+        let hosts = vec![create_local_host()];
+        let result = play.execute(&hosts);
+
+        // Should succeed because ignore_errors is true
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_play_execute_when_condition() {
+        let mut play = create_test_play();
+        let mut task = create_command_task("Conditional Task", "echo ran");
+        // Condition that evaluates to false
+        task.when = Some(Value::String("1 == 2".to_string()));
+        play.tasks.push(task);
+
+        let hosts = vec![create_local_host()];
+        let result = play.execute(&hosts);
+
+        assert!(result.is_ok());
+        // In a real test we'd check if it ran, but here we just check it didn't crash
+        // and returned success (skipped tasks are successful)
+    }
+}

@@ -4,4 +4,4 @@ use crate::playbook::Task;
 #[derive(Debug, Clone)]
 pub struct Handler {
     pub task: Task,
-} 
+}

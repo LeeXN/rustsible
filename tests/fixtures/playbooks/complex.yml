@@ -1,0 +1,54 @@
+---
+# Complex playbook for testing with various module types
+
+- name: Test multiple modules
+  hosts: localhost
+  connection: local
+  become: false
+  vars:
+    app_user: testuser
+    app_dir: /opt/testapp
+    config_file: /opt/testapp/config.ini
+
+  tasks:
+    - name: Create application user
+      user:
+        name: "{{ app_user }}"
+        system: true
+        shell: /bin/false
+        create_home: true
+      when: false
+
+    - name: Create application directories
+      file:
+        path: "{{ item }}"
+        state: directory
+        mode: "0755"
+      loop:
+        - "{{ app_dir }}/logs"
+        - "{{ app_dir }}/data"
+        - "{{ app_dir }}/tmp"
+
+    - name: Create base configuration
+      copy:
+        content: |
+          [app]
+          name=MyApplication
+          version=1.0.0
+          debug=false
+        dest: "{{ config_file }}"
+        mode: "0644"
+
+    - name: Configure application settings
+      lineinfile:
+        path: "{{ config_file }}"
+        regexp: "^debug="
+        line: "debug=true"
+        backup: true
+
+    - name: Display environment info
+      debug:
+        msg:
+          - "App directory: {{ app_dir }}"
+          - "Config file: {{ config_file }}"
+          - "User: {{ app_user }}"

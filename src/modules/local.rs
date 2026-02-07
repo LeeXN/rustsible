@@ -1,39 +1,36 @@
-use anyhow::{Result, anyhow};
+use anyhow::{anyhow, Result};
+use log::{debug, info};
 use serde_yaml::Value;
 use std::process::Command;
-use log::{info, debug};
 
+use crate::inventory::Host;
 use crate::modules::ModuleResult;
 use crate::ssh::connection::SshClient;
-use crate::inventory::Host;
 
 /// Execute the command module locally (without SSH)
 pub fn execute_local_command(command: &str) -> Result<(i32, String, String)> {
     debug!("Executing local command: {}", command);
-    
+
     // Use shell for more consistent behavior across platforms
     let output = if cfg!(target_os = "windows") {
-        Command::new("cmd")
-            .args(&["/C", command])
-            .output()
+        Command::new("cmd").args(&["/C", command]).output()
     } else {
-        Command::new("sh")
-            .args(&["-c", command])
-            .output()
-    }.map_err(|e| anyhow!("Failed to execute command: {}", e))?;
-    
+        Command::new("sh").args(&["-c", command]).output()
+    }
+    .map_err(|e| anyhow!("Failed to execute command: {}", e))?;
+
     let stdout = String::from_utf8_lossy(&output.stdout).to_string();
     let stderr = String::from_utf8_lossy(&output.stderr).to_string();
-    
+
     Ok((output.status.code().unwrap_or(1), stdout, stderr))
 }
 
 /// Execute the command module - runs a command on the target host
 pub fn execute(
-    ssh_client: &SshClient, 
-    args: &Value, 
-    use_become: bool, 
-    become_user: &str
+    ssh_client: &SshClient,
+    args: &Value,
+    use_become: bool,
+    become_user: &str,
 ) -> Result<ModuleResult> {
     if let Value::Mapping(map) = args {
         // Get the raw command to execute
@@ -42,11 +39,11 @@ pub fn execute(
             _ => return Err(anyhow!("Command module requires a command string")),
         };
 
-        // Check if this is a local execution 
+        // Check if this is a local execution
         let host_type = map.get(&Value::String("_host_type".to_string()));
         let is_local = match host_type {
             Some(Value::String(host_type)) => host_type == "local",
-            _ => false, 
+            _ => false,
         };
 
         let (exit_code, stdout, stderr) = if is_local {
@@ -59,18 +56,19 @@ pub fn execute(
             // Run command remotely without sudo
             ssh_client.execute_command(cmd)?
         };
-        
+
         let mut result = ModuleResult::default();
         result.stdout = stdout;
         result.stderr = stderr;
-        
+
         if exit_code == 0 {
             result.changed = true;
             result.msg = format!("Command executed successfully (exit code: {})", exit_code);
         } else {
+            result.failed = true;
             result.msg = format!("Command failed with exit code: {}", exit_code);
         }
-        
+
         Ok(result)
     } else {
         Err(anyhow!("Command module requires parameters"))
@@ -84,7 +82,7 @@ pub fn execute_adhoc(host: &Host, args: &Value) -> Result<ModuleResult> {
         // For localhost, execute directly without SSH
         return execute_adhoc_local(host, args);
     }
-    
+
     info!("Connecting to host: {}", host.name);
     let ssh_client = match crate::ssh::connection::SshClient::connect(host) {
         Ok(client) => client,
@@ -93,11 +91,12 @@ pub fn execute_adhoc(host: &Host, args: &Value) -> Result<ModuleResult> {
                 stdout: String::new(),
                 stderr: format!("Connection error: {}", e),
                 changed: false,
+                failed: true,
                 msg: format!("Failed to connect to host: {}", e),
             });
         }
     };
-    
+
     execute(&ssh_client, args, false, "")
 }
 
@@ -110,22 +109,23 @@ fn execute_adhoc_local(host: &Host, args: &Value) -> Result<ModuleResult> {
             Some(Value::String(cmd)) => cmd,
             _ => return Err(anyhow!("Command module requires a command string")),
         };
-        
+
         info!("Executing local command on host {}: {}", host.name, cmd);
-        
+
         let (exit_code, stdout, stderr) = execute_local_command(cmd)?;
-        
+
         let mut result = ModuleResult::default();
         result.stdout = stdout;
         result.stderr = stderr;
-        
+
         if exit_code == 0 {
             result.changed = true;
             result.msg = format!("Command executed successfully (exit code: {})", exit_code);
         } else {
+            result.failed = true;
             result.msg = format!("Command failed with exit code: {}", exit_code);
         }
-        
+
         Ok(result)
     } else {
         Err(anyhow!("Command module requires parameters"))
@@ -144,4 +144,4 @@ mod tests {
         assert_eq!(out.trim(), "hello");
         assert!(err.is_empty());
     }
-} 
+}

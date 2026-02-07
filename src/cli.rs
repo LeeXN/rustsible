@@ -1,4 +1,4 @@
-use clap::{Command, Arg, ArgAction};
+use clap::{Arg, ArgAction, Command};
 
 pub fn build_cli() -> Command {
     Command::new("rustsible")
@@ -13,34 +13,34 @@ pub fn build_cli() -> Command {
                     Arg::new("playbook")
                         .help("Playbook file to run")
                         .required(true)
-                        .index(1)
+                        .index(1),
                 )
                 .arg(
                     Arg::new("inventory")
                         .short('i')
                         .long("inventory")
                         .help("Specify inventory file path (default: 'inventory')")
-                        .value_name("INVENTORY")
+                        .value_name("INVENTORY"),
                 )
                 .arg(
                     Arg::new("verbose")
                         .short('v')
                         .action(ArgAction::Count)
-                        .help("Increase verbosity (up to -vvvv)")
+                        .help("Increase verbosity (up to -vvvv)"),
                 )
                 .arg(
                     Arg::new("limit")
                         .short('l')
                         .long("limit")
                         .help("Limit to specified hosts or groups")
-                        .value_name("SUBSET")
+                        .value_name("SUBSET"),
                 )
                 .arg(
                     Arg::new("check")
                         .long("check")
                         .help("Perform a dry run without making changes")
-                        .action(ArgAction::SetTrue)
-                )
+                        .action(ArgAction::SetTrue),
+                ),
         )
         .subcommand(
             Command::new("ad-hoc")
@@ -49,7 +49,7 @@ pub fn build_cli() -> Command {
                     Arg::new("pattern")
                         .help("Host pattern to target")
                         .required(true)
-                        .index(1)
+                        .index(1),
                 )
                 .arg(
                     Arg::new("module")
@@ -57,7 +57,7 @@ pub fn build_cli() -> Command {
                         .long("module")
                         .help("Module name to execute")
                         .required(true)
-                        .value_name("MODULE")
+                        .value_name("MODULE"),
                 )
                 .arg(
                     Arg::new("args")
@@ -65,21 +65,21 @@ pub fn build_cli() -> Command {
                         .long("args")
                         .help("Module arguments")
                         .required(true)
-                        .value_name("ARGS")
+                        .value_name("ARGS"),
                 )
                 .arg(
                     Arg::new("inventory")
                         .short('i')
                         .long("inventory")
                         .help("Specify inventory file path (default: 'inventory')")
-                        .value_name("INVENTORY")
+                        .value_name("INVENTORY"),
                 )
                 .arg(
                     Arg::new("verbose")
                         .short('v')
                         .action(ArgAction::Count)
-                        .help("Increase verbosity (up to -vvvv)")
-                )
+                        .help("Increase verbosity (up to -vvvv)"),
+                ),
         )
         .subcommand(
             Command::new("inventory-debug")
@@ -89,14 +89,14 @@ pub fn build_cli() -> Command {
                         .short('i')
                         .long("inventory")
                         .help("Specify inventory file path (default: 'inventory')")
-                        .value_name("INVENTORY")
+                        .value_name("INVENTORY"),
                 )
                 .arg(
                     Arg::new("verbose")
                         .short('v')
                         .action(ArgAction::Count)
-                        .help("Increase verbosity (up to -vvvv)")
-                )
+                        .help("Increase verbosity (up to -vvvv)"),
+                ),
         )
 }
 
@@ -112,4 +112,4 @@ mod tests {
         assert!(subcommands.contains(&"ad-hoc"));
         assert!(subcommands.contains(&"inventory-debug"));
     }
-} 
+}

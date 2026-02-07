@@ -1,0 +1,24 @@
+---
+# Simple playbook for testing
+
+- name: Test simple playbook
+  hosts: localhost
+  connection: local
+  vars:
+    test_var: "hello world"
+    test_number: 42
+
+  tasks:
+    - name: Print a message
+      debug:
+        msg: "{{ test_var }}"
+
+    - name: Create a test file
+      file:
+        path: /tmp/test_rustsible.txt
+        state: touch
+
+    - name: Remove test file
+      file:
+        path: /tmp/test_rustsible.txt
+        state: absent
