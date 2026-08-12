@@ -1,633 +1,218 @@
 # Rustsible
 
-**Ansible-Compatible, High-Performance IT Automation in Rust**
-
+[![CI](https://github.com/LeeXN/rustsible/actions/workflows/rust.yml/badge.svg)](https://github.com/LeeXN/rustsible/actions/workflows/rust.yml)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
-[![Ask DeepWiki](https://deepwiki.com/badge.svg)](https://deepwiki.com/LeeXN/rustsible)
 
-> ⚠️ **Development Status**: Rustsible is currently under active development. While many core features are functional, some features may be incomplete or subject to change. Use in production environments at your own discretion.
+Rustsible is an experimental, Ansible-inspired configuration and command runner written in Rust.
 
----
+> Rustsible is not a drop-in replacement for Ansible. It implements a useful subset of Ansible's inventory, playbook, templating, and module behavior, but compatibility is incomplete. Review a playbook with `--check` and test it in a disposable environment before using it on important systems.
 
-## Overview
+## Current scope
 
-Rustsible is a modern, Ansible-compatible automation tool written in Rust. It aims to be a drop-in replacement for Ansible, providing improved performance, safety, and maintainability. Rustsible leverages Rust's async and concurrency features, and is designed with modularity, type safety, and extensibility in mind.
+Rustsible currently provides:
 
----
+- INI and YAML inventory parsing, group variables, child groups, and host-pattern filtering;
+- playbook tasks, variables, loops, conditions, registered results, handlers, and `become` support;
+- ad-hoc module execution;
+- local command execution and remote execution through SSH;
+- the `command`, `shell`, `debug`, `copy`, `file`, `template`, `lineinfile`, `user`, `service`, and `package` modules;
+- short module names and the `ansible.builtin.*` / `ansible.legacy.*` name prefixes;
+- playbook `--limit`, `--check`, and `--forks` options.
 
-## Features
+Tasks retain playbook order, while hosts within a task run concurrently with a bounded worker count (`--forks`, default 5). Most state-management modules and remote commands assume a POSIX shell, and the `package`, `service`, and `user` modules target Linux-style system tools. Linux is the primary supported and tested platform; Windows support is not claimed.
 
-- **Ansible-Compatible**: Supports standard Ansible playbooks and inventory formats
-- **High Performance**: Built with Rust, optimized for speed and memory safety
-- **Async & Concurrency**: Uses `tokio` for async task execution and efficient resource management
-- **Modular Architecture**: Each module (e.g., file, copy, template) is cleanly separated and reusable
-- **Local & Remote Execution**: Seamless execution on localhost and remote hosts via SSH
-- **Type-Safe Parameter Extraction**: Generic, type-safe parameter extraction utilities for robust module development
-- **Minimal Dependencies**: Distributed as a single binary, no Python or external runtime required
-- **Cross-Platform**: Works on Linux, macOS, and Windows
+Module names and common parameters resemble Ansible, but their complete argument schemas, facts, plugin system, transports, strategy engine, Vault support, and all Ansible edge cases are not implemented. Idempotency and check-mode prediction can also differ from Ansible.
 
----
+## Build
 
-## Quick Start
-
-### Build from Source
+Install a current stable Rust toolchain, then run:
 
 ```bash
-# Clone the repository
 git clone https://github.com/LeeXN/rustsible.git
 cd rustsible
-
-# Build release binary
-cargo build --release
+cargo build --release --locked
 ```
 
-The binary will be at `target/release/rustsible`.
+The binary is written to `target/release/rustsible`.
 
-### Usage Examples
+## Usage
 
-#### Run a Playbook
+Run a playbook:
 
 ```bash
-rustsible playbook examples/playbooks/test_all_modules.yml -i inventory
+rustsible playbook site.yml -i inventory.ini
 ```
 
-#### Run Ad-hoc Commands
+Limit execution to a host or group expression:
 
 ```bash
-# Basic command execution
-rustsible ad-hoc localhost -m command -a "uname -a"
-
-# File operations
-rustsible ad-hoc all -m file -a "path=/tmp/test state=touch mode=0644"
-
-# User management
-rustsible ad-hoc all -m user -a "name=testuser state=present shell=/bin/bash"
-
-# Line file management
-rustsible ad-hoc all -m lineinfile -a "path=/etc/hosts line='127.0.0.1 test.local' backup=true"
+rustsible playbook site.yml -i inventory.ini --limit webservers
 ```
 
----
-
-## Testing
-
-Rustsible includes comprehensive unit tests to ensure code quality and prevent regressions.
-
-### Running Tests
+Preview a playbook without applying state changes:
 
 ```bash
-# Run all tests
-cargo test
-
-# Run tests with output
-cargo test -- --nocapture
-
-# Run specific test module
-cargo test modules::file
-
-# Run tests with coverage (requires cargo-tarpaulin)
-cargo tarpaulin --out Html
+rustsible playbook site.yml -i inventory.ini --check
 ```
 
-### Test Organization
+In check mode, commands with no safe prediction (`command` and `shell`) are skipped. State-management modules report their predicted result without applying it. Prediction is best effort and is not a substitute for testing against a disposable target.
 
-Tests are organized as follows:
-- **Module tests**: Unit tests within each module file (e.g., `src/modules/file.rs`) using `#[cfg(test)]` modules
-- **Integration tests**: System-level tests in `tests/` directory for multi-module workflows
-- **Shared utilities**: Common test helpers in `src/testing/mod.rs` for reducing duplication
-- **Fixtures**: Test data in `tests/fixtures/` for sample playbooks and inventory files
+Control the maximum number of hosts processed concurrently:
 
-### Test Patterns
-
-#### Async Code Testing
-
-All async functions use `#[tokio::test]` attribute:
-
-```rust
-#[tokio::test]
-async fn test_async_function() {
-    // Test async code here
-}
-```
-
-For time-dependent tests, use `tokio::time::pause` for deterministic behavior.
-
-#### Using Mocks
-
-External dependencies (SSH, filesystem) are mocked using `mockall`:
-
-```rust
-use mockall::mock;
-use crate::ssh::connection::SshClient;
-
-#[mock]
-trait SshClientMock {
-    fn connect(host: &Host) -> Result<SshClient>;
-}
-```
-
-#### Parameter Testing
-
-Test module parameters using the `testing` module helpers:
-
-```rust
-use crate::testing::{create_test_host, create_test_mapping};
-
-#[test]
-fn test_module_with_params() {
-    let args = create_test_mapping(vec![
-        ("path", Value::String("/tmp/test".to_string())),
-        ("mode", Value::String("0644".to_string())),
-    ]);
-    // Test with args...
-}
-```
-
-#### Property-Based Testing
-
-For functions with complex logic, use `proptest` to generate test cases:
-
-```rust
-use proptest::prelude::*;
-
-proptest! {
-    #[test]
-    fn prop_parameter_type_coersion(input in ".*") {
-        // Test with generated inputs...
-    }
-}
-```
-
-### Test Coverage
-
-Target: 80%+ overall coverage, 90%+ for critical modules (SSH, playbook execution).
-
-Generate coverage report:
 ```bash
-cargo tarpaulin --out Html --output-dir coverage
+rustsible playbook site.yml -i inventory.ini --forks 10
 ```
 
----
+Run an ad-hoc module:
 
-## Inventory Example
+```bash
+rustsible ad-hoc webservers -i inventory.ini -m command -a "uname -a"
+rustsible ad-hoc all -i inventory.ini -m file -a "path=/tmp/example state=touch mode=0644"
+rustsible ad-hoc all -i inventory.ini -m package -a "name=curl state=present" --become --check
+```
+
+Ad-hoc runs inherit `ansible_become` and `ansible_become_user` per host. Use
+`--become`, `--become-user`, `--check`, and `--forks` to override execution
+controls from the command line.
+
+Inspect the parsed inventory without running tasks:
+
+```bash
+rustsible inventory-debug -i inventory.ini
+```
+
+Use `rustsible <subcommand> --help` for the complete CLI syntax.
+
+## Inventory
+
+A minimal INI inventory looks like this:
 
 ```ini
 [webservers]
-web1.example.com
-web2.example.com
-
-[dbservers]
-db1.example.com
-db2.example.com
+web1 ansible_host=192.0.2.10 ansible_user=deploy
+web2 ansible_host=192.0.2.11 ansible_port=2222
 
 [local]
 localhost ansible_connection=local
 
-[all:vars]
-ansible_user=admin
+[webservers:vars]
+ansible_ssh_private_key_file=/home/deploy/.ssh/id_ed25519
 ```
 
----
-
-## Supported Modules
-
-Rustsible supports a comprehensive set of modules compatible with Ansible. All modules support both local and remote execution.
-
-### 1. command - Execute Commands
-Execute simple system commands.
+YAML inventory is also accepted:
 
 ```yaml
-- name: Check system information
-  command: uname -a
+all:
+  children:
+    webservers:
+      hosts:
+        web1:
+          ansible_host: 192.0.2.10
+          ansible_user: deploy
 ```
 
-### 2. shell - Execute Shell Commands
-Execute complex shell commands with pipes and redirections.
+Inventory variables may contain credentials. Keep inventory files out of source control, restrict their file permissions, and prefer SSH keys over passwords.
 
-```yaml
-- name: Use shell with pipes
-  shell: ps aux | grep nginx | head -5
-```
-
-### 3. debug - Debug Output
-Output debug information and variable content.
-
-```yaml
-- name: Display variable
-  debug:
-    var: ansible_hostname
-
-- name: Display message
-  debug:
-    msg: "Hello, {{ ansible_hostname }}!"
-```
-
-### 4. copy - Copy Files
-Copy files to target hosts.
-
-```yaml
-- name: Copy configuration file
-  copy:
-    src: /local/path/config.yml
-    dest: /remote/path/config.yml
-    mode: "0644"
-    owner: root
-    group: root
-
-- name: Create file with content
-  copy:
-    content: |
-      server {
-        listen 80;
-        server_name example.com;
-      }
-    dest: /etc/nginx/sites-available/example
-    mode: "0644"
-```
-
-### 5. file - File Management
-Manage file and directory states and permissions.
-
-```yaml
-- name: Create directory
-  file:
-    path: /var/app/logs
-    state: directory
-    mode: "0755"
-    owner: app
-    group: app
-
-- name: Remove file
-  file:
-    path: /tmp/old_file.txt
-    state: absent
-
-- name: Create empty file
-  file:
-    path: /var/log/app.log
-    state: touch
-    mode: "0644"
-```
-
-### 6. template - Template Rendering
-Render files using the Tera template engine.
-
-```yaml
-- name: Generate configuration file
-  template:
-    src: templates/nginx.conf.j2
-    dest: /etc/nginx/nginx.conf
-    mode: "0644"
-    vars:
-      server_name: "{{ ansible_hostname }}"
-      worker_processes: 4
-```
-
-### 7. lineinfile - Line Management ⭐ New Feature
-Manage single lines in files, similar to Ansible's lineinfile module.
-
-#### Basic Usage
-```yaml
-- name: Add configuration line
-  lineinfile:
-    path: /etc/hosts
-    line: "192.168.1.100 myserver.local"
-    backup: true
-
-- name: Update line using regex
-  lineinfile:
-    path: /etc/ssh/sshd_config
-    regexp: "^#?PermitRootLogin"
-    line: "PermitRootLogin no"
-    backup: true
-
-- name: Insert line at specific position
-  lineinfile:
-    path: /etc/fstab
-    line: "/dev/sdb1 /data ext4 defaults 0 2"
-    insertafter: "^/dev/sda"
-
-- name: Remove matching lines
-  lineinfile:
-    path: /etc/hosts
-    regexp: ".*old-server.*"
-    state: absent
-```
-
-#### Parameters
-- `path`: Target file path (required)
-- `line`: Line content to add or modify
-- `regexp`: Regular expression to match lines for modification
-- `state`: State, `present` (default) or `absent`
-- `backup`: Create backup file, default `false`
-- `create`: Create file if it doesn't exist, default `false`
-- `insertafter`: Insert after matching line, supports `EOF`
-- `insertbefore`: Insert before matching line, supports `BOF`
-- `mode`: File permissions
-- `owner`: File owner
-- `group`: File group
-
-### 8. user - User Management ⭐ New Feature
-Manage system user accounts, similar to Ansible's user module.
-
-#### Basic Usage
-```yaml
-- name: Create user
-  user:
-    name: myuser
-    comment: "My Application User"
-    shell: /bin/bash
-    home: /home/myuser
-    create_home: true
-    state: present
-
-- name: Create system user
-  user:
-    name: appuser
-    system: true
-    shell: /bin/false
-    create_home: false
-    comment: "Application service user"
-
-- name: Add user to groups
-  user:
-    name: myuser
-    groups: ["wheel", "docker"]
-    append: true
-
-- name: Modify user shell
-  user:
-    name: myuser
-    shell: /bin/zsh
-
-- name: Remove user
-  user:
-    name: olduser
-    state: absent
-    remove: true  # Also remove home directory
-```
-
-#### Parameters
-- `name`: Username (required)
-- `state`: State, `present` (default) or `absent`
-- `uid`: User ID
-- `gid`: Primary group ID
-- `groups`: Additional groups list
-- `append`: Append to existing groups, default `false`
-- `home`: Home directory path
-- `shell`: Login shell
-- `comment`: User comment (GECOS)
-- `password`: Encrypted password hash
-- `create_home`: Create home directory, default `true`
-- `system`: System user, default `false`
-- `remove`: Remove home directory when deleting user, default `false`
-
-### 9. service - Service Management
-Manage system service states.
-
-```yaml
-- name: Start nginx service
-  service:
-    name: nginx
-    state: started
-    enabled: true
-
-- name: Restart service
-  service:
-    name: mysql
-    state: restarted
-```
-
-### 10. package - Package Management
-Manage system packages.
-
-```yaml
-- name: Install package
-  package:
-    name: nginx
-    state: present
-
-- name: Install multiple packages
-  package:
-    name: ["git", "curl", "vim"]
-    state: present
-```
-
----
-
-## Local Execution Support
-
-All modules support local execution (localhost). When the target host is `localhost` or `127.0.0.1`, modules execute directly without SSH connections.
-
-```yaml
-- name: Local execution example
-  hosts: localhost
-  tasks:
-    - name: Create local file
-      file:
-        path: /tmp/local_test.txt
-        state: touch
-    
-    - name: Manage local user
-      user:
-        name: localuser
-        state: present
-```
-
----
-
-## Ad-hoc Command Examples
-
-All modules support ad-hoc command execution with automatic type conversion for parameters:
-
-```bash
-# Basic commands
-rustsible ad-hoc all -m command -a "uname -a"
-rustsible ad-hoc all -m shell -a "ps aux | grep nginx"
-
-# File operations
-rustsible ad-hoc all -m file -a "path=/tmp/test state=touch mode=0644"
-rustsible ad-hoc all -m file -a "path=/var/app state=directory mode=0755"
-
-# Copy files
-rustsible ad-hoc all -m copy -a "src=/local/file dest=/remote/file mode=0644"
-rustsible ad-hoc all -m copy -a "content='Hello World' dest=/tmp/hello.txt"
-
-# Line file management
-rustsible ad-hoc all -m lineinfile -a "path=/etc/hosts line='127.0.0.1 test.local' backup=true"
-rustsible ad-hoc all -m lineinfile -a "path=/tmp/config.txt regexp='^setting=' line='setting=new_value'"
-
-# User management
-rustsible ad-hoc all -m user -a "name=testuser state=present shell=/bin/bash"
-rustsible ad-hoc all -m user -a "name=testuser groups=wheel,docker append=true"
-rustsible ad-hoc all -m user -a "name=testuser state=absent remove=true"
-
-# Service management
-rustsible ad-hoc all -m service -a "name=nginx state=started enabled=true"
-
-# Package management
-rustsible ad-hoc all -m package -a "name=curl state=present"
-
-# Debug output
-rustsible ad-hoc all -m debug -a "msg='Hello from Rustsible'"
-```
-
-📖 **For comprehensive ad-hoc examples**, see [examples/ad-hoc-examples.md](examples/ad-hoc-examples.md)
-
----
-
-## Example Playbooks
-
-Check the `examples/playbooks/` directory for comprehensive examples:
-
-- `test_lineinfile.yml` - lineinfile module examples
-- `test_user.yml` - user module examples  
-- `test_all_modules.yml` - comprehensive module demonstration
-- `test_all_features.yml` - advanced features showcase
-
-### Sample Playbook
+## Playbook example
 
 ```yaml
 ---
-- name: Complete System Setup
-  hosts: all
+- name: Configure web nodes
+  hosts: webservers
   become: true
   vars:
-    app_user: myapp
-    app_dir: /opt/myapp
-    config_file: "{{ app_dir }}/config.ini"
-  
+    config_path: /etc/example.conf
+
   tasks:
-    # User management
-    - name: Create application user
-      user:
-        name: "{{ app_user }}"
-        system: true
-        shell: /bin/false
-        home: "{{ app_dir }}"
-        create_home: true
-    
-    # Directory setup
-    - name: Create application directories
-      file:
-        path: "{{ item }}"
-        state: directory
-        owner: "{{ app_user }}"
-        group: "{{ app_user }}"
-        mode: "0755"
-      loop:
-        - "{{ app_dir }}/logs"
-        - "{{ app_dir }}/data"
-        - "{{ app_dir }}/tmp"
-    
-    # Configuration management
-    - name: Create base configuration
-      copy:
-        content: |
-          [app]
-          name=MyApplication
-          version=1.0.0
-          debug=false
-          
-          [database]
-          host=localhost
-          port=5432
-        dest: "{{ config_file }}"
-        owner: "{{ app_user }}"
-        mode: "0640"
-    
-    - name: Configure application settings
-      lineinfile:
-        path: "{{ config_file }}"
-        regexp: "^{{ item.key }}="
-        line: "{{ item.key }}={{ item.value }}"
-        backup: true
-      loop:
-        - { key: "debug", value: "true" }
-        - { key: "log_level", value: "INFO" }
-    
-    # Template rendering
-    - name: Generate startup script
+    - name: Install the package
+      package:
+        name: nginx
+        state: present
+
+    - name: Render configuration
       template:
-        content: |
-          #!/bin/bash
-          # Startup script for {{ app_user }}
-          # Generated on {{ ansible_date_time.date }}
-          
-          APP_USER="{{ app_user }}"
-          APP_DIR="{{ app_dir }}"
-          CONFIG_FILE="{{ config_file }}"
-          
-          echo "Starting application as $APP_USER"
-          echo "Application directory: $APP_DIR"
-          echo "Configuration file: $CONFIG_FILE"
-        dest: "{{ app_dir }}/start.sh"
-        mode: "0755"
-        owner: "{{ app_user }}"
+        src: templates/example.conf.j2
+        dest: "{{ config_path }}"
+        mode: "0644"
+      notify: restart nginx
+
+  handlers:
+    - name: restart nginx
+      service:
+        name: nginx
+        state: restarted
 ```
 
----
+Examples under [`examples/`](examples/) include runnable subset examples plus explicitly documented migration fixtures that exercise unsupported Ansible syntax. They are examples rather than a compatibility guarantee.
 
-## Error Handling
+## SSH security defaults
 
-All modules support comprehensive error handling:
+SSH host-key verification is enabled by default. Rustsible reads the system OpenSSH known-hosts file and `$HOME/.ssh/known_hosts`; an unknown or mismatched key causes the connection to fail.
 
-```yaml
-- name: Task that might fail
-  user:
-    name: testuser
-    groups: ["nonexistent_group"]
-  ignore_errors: true
+For an isolated known-hosts file, set one of these inventory variables:
 
-- name: Conditional task
-  lineinfile:
-    path: /etc/config
-    line: "setting=value"
-  when: ansible_os_family == "RedHat"
+```ini
+host1 rustsible_known_hosts_file=/path/to/known_hosts
+# ansible_ssh_known_hosts_file is also recognized
 ```
 
----
+Host-key verification can be disabled only through an explicit inventory setting:
 
-## Best Practices
-
-1. **Backup Important Files**: Use `backup: true` parameter for file modifications
-2. **Permission Management**: Always explicitly set file permissions and ownership
-3. **Idempotency**: Leverage module idempotency - repeated execution produces consistent results
-4. **Error Handling**: Use `ignore_errors` or conditional statements for potentially failing tasks
-5. **Variable Usage**: Make playbooks flexible with template variables and facts
-6. **Testing**: Test playbooks in development environments before production deployment
-
----
-
-## Architecture Highlights
-
-- **Async Runtime**: All remote operations are async, using `tokio` for concurrency and efficiency
-- **Channel-Based Communication**: Uses `tokio::sync` channels for task coordination
-- **Type-Safe Parameter Extraction**: Generic, type-safe parameter utilities in `src/modules/param.rs`:
-
-```rust
-let path: String = get_param(args, "path")?;
-let mode: Option<String> = get_optional_param(args, "mode");
-let backup: bool = get_optional_param(args, "backup").unwrap_or(false);
+```ini
+host1 rustsible_host_key_checking=false
 ```
 
-- **Error Handling**: All modules use `anyhow::Result` and propagate errors with context
-- **Extensible Modules**: Add new modules by implementing the required trait and registering in `src/modules/mod.rs`
-- **Template Engine**: Uses Tera for powerful template rendering with Ansible-compatible syntax
+`ansible_host_key_checking` and `ansible_ssh_host_key_checking` are also recognized. Disabling verification makes SSH connections vulnerable to interception and should only be used in controlled, temporary environments.
 
+The default SSH connection timeout is 10 seconds and the default remote-command timeout is 300 seconds. They can be configured with `ansible_ssh_timeout` / `ansible_timeout` and `rustsible_command_timeout` / `ansible_command_timeout`, respectively.
 
+## Supported modules
 
----
+The following built-in modules are registered:
+
+| Module | Purpose |
+| --- | --- |
+| `command` | Run a command |
+| `shell` | Run a command through a shell |
+| `debug` | Display a message or variable |
+| `copy` | Copy a controller file or literal content |
+| `file` | Manage files, directories, links, and permissions |
+| `template` | Render a Tera/Jinja-like template |
+| `lineinfile` | Add, replace, or remove matching lines |
+| `user` | Manage local user accounts |
+| `service` | Manage service state and enablement |
+| `package` | Manage packages through detected system tools |
+
+Only the subset exercised by this repository's tests should be considered supported. Consult the module source and examples before relying on Ansible-specific parameters.
+
+## Development and testing
+
+The CI-equivalent local checks are:
+
+```bash
+cargo fmt --all -- --check
+cargo clippy --all-targets --all-features --locked -- -D warnings
+cargo test --all-targets --all-features --locked
+cargo llvm-cov --all-targets --all-features --locked --fail-under-lines 70
+cargo build --release --all-features --locked
+```
+
+To run a focused test, pass its name to Cargo, for example:
+
+```bash
+cargo test modules::file
+```
+
+For a staged hands-on acceptance run covering local execution, SSH, check mode,
+idempotency, privilege escalation, failure handling, concurrency, and log
+redaction, follow [`MANUAL_TEST_PLAN.md`](MANUAL_TEST_PLAN.md).
+
+Dependency advisories are checked in CI against `Cargo.lock`. CI also enforces a 70% line-coverage floor; the current all-target result is 73.01%. This is a regression baseline, not a claim that every remote SSH path is exercised end to end.
 
 ## License
 
-This project is licensed under the [MIT License](LICENSE).
-
----
+Rustsible is available under the [MIT License](LICENSE).
 
 ## Acknowledgements
 
-- Inspired by [Ansible](https://github.com/ansible/ansible)
-- Built with 💜 in Rust
-- Thanks to [Ansible](https://github.com/ansible/ansible) and the Rust community
-- Cursor AI for the code completion and documentation
+Rustsible is inspired by [Ansible](https://github.com/ansible/ansible) and uses names familiar to Ansible users. It is an independent implementation and is not affiliated with or endorsed by Red Hat or the Ansible project.

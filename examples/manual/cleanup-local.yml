@@ -1,0 +1,9 @@
+---
+- name: Clean Rustsible manual local acceptance files
+  hosts: manual_local
+  connection: local
+  tasks:
+    - name: Remove the dedicated test directory
+      file:
+        path: /tmp/rustsible-manual
+        state: absent

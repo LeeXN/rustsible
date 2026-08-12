@@ -1,0 +1,68 @@
+---
+- name: Rustsible manual local acceptance
+  hosts: manual_local
+  connection: local
+  vars:
+    test_root: /tmp/rustsible-manual
+    secret_value: manual-secret-do-not-log
+
+  tasks:
+    - name: 创建 UTF-8 测试目录 🚀
+      file:
+        path: "{{ test_root }}"
+        state: directory
+        mode: "0750"
+
+    - name: Copy an idempotent configuration
+      copy:
+        content: |
+          application=rustsible
+          enabled=true
+        dest: "{{ test_root }}/app.conf"
+        mode: "0640"
+      check_mode: false
+      notify: Record configuration change
+
+    - name: Manage an independent line
+      lineinfile:
+        path: "{{ test_root }}/managed-lines.conf"
+        line: "managed=true"
+        create: true
+        mode: "0640"
+
+    - name: Render UTF-8 and a deterministic password hash
+      template:
+        content: |
+          greeting=你好，Rustsible 🚀
+          password_hash={{ 'manual-password' | password_hash('sha512', 'manualsalt') }}
+        dest: "{{ test_root }}/rendered.conf"
+        mode: "0600"
+
+    - name: Exercise no_log redaction
+      no_log: true
+      copy:
+        content: "{{ secret_value }}"
+        dest: "{{ test_root }}/secret.txt"
+        mode: "0600"
+
+    - name: Create files through a loop
+      copy:
+        content: "item={{ item }}"
+        dest: "{{ test_root }}/{{ item }}.txt"
+        mode: "0644"
+      loop:
+        - alpha
+        - beta
+      register: loop_files
+
+    - name: Confirm the registered loop result is usable
+      debug:
+        var: loop_files.results
+      when: loop_files is succeeded
+
+  handlers:
+    - name: Record configuration change
+      copy:
+        content: "handler-ran"
+        dest: "{{ test_root }}/handler.marker"
+        mode: "0644"

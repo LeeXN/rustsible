@@ -2,16 +2,16 @@
 
 webservers:
   hosts:
-    - web1.example.com
-    - web2.example.com
+    web1.example.com:
+    web2.example.com:
   vars:
     http_port: 80
 
 dbservers:
   hosts:
-    - db1.example.com
+    db1.example.com:
       ansible_port: 2222
-    - db2.example.com
+    db2.example.com:
   vars:
     db_port: 5432
 

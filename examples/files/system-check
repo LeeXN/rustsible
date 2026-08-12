@@ -1,0 +1,6 @@
+#!/bin/sh
+set -eu
+
+echo "System: $(hostname)"
+echo "Load: $(uptime)"
+echo "Disk: $(df -h / | tail -1)"

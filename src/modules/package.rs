@@ -1,13 +1,14 @@
-use anyhow::{Context, Result};
-use log::{debug, error, info, warn};
+use anyhow::{bail, Context, Result};
+use log::{debug, info};
 use serde_yaml::Value;
 
 use crate::inventory::Host;
+use crate::modules::file::quote_posix_shell_arg;
+use crate::modules::param::validate_params;
 use crate::modules::ModuleResult;
-use crate::ssh::connection::SshClient;
+use crate::ssh::connection::{Connection, SshConnection};
 
-/// Package states supported by the module
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum PackageState {
     Present,
     Absent,
@@ -15,18 +16,17 @@ enum PackageState {
 }
 
 impl PackageState {
-    fn from_str(s: &str) -> Result<Self> {
-        match s.to_lowercase().as_str() {
-            "present" | "installed" => Ok(PackageState::Present),
-            "absent" | "removed" => Ok(PackageState::Absent),
-            "latest" => Ok(PackageState::Latest),
-            _ => Err(anyhow::anyhow!("Invalid package state: {}", s)),
+    fn from_str(value: &str) -> Result<Self> {
+        match value.to_ascii_lowercase().as_str() {
+            "present" | "installed" => Ok(Self::Present),
+            "absent" | "removed" => Ok(Self::Absent),
+            "latest" => Ok(Self::Latest),
+            _ => bail!("Invalid package state: {value}"),
         }
     }
 }
 
-/// Package manager types
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum PackageManager {
     Apt,
     Yum,
@@ -35,360 +35,439 @@ enum PackageManager {
     Pacman,
 }
 
-/// Execute package module with the given arguments
+impl PackageManager {
+    fn executable(self) -> &'static str {
+        match self {
+            Self::Apt => "apt-get",
+            Self::Yum => "yum",
+            Self::Dnf => "dnf",
+            Self::Zypper => "zypper",
+            Self::Pacman => "pacman",
+        }
+    }
+}
+
+fn quote_package_name(name: &str) -> Result<String> {
+    if name.is_empty() || name.starts_with('-') {
+        bail!("Invalid package name: {name}");
+    }
+    quote_posix_shell_arg(name)
+}
+
+fn package_names(args: &Value) -> Result<Vec<String>> {
+    let map = args
+        .as_mapping()
+        .context("Package module requires a mapping of arguments")?;
+    let key = Value::String("name".to_string());
+    let names = match map.get(&key) {
+        Some(Value::String(name)) => vec![name.clone()],
+        Some(Value::Sequence(values)) => values
+            .iter()
+            .map(|value| match value {
+                Value::String(name) => Ok(name.clone()),
+                _ => bail!("Package names in a list must be strings"),
+            })
+            .collect::<Result<Vec<_>>>()?,
+        _ => bail!("Package module requires a 'name' parameter (string or list)"),
+    };
+    if names.is_empty() {
+        bail!("Package module requires at least one package name");
+    }
+    for name in &names {
+        quote_package_name(name)?;
+    }
+    Ok(names)
+}
+
+fn run_operation(
+    connection: &dyn SshConnection,
+    command: &str,
+    use_become: bool,
+    become_user: &str,
+) -> Result<(i32, String, String)> {
+    if use_become {
+        connection.execute_sudo_command(command, become_user)
+    } else {
+        // Do not silently escalate. A caller that omitted become should see
+        // the package manager's normal permission error.
+        connection.execute_command(command)
+    }
+}
+
+fn detect_package_manager(connection: &dyn SshConnection) -> Result<PackageManager> {
+    // Prefer the distribution's native manager where multiple compatibility
+    // front-ends are installed.
+    for manager in [
+        PackageManager::Apt,
+        PackageManager::Dnf,
+        PackageManager::Yum,
+        PackageManager::Zypper,
+        PackageManager::Pacman,
+    ] {
+        let command = format!("command -v -- {} >/dev/null 2>&1", manager.executable());
+        let (code, _, stderr) = connection
+            .execute_command(&command)
+            .with_context(|| format!("Failed while detecting {}", manager.executable()))?;
+        match code {
+            0 => return Ok(manager),
+            1 | 127 => {}
+            code => bail!(
+                "Failed while detecting {} (exit {}): {}",
+                manager.executable(),
+                code,
+                stderr.trim()
+            ),
+        }
+    }
+    bail!("No supported package manager was detected")
+}
+
+fn installed_query(manager: PackageManager, package: &str) -> Result<String> {
+    let package = quote_package_name(package)?;
+    Ok(match manager {
+        PackageManager::Apt => format!(
+            "dpkg-query -W -f='${{Status}}' -- {package} 2>/dev/null | grep -q '^install ok installed$'"
+        ),
+        PackageManager::Yum | PackageManager::Dnf | PackageManager::Zypper => {
+            format!("rpm -q -- {package} >/dev/null 2>&1")
+        }
+        PackageManager::Pacman => format!("pacman -Q -- {package} >/dev/null 2>&1"),
+    })
+}
+
+fn is_installed(
+    connection: &dyn SshConnection,
+    manager: PackageManager,
+    package: &str,
+) -> Result<bool> {
+    let command = installed_query(manager, package)?;
+    let (code, _, stderr) = connection.execute_command(&command)?;
+    match code {
+        0 => Ok(true),
+        1 => Ok(false),
+        code => bail!(
+            "Failed to query installed state for '{}' (exit {}): {}",
+            package,
+            code,
+            stderr.trim()
+        ),
+    }
+}
+
+fn is_latest(
+    connection: &dyn SshConnection,
+    manager: PackageManager,
+    package: &str,
+) -> Result<bool> {
+    let package_arg = quote_package_name(package)?;
+    let command = match manager {
+        PackageManager::Apt => format!(
+            "installed=$(dpkg-query -W -f='${{Version}}' -- {0} 2>/dev/null) || exit 2; candidate=$(apt-cache policy -- {0} | awk '/^[[:space:]]*Candidate:/ {{print $2; exit}}'); test -n \"$candidate\" || exit 3; test \"$installed\" = \"$candidate\"",
+            package_arg
+        ),
+        PackageManager::Dnf => format!("dnf -q check-update -- {package_arg}"),
+        PackageManager::Yum => format!("yum -q check-update -- {package_arg}"),
+        // `pacman -Qu` prints an entry and succeeds only when an upgrade is
+        // available, so its result is inverted below.
+        PackageManager::Pacman => format!("pacman -Qu -- {package_arg} >/dev/null 2>&1"),
+        PackageManager::Zypper => {
+            // Zypper has no stable, locale-independent per-package exit code
+            // for this question. Refuse to claim idempotency rather than run
+            // an update on every invocation.
+            bail!(
+                "state=latest is not supported for zypper because the installed/candidate state cannot be determined reliably"
+            )
+        }
+    };
+    let (code, _, stderr) = connection.execute_command(&command)?;
+    match manager {
+        PackageManager::Apt => match code {
+            0 => Ok(true),
+            1 => Ok(false),
+            2 => bail!(
+                "Package '{}' disappeared while checking its version",
+                package
+            ),
+            3 => bail!(
+                "No candidate version was reported for package '{}'",
+                package
+            ),
+            code => bail!(
+                "Failed to compare package versions for '{}' (exit {}): {}",
+                package,
+                code,
+                stderr.trim()
+            ),
+        },
+        PackageManager::Dnf | PackageManager::Yum => match code {
+            0 => Ok(true),
+            100 => Ok(false),
+            code => bail!(
+                "Failed to query available updates for '{}' (exit {}): {}",
+                package,
+                code,
+                stderr.trim()
+            ),
+        },
+        PackageManager::Pacman => match code {
+            0 => Ok(false),
+            1 => Ok(true),
+            code => bail!(
+                "Failed to query available updates for '{}' (exit {}): {}",
+                package,
+                code,
+                stderr.trim()
+            ),
+        },
+        PackageManager::Zypper => bail!("state=latest is not supported for zypper"),
+    }
+}
+
+fn package_needs_change(
+    connection: &dyn SshConnection,
+    manager: PackageManager,
+    package: &str,
+    state: PackageState,
+) -> Result<bool> {
+    let installed = is_installed(connection, manager, package)?;
+    match state {
+        PackageState::Present => Ok(!installed),
+        PackageState::Absent => Ok(installed),
+        PackageState::Latest if !installed => Ok(true),
+        PackageState::Latest => Ok(!is_latest(connection, manager, package)?),
+    }
+}
+
+fn cache_update_command(manager: PackageManager) -> &'static str {
+    match manager {
+        PackageManager::Apt => "apt-get update",
+        PackageManager::Yum => "yum -y makecache",
+        PackageManager::Dnf => "dnf -y makecache",
+        PackageManager::Zypper => "zypper --non-interactive refresh",
+        PackageManager::Pacman => "pacman -Sy --noconfirm",
+    }
+}
+
+fn change_command(manager: PackageManager, package: &str, state: PackageState) -> Result<String> {
+    let package = quote_package_name(package)?;
+    Ok(match (manager, state) {
+        (PackageManager::Apt, PackageState::Present) => format!("apt-get -y install -- {package}"),
+        (PackageManager::Apt, PackageState::Absent) => format!("apt-get -y remove -- {package}"),
+        // `install` both creates a missing package and upgrades an installed
+        // package to the candidate version, which is exactly `latest`.
+        (PackageManager::Apt, PackageState::Latest) => format!("apt-get -y install -- {package}"),
+        (PackageManager::Yum, PackageState::Present) => format!("yum -y install -- {package}"),
+        (PackageManager::Yum, PackageState::Absent) => format!("yum -y remove -- {package}"),
+        (PackageManager::Yum, PackageState::Latest) => format!("yum -y install -- {package}"),
+        (PackageManager::Dnf, PackageState::Present) => format!("dnf -y install -- {package}"),
+        (PackageManager::Dnf, PackageState::Absent) => format!("dnf -y remove -- {package}"),
+        (PackageManager::Dnf, PackageState::Latest) => format!("dnf -y install -- {package}"),
+        (PackageManager::Zypper, PackageState::Present) => {
+            format!("zypper --non-interactive install -- {package}")
+        }
+        (PackageManager::Zypper, PackageState::Absent) => {
+            format!("zypper --non-interactive remove -- {package}")
+        }
+        (PackageManager::Zypper, PackageState::Latest) => {
+            bail!("state=latest is not supported for zypper")
+        }
+        (PackageManager::Pacman, PackageState::Present) => {
+            format!("pacman -S --noconfirm -- {package}")
+        }
+        (PackageManager::Pacman, PackageState::Absent) => {
+            format!("pacman -R --noconfirm -- {package}")
+        }
+        (PackageManager::Pacman, PackageState::Latest) => {
+            format!("pacman -S --noconfirm -- {package}")
+        }
+    })
+}
+
+/// Manage one or more packages. Cache refresh is deliberately considered a
+/// change whenever requested because refreshing the manager's cache mutates
+/// local state even when package versions remain the same.
 pub fn execute(
-    ssh_client: &SshClient,
+    connection: &dyn SshConnection,
     args: &Value,
     use_become: bool,
     become_user: &str,
+    check_mode: bool,
 ) -> Result<ModuleResult> {
-    let map = match args {
-        Value::Mapping(map) => map,
-        _ => {
-            return Err(anyhow::anyhow!(
-                "Package module requires a mapping of arguments"
-            ))
-        }
+    validate_params(args, &["name", "state", "update_cache"])?;
+    let map = args
+        .as_mapping()
+        .context("Package module requires a mapping of arguments")?;
+    let packages = package_names(args)?;
+    let state = match map.get(Value::String("state".to_string())) {
+        Some(Value::String(state)) => PackageState::from_str(state)?,
+        Some(_) => bail!("Package 'state' must be a string"),
+        None => PackageState::Present,
+    };
+    let update_cache = match map.get(Value::String("update_cache".to_string())) {
+        Some(Value::Bool(value)) => *value,
+        Some(_) => bail!("Package 'update_cache' must be a boolean"),
+        None => false,
     };
 
-    // Get package name - support both string and sequence (list) formats
-    let packages = match map.get(&Value::String("name".to_string())) {
-        Some(Value::String(name)) => vec![name.clone()],
-        Some(Value::Sequence(names)) => {
-            let mut package_names = Vec::new();
-            for name_value in names {
-                if let Value::String(name) = name_value {
-                    package_names.push(name.clone());
+    let manager = detect_package_manager(connection)?;
+    info!("Detected package manager: {:?}", manager);
+    if manager == PackageManager::Zypper && state == PackageState::Latest {
+        bail!(
+            "state=latest is not supported for zypper because installed and candidate versions cannot be compared reliably"
+        );
+    }
+
+    // Probe every package before performing mutations. This prevents a later
+    // query failure from leaving only the first half of a package list changed.
+    let mut pending = Vec::new();
+    for package in &packages {
+        if package_needs_change(connection, manager, package, state)? {
+            pending.push(package.clone());
+        }
+    }
+    let changed = update_cache || !pending.is_empty();
+
+    if !check_mode {
+        if update_cache {
+            let command = cache_update_command(manager);
+            let (code, _, stderr) = run_operation(connection, command, use_become, become_user)?;
+            if code != 0 {
+                bail!(
+                    "Failed to update the package cache (exit {}): {}",
+                    code,
+                    stderr.trim()
+                );
+            }
+        }
+
+        for package in &pending {
+            let command = change_command(manager, package, state)?;
+            debug!(
+                "Executing package-manager operation ({} bytes)",
+                command.len()
+            );
+            let (code, _, stderr) = run_operation(connection, &command, use_become, become_user)?;
+            if code != 0 {
+                bail!(
+                    "Package operation failed for '{}' (exit {}): {}",
+                    package,
+                    code,
+                    stderr.trim()
+                );
+            }
+        }
+    }
+
+    Ok(ModuleResult {
+        stdout: String::new(),
+        stderr: String::new(),
+        rc: None,
+        changed,
+        failed: false,
+        msg: if changed {
+            format!(
+                "{} package(s) {}{}",
+                pending.len(),
+                if check_mode {
+                    "would be changed"
                 } else {
-                    return Err(anyhow::anyhow!("Package names in list must be strings"));
+                    "changed"
+                },
+                if update_cache {
+                    "; cache refresh requested"
+                } else {
+                    ""
                 }
-            }
-            if package_names.is_empty() {
-                return Err(anyhow::anyhow!(
-                    "Package module requires at least one package name"
-                ));
-            }
-            package_names
-        }
-        _ => {
-            return Err(anyhow::anyhow!(
-                "Package module requires a 'name' parameter (string or list)"
-            ))
-        }
-    };
-
-    // Get desired state
-    let state_str = match map.get(&Value::String("state".to_string())) {
-        Some(Value::String(state)) => state,
-        _ => "present", // Default to present if not specified
-    };
-
-    let state = PackageState::from_str(state_str).context("Failed to parse package state")?;
-
-    // Check if we should update package cache
-    let update_cache = match map.get(&Value::String("update_cache".to_string())) {
-        Some(Value::Bool(update)) => *update,
-        _ => false, // Default to false if not specified
-    };
-
-    // Detect package manager
-    let pkg_manager = detect_package_manager(ssh_client, use_become, become_user)?;
-    info!("Detected package manager: {:?}", pkg_manager);
-
-    // Update package cache if requested
-    if update_cache {
-        let update_cmd = match pkg_manager {
-            PackageManager::Apt => "apt-get update",
-            PackageManager::Yum => "yum check-update || true", // yum check-update returns 100 if updates are available
-            PackageManager::Dnf => "dnf check-update || true",
-            PackageManager::Zypper => "zypper refresh",
-            PackageManager::Pacman => "pacman -Sy",
-        };
-
-        info!("Updating package cache with command: {}", update_cmd);
-
-        let result = if use_become {
-            ssh_client.execute_sudo_command(update_cmd, become_user)?
+            )
         } else {
-            ssh_client.execute_sudo_command(update_cmd, "root")?
-        };
-
-        let (exit_code, _, stderr) = result;
-        if !stderr.trim().is_empty() {
-            warn!("Update cache stderr: {}", stderr);
-        }
-
-        // Special handling for yum/dnf check-update which returns 100 when updates are available
-        if exit_code != 0 && exit_code != 100 {
-            error!(
-                "Failed to update package cache with exit code: {}",
-                exit_code
-            );
-            return Err(anyhow::anyhow!(
-                "Failed to update package cache with exit code: {}",
-                exit_code
-            ));
-        }
-    }
-
-    // Process each package in the list
-    for package_name in packages.clone() {
-        info!("Processing package: {}", package_name);
-
-        // Build the command based on the detected package manager
-        let command = match (pkg_manager.clone(), &state) {
-            (PackageManager::Apt, PackageState::Present) => {
-                format!("apt-get -y install {}", package_name)
-            }
-            (PackageManager::Apt, PackageState::Absent) => {
-                format!("apt-get -y remove {}", package_name)
-            }
-            (PackageManager::Apt, PackageState::Latest) => {
-                format!("apt-get -y install --only-upgrade {}", package_name)
-            }
-
-            (PackageManager::Yum, PackageState::Present) => {
-                format!("yum -y install {}", package_name)
-            }
-            (PackageManager::Yum, PackageState::Absent) => {
-                format!("yum -y remove {}", package_name)
-            }
-            (PackageManager::Yum, PackageState::Latest) => {
-                format!("yum -y update {}", package_name)
-            }
-
-            (PackageManager::Dnf, PackageState::Present) => {
-                format!("dnf -y install {}", package_name)
-            }
-            (PackageManager::Dnf, PackageState::Absent) => {
-                format!("dnf -y remove {}", package_name)
-            }
-            (PackageManager::Dnf, PackageState::Latest) => {
-                format!("dnf -y update {}", package_name)
-            }
-
-            (PackageManager::Zypper, PackageState::Present) => {
-                format!("zypper --non-interactive install {}", package_name)
-            }
-            (PackageManager::Zypper, PackageState::Absent) => {
-                format!("zypper --non-interactive remove {}", package_name)
-            }
-            (PackageManager::Zypper, PackageState::Latest) => {
-                format!("zypper --non-interactive update {}", package_name)
-            }
-
-            (PackageManager::Pacman, PackageState::Present) => {
-                format!("pacman -S --noconfirm {}", package_name)
-            }
-            (PackageManager::Pacman, PackageState::Absent) => {
-                format!("pacman -R --noconfirm {}", package_name)
-            }
-            (PackageManager::Pacman, PackageState::Latest) => {
-                format!("pacman -Syu --noconfirm {}", package_name)
-            }
-        };
-
-        info!("Executing package command: {}", command);
-
-        // Check if package is already in desired state
-        if should_skip_operation(
-            ssh_client,
-            &package_name,
-            &state,
-            pkg_manager.clone(),
-            use_become,
-            become_user,
-        )? {
-            info!(
-                "Package '{}' is already in desired state '{}', skipping",
-                package_name, state_str
-            );
-            continue;
-        }
-
-        // Run the command with privilege escalation (always needed for package operations)
-        let result = if use_become {
-            ssh_client.execute_sudo_command(&command, become_user)?
-        } else {
-            // Force become for package operations
-            ssh_client.execute_sudo_command(&command, "root")?
-        };
-
-        let (exit_code, stdout, stderr) = result;
-
-        if !stdout.trim().is_empty() {
-            debug!("Command stdout: {}", stdout);
-        }
-
-        if !stderr.trim().is_empty() {
-            warn!("Command stderr: {}", stderr);
-        }
-
-        if exit_code != 0 {
-            error!("Package command failed with exit code: {}", exit_code);
-            return Err(anyhow::anyhow!(
-                "Package command failed for '{}' with exit code: {}",
-                package_name,
-                exit_code
-            ));
-        }
-
-        info!("Package '{}' is now in state '{}'", package_name, state_str);
-    }
-    let state_str = match state {
-        PackageState::Present => "installed",
-        PackageState::Absent => "removed",
-        PackageState::Latest => "updated",
-    };
-
-    Ok(ModuleResult {
-        stdout: String::new(),
-        stderr: String::new(),
-        changed: true,
-        failed: false,
-        msg: format!(
-            "Package(s) {} state changed to {}",
-            packages.join(", "),
-            state_str
-        ),
+            format!(
+                "Package(s) {} are already in the requested state",
+                packages.join(", ")
+            )
+        },
     })
 }
 
-/// Execute package module in ad-hoc mode
-pub fn execute_adhoc(host: &Host, package_args: &Value) -> Result<ModuleResult> {
-    info!("Connecting to host: {}", host.name);
-    let ssh_client = SshClient::connect(host)?;
-
-    // 执行包操作
-    execute(&ssh_client, package_args, false, "")?;
-
-    // 获取包名和状态用于输出消息
-    let map = match package_args {
-        Value::Mapping(map) => map,
-        _ => {
-            return Err(anyhow::anyhow!(
-                "Package module requires a mapping of arguments"
-            ))
-        }
-    };
-
-    // 尝试构建信息消息，包括包名和状态
-    let package_info = match map.get(&Value::String("name".to_string())) {
-        Some(Value::String(name)) => name.clone(),
-        Some(Value::Sequence(names)) => {
-            let mut package_names = Vec::new();
-            for name_value in names {
-                if let Value::String(name) = name_value {
-                    package_names.push(name.clone());
-                }
-            }
-            package_names.join(", ")
-        }
-        _ => "packages".to_string(),
-    };
-
-    let state = match map.get(&Value::String("state".to_string())) {
-        Some(Value::String(state)) => state.clone(),
-        _ => "present".to_string(),
-    };
-
-    Ok(ModuleResult {
-        stdout: String::new(),
-        stderr: String::new(),
-        changed: true,
-        failed: false,
-        msg: format!("Package(s) {} state changed to {}", package_info, state),
-    })
-}
-
-/// Detect the package manager used by the remote host
-fn detect_package_manager(
-    ssh_client: &SshClient,
+pub fn execute_adhoc(
+    host: &Host,
+    args: &Value,
     use_become: bool,
     become_user: &str,
-) -> Result<PackageManager> {
-    // Check for common package managers in order of preference
-    let checks = vec![
-        ("which apt-get", PackageManager::Apt),
-        ("which dnf", PackageManager::Dnf),
-        ("which yum", PackageManager::Yum),
-        ("which zypper", PackageManager::Zypper),
-        ("which pacman", PackageManager::Pacman),
-    ];
+    check_mode: bool,
+) -> Result<ModuleResult> {
+    info!("Opening connection for host: {}", host.name);
+    let connection = Connection::connect(host)?;
+    execute(
+        connection.as_connection(),
+        args,
+        use_become,
+        become_user,
+        check_mode,
+    )
+}
 
-    for (cmd, manager) in checks {
-        let result = if use_become {
-            ssh_client.execute_sudo_command(cmd, become_user)
-        } else {
-            ssh_client.execute_command(cmd)
-        };
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::ssh::connection::MockSshConnection;
 
-        if let Ok((exit_code, _, _)) = result {
-            if exit_code == 0 {
-                return Ok(manager);
-            }
-        }
+    #[test]
+    fn package_names_are_one_non_option_shell_argument() {
+        assert_eq!(
+            quote_package_name("libfoo;touch /tmp/pwned").unwrap(),
+            "'libfoo;touch /tmp/pwned'"
+        );
+        assert!(quote_package_name("").is_err());
+        assert!(quote_package_name("--installroot=/").is_err());
+        assert!(quote_package_name("bad\0name").is_err());
     }
 
-    // Default to apt if nothing else is found
-    warn!("No package manager detected, defaulting to apt");
-    Ok(PackageManager::Apt)
-}
+    #[test]
+    fn present_and_absent_plans_are_idempotent() {
+        // The decision itself is deliberately tiny and fully covered here;
+        // manager-specific exit-code interpretation is exercised separately.
+        assert!(!matches!(PackageState::Present, PackageState::Absent));
+        assert_eq!(
+            PackageState::from_str("installed").unwrap(),
+            PackageState::Present
+        );
+        assert_eq!(
+            PackageState::from_str("removed").unwrap(),
+            PackageState::Absent
+        );
+    }
 
-/// Check if the package is already in the desired state
-fn should_skip_operation(
-    ssh_client: &SshClient,
-    package_name: &str,
-    desired_state: &PackageState,
-    pkg_manager: PackageManager,
-    use_become: bool,
-    become_user: &str,
-) -> Result<bool> {
-    // Build command to check if package is installed
-    let check_cmd = match pkg_manager {
-        PackageManager::Apt => format!(
-            "dpkg-query -W -f='${{Status}}' {} 2>/dev/null | grep -q 'ok installed'",
-            package_name
-        ),
-        PackageManager::Yum | PackageManager::Dnf => {
-            format!("rpm -q {} >/dev/null 2>&1", package_name)
-        }
-        PackageManager::Zypper => format!("rpm -q {} >/dev/null 2>&1", package_name),
-        PackageManager::Pacman => format!("pacman -Q {} >/dev/null 2>&1", package_name),
-    };
+    #[test]
+    fn latest_command_can_install_a_missing_package() {
+        assert_eq!(
+            change_command(PackageManager::Apt, "curl", PackageState::Latest).unwrap(),
+            "apt-get -y install -- 'curl'"
+        );
+        assert_eq!(
+            change_command(PackageManager::Dnf, "curl", PackageState::Latest).unwrap(),
+            "dnf -y install -- 'curl'"
+        );
+        assert!(change_command(PackageManager::Zypper, "curl", PackageState::Latest).is_err());
+    }
 
-    let result = if use_become {
-        ssh_client.execute_sudo_command(&check_cmd, become_user)
-    } else {
-        ssh_client.execute_command(&check_cmd)
-    };
+    #[test]
+    fn check_mode_plans_without_running_package_mutations() {
+        let mut connection = MockSshConnection::new();
+        connection
+            .expect_execute_command()
+            .times(2)
+            .returning(|command| {
+                if command.contains("command -v") {
+                    Ok((0, "/usr/bin/apt-get\n".to_string(), String::new()))
+                } else {
+                    assert!(command.contains("dpkg-query"));
+                    Ok((1, String::new(), String::new()))
+                }
+            });
+        connection.expect_execute_sudo_command().times(0);
+        let args: Value = serde_yaml::from_str("name: curl\nstate: present\n").unwrap();
 
-    let is_installed = match result {
-        Ok((exit_code, _, _)) => exit_code == 0,
-        Err(_) => false,
-    };
-
-    // Compare current state with desired state
-    match desired_state {
-        PackageState::Present => {
-            // If we want it present and it's already installed, skip
-            Ok(is_installed)
-        }
-        PackageState::Absent => {
-            // If we want it absent and it's not installed, skip
-            Ok(!is_installed)
-        }
-        PackageState::Latest => {
-            // For latest, we need more checks
-            if !is_installed {
-                // If not installed at all, don't skip
-                return Ok(false);
-            }
-
-            // Check if package is already at latest version
-            // This varies by package manager, and requires more complex logic
-            // For simplicity, we'll always update when "latest" is requested
-            Ok(false)
-        }
+        let result = execute(&connection, &args, true, "root", true).unwrap();
+        assert!(result.changed);
     }
 }

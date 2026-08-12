@@ -1,13 +1,14 @@
-use anyhow::{Context, Result};
-use log::{error, info, warn};
+use anyhow::{bail, Context, Result};
+use log::info;
 use serde_yaml::Value;
 
 use crate::inventory::Host;
+use crate::modules::file::quote_posix_shell_arg;
+use crate::modules::param::validate_params;
 use crate::modules::ModuleResult;
-use crate::ssh::connection::SshClient;
+use crate::ssh::connection::{Connection, SshConnection};
 
-/// Service states supported by the module
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ServiceState {
     Started,
     Stopped,
@@ -16,236 +17,384 @@ enum ServiceState {
 }
 
 impl ServiceState {
-    fn from_str(s: &str) -> Result<Self> {
-        match s.to_lowercase().as_str() {
-            "started" => Ok(ServiceState::Started),
-            "stopped" => Ok(ServiceState::Stopped),
-            "restarted" => Ok(ServiceState::Restarted),
-            "reloaded" => Ok(ServiceState::Reloaded),
-            _ => Err(anyhow::anyhow!("Invalid service state: {}", s)),
+    fn from_str(value: &str) -> Result<Self> {
+        match value.to_ascii_lowercase().as_str() {
+            "started" => Ok(Self::Started),
+            "stopped" => Ok(Self::Stopped),
+            "restarted" => Ok(Self::Restarted),
+            "reloaded" => Ok(Self::Reloaded),
+            _ => bail!("Invalid service state: {value}"),
         }
     }
 }
 
-/// Execute service module with the given arguments
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum InitSystem {
+    Systemd,
+    SysV,
+    Upstart,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ServicePlan {
+    state_change: bool,
+    enable_change: bool,
+}
+
+impl ServicePlan {
+    fn changed(self) -> bool {
+        self.state_change || self.enable_change
+    }
+}
+
+fn run(
+    connection: &dyn SshConnection,
+    command: &str,
+    use_become: bool,
+    become_user: &str,
+) -> Result<(i32, String, String)> {
+    if use_become {
+        connection.execute_sudo_command(command, become_user)
+    } else {
+        connection.execute_command(command)
+    }
+}
+
+fn detect_init_system(connection: &dyn SshConnection) -> Result<InitSystem> {
+    let checks = [
+        (
+            "test -d /run/systemd/system && command -v -- systemctl >/dev/null 2>&1",
+            InitSystem::Systemd,
+        ),
+        ("command -v -- initctl >/dev/null 2>&1", InitSystem::Upstart),
+        ("command -v -- service >/dev/null 2>&1", InitSystem::SysV),
+    ];
+    for (command, system) in checks {
+        let (code, _, stderr) = connection
+            .execute_command(command)
+            .context("Failed while detecting the init system")?;
+        match code {
+            0 => return Ok(system),
+            1 | 127 => {}
+            code => bail!(
+                "Failed while detecting the init system (exit {}): {}",
+                code,
+                stderr.trim()
+            ),
+        }
+    }
+    bail!("No supported init system was detected")
+}
+
+fn active_state(
+    connection: &dyn SshConnection,
+    init: InitSystem,
+    service: &str,
+    use_become: bool,
+    become_user: &str,
+) -> Result<bool> {
+    let service = quote_posix_shell_arg(service)?;
+    let command = match init {
+        InitSystem::Systemd => format!("systemctl is-active --quiet -- {service}"),
+        InitSystem::SysV => format!("service {service} status >/dev/null 2>&1"),
+        InitSystem::Upstart => format!("initctl status {service}"),
+    };
+    let (code, stdout, stderr) = run(connection, &command, use_become, become_user)?;
+    match init {
+        InitSystem::Systemd => match code {
+            0 => Ok(true),
+            3 => Ok(false),
+            code => bail!(
+                "Failed to query service state (exit {}): {}",
+                code,
+                stderr.trim()
+            ),
+        },
+        InitSystem::SysV => match code {
+            0 => Ok(true),
+            1 | 3 => Ok(false),
+            code => bail!(
+                "Failed to query service state (exit {}): {}",
+                code,
+                stderr.trim()
+            ),
+        },
+        InitSystem::Upstart => {
+            if code != 0 {
+                bail!(
+                    "Failed to query service state (exit {}): {}",
+                    code,
+                    stderr.trim()
+                );
+            }
+            if stdout.contains("start/running") {
+                Ok(true)
+            } else if stdout.contains("stop/waiting") {
+                Ok(false)
+            } else {
+                bail!("Unrecognized upstart status response")
+            }
+        }
+    }
+}
+
+fn enabled_state(
+    connection: &dyn SshConnection,
+    init: InitSystem,
+    service: &str,
+    use_become: bool,
+    become_user: &str,
+) -> Result<bool> {
+    if init != InitSystem::Systemd {
+        bail!("The 'enabled' parameter is supported only for systemd services");
+    }
+    let service = quote_posix_shell_arg(service)?;
+    let command = format!("systemctl is-enabled -- {service}");
+    let (code, stdout, stderr) = run(connection, &command, use_become, become_user)?;
+    let state = stdout.trim();
+    match (code, state) {
+        (0, "enabled" | "enabled-runtime" | "linked" | "linked-runtime" | "alias") => Ok(true),
+        (0, "static" | "indirect" | "generated" | "transient") => Ok(false),
+        (1, "disabled" | "masked" | "masked-runtime" | "static" | "indirect") => Ok(false),
+        _ => bail!(
+            "Failed to query whether the service is enabled (exit {}): {}",
+            code,
+            if stderr.trim().is_empty() {
+                state
+            } else {
+                stderr.trim()
+            }
+        ),
+    }
+}
+
+fn plan_service(
+    state: Option<ServiceState>,
+    active: Option<bool>,
+    enable_change: bool,
+) -> Result<ServicePlan> {
+    let state_change = match state {
+        Some(ServiceState::Started) => {
+            !active.context("Internal service plan is missing the active state")?
+        }
+        Some(ServiceState::Stopped) => {
+            active.context("Internal service plan is missing the active state")?
+        }
+        Some(ServiceState::Restarted | ServiceState::Reloaded) => true,
+        None => false,
+    };
+    Ok(ServicePlan {
+        state_change,
+        enable_change,
+    })
+}
+
+fn state_command(init: InitSystem, service: &str, state: ServiceState) -> Result<String> {
+    let service = quote_posix_shell_arg(service)?;
+    let verb = match state {
+        ServiceState::Started => "start",
+        ServiceState::Stopped => "stop",
+        ServiceState::Restarted => "restart",
+        ServiceState::Reloaded => "reload",
+    };
+    Ok(match init {
+        InitSystem::Systemd => format!("systemctl {verb} -- {service}"),
+        InitSystem::SysV => format!("service {service} {verb}"),
+        InitSystem::Upstart => format!("initctl {verb} {service}"),
+    })
+}
+
 pub fn execute(
-    ssh_client: &SshClient,
+    connection: &dyn SshConnection,
     args: &Value,
     use_become: bool,
     become_user: &str,
+    check_mode: bool,
 ) -> Result<ModuleResult> {
-    let map = match args {
-        Value::Mapping(map) => map,
-        _ => {
-            return Err(anyhow::anyhow!(
-                "Service module requires a mapping of arguments"
-            ))
-        }
+    validate_params(args, &["name", "state", "enabled"])?;
+    let map = args
+        .as_mapping()
+        .context("Service module requires a mapping of arguments")?;
+    let name = match map.get(Value::String("name".to_string())) {
+        Some(Value::String(value)) if !value.is_empty() && !value.starts_with('-') => value,
+        Some(Value::String(_)) => bail!("Service name cannot be empty or begin with '-'"),
+        _ => bail!("Service module requires a string 'name' parameter"),
     };
-
-    // Get service name
-    let name = match map.get(&Value::String("name".to_string())) {
-        Some(Value::String(name)) => name,
-        _ => {
-            return Err(anyhow::anyhow!(
-                "Service module requires a 'name' parameter"
-            ))
-        }
+    let state = match map.get(Value::String("state".to_string())) {
+        Some(Value::String(value)) => Some(ServiceState::from_str(value)?),
+        Some(_) => bail!("Service 'state' must be a string"),
+        None => None,
     };
-
-    // Get desired state
-    let state_str = match map.get(&Value::String("state".to_string())) {
-        Some(Value::String(state)) => state,
-        _ => {
-            return Err(anyhow::anyhow!(
-                "Service module requires a 'state' parameter"
-            ))
-        }
+    let enabled = match map.get(Value::String("enabled".to_string())) {
+        Some(Value::Bool(value)) => Some(*value),
+        Some(_) => bail!("Service 'enabled' must be a boolean"),
+        None => None,
     };
-
-    let state = ServiceState::from_str(state_str).context("Failed to parse service state")?;
-
-    // Check if we need to detect the init system
-    let init_system = detect_init_system(ssh_client, use_become, become_user)?;
-    info!("Detected init system: {}", init_system);
-
-    // Build the command based on the detected init system
-    let command = match (init_system.as_str(), &state) {
-        ("systemd", ServiceState::Started) => format!("systemctl start {}", name),
-        ("systemd", ServiceState::Stopped) => format!("systemctl stop {}", name),
-        ("systemd", ServiceState::Restarted) => format!("systemctl restart {}", name),
-        ("systemd", ServiceState::Reloaded) => format!("systemctl reload {}", name),
-
-        ("sysvinit", ServiceState::Started) => format!("service {} start", name),
-        ("sysvinit", ServiceState::Stopped) => format!("service {} stop", name),
-        ("sysvinit", ServiceState::Restarted) => format!("service {} restart", name),
-        ("sysvinit", ServiceState::Reloaded) => format!("service {} reload", name),
-
-        ("upstart", ServiceState::Started) => format!("initctl start {}", name),
-        ("upstart", ServiceState::Stopped) => format!("initctl stop {}", name),
-        ("upstart", ServiceState::Restarted) => format!("initctl restart {}", name),
-        ("upstart", ServiceState::Reloaded) => format!("initctl reload {}", name),
-
-        _ => return Err(anyhow::anyhow!("Unsupported init system: {}", init_system)),
-    };
-
-    info!("Executing service command: {}", command);
-
-    // Run the command with privilege escalation if needed
-    let result = if use_become {
-        ssh_client.execute_sudo_command(&command, become_user)?
-    } else {
-        ssh_client.execute_command(&command)?
-    };
-
-    let (exit_code, stdout, stderr) = result;
-
-    if !stdout.trim().is_empty() {
-        info!("Command stdout: {}", stdout);
+    if state.is_none() && enabled.is_none() {
+        bail!("Service module requires at least one of 'state' or 'enabled'");
     }
 
-    if !stderr.trim().is_empty() {
-        warn!("Command stderr: {}", stderr);
+    let init = detect_init_system(connection)?;
+    info!("Detected init system: {:?}", init);
+    if enabled.is_some() && init != InitSystem::Systemd {
+        bail!("The 'enabled' parameter is supported only for systemd services");
     }
 
-    if exit_code != 0 {
-        error!("Service command failed with exit code: {}", exit_code);
-        return Err(anyhow::anyhow!(
-            "Service command failed with exit code: {}",
-            exit_code
-        ));
-    }
-
-    info!("Service '{}' {}.", name, get_state_past_tense(&state));
-    let state_str = match state {
-        ServiceState::Started => "started",
-        ServiceState::Stopped => "stopped",
-        ServiceState::Restarted => "restarted",
-        ServiceState::Reloaded => "reloaded",
+    let active = state
+        .map(|_| active_state(connection, init, name, use_become, become_user))
+        .transpose()?;
+    let enable_change = match enabled {
+        Some(desired) => enabled_state(connection, init, name, use_become, become_user)? != desired,
+        None => false,
     };
-    Ok(ModuleResult {
-        stdout: String::new(),
-        stderr: String::new(),
-        changed: true,
-        failed: false,
-        msg: format!("Service {} state changed to {}", name, state_str),
-    })
-}
+    let plan = plan_service(state, active, enable_change)?;
 
-/// Execute service module in ad-hoc mode
-pub fn execute_adhoc(host: &Host, service_args: &Value) -> Result<ModuleResult> {
-    info!("Connecting to host: {}", host.name);
-    let ssh_client = SshClient::connect(host)?;
-
-    let service_name = get_param(service_args, "name")?;
-    let state = get_param(service_args, "state").unwrap_or_else(|_| "started".to_string());
-
-    execute(&ssh_client, service_args, false, "")?;
-
-    Ok(ModuleResult {
-        stdout: String::new(),
-        stderr: String::new(),
-        changed: true,
-        failed: false,
-        msg: format!("Service {} state changed to {}", service_name, state),
-    })
-}
-
-/// Detect the init system used by the remote host
-fn detect_init_system(
-    ssh_client: &SshClient,
-    use_become: bool,
-    become_user: &str,
-) -> Result<String> {
-    // Check for systemd
-    let systemd_check = if use_become {
-        ssh_client.execute_sudo_command("systemctl --version 2>/dev/null", become_user)
-    } else {
-        ssh_client.execute_command("systemctl --version 2>/dev/null")
-    };
-
-    if let Ok((exit_code, _, _)) = systemd_check {
-        if exit_code == 0 {
-            return Ok("systemd".to_string());
-        }
-    }
-
-    // Check for upstart
-    let upstart_check = if use_become {
-        ssh_client.execute_sudo_command("initctl --version 2>/dev/null", become_user)
-    } else {
-        ssh_client.execute_command("initctl --version 2>/dev/null")
-    };
-
-    if let Ok((exit_code, _, _)) = upstart_check {
-        if exit_code == 0 {
-            return Ok("upstart".to_string());
-        }
-    }
-
-    // Default to sysvinit
-    Ok("sysvinit".to_string())
-}
-
-/// Get the past tense form of a service state for better log messages
-fn get_state_past_tense(state: &ServiceState) -> &str {
-    match state {
-        ServiceState::Started => "started",
-        ServiceState::Stopped => "stopped",
-        ServiceState::Restarted => "restarted",
-        ServiceState::Reloaded => "reloaded",
-    }
-}
-
-// Helper to extract a string parameter from a YAML value
-fn get_param(args: &Value, name: &str) -> Result<String> {
-    match args {
-        Value::Mapping(map) => {
-            if let Some(Value::String(value)) = map.get(&Value::String(name.to_string())) {
-                Ok(value.clone())
-            } else {
-                Err(anyhow::anyhow!("Missing required parameter: {}", name))
+    if !check_mode {
+        if enable_change {
+            let desired = enabled.context("Internal service enablement plan error")?;
+            let name_arg = quote_posix_shell_arg(name)?;
+            let command = format!(
+                "systemctl {} -- {}",
+                if desired { "enable" } else { "disable" },
+                name_arg
+            );
+            let (code, _, stderr) = run(connection, &command, use_become, become_user)?;
+            if code != 0 {
+                bail!("Failed to change service enablement: {}", stderr.trim());
             }
         }
-        _ => Err(anyhow::anyhow!("Arguments must be a mapping")),
+        if plan.state_change {
+            let command = state_command(
+                init,
+                name,
+                state.context("Internal service state plan error")?,
+            )?;
+            let (code, _, stderr) = run(connection, &command, use_become, become_user)?;
+            if code != 0 {
+                bail!("Failed to change service state: {}", stderr.trim());
+            }
+        }
     }
+
+    Ok(ModuleResult {
+        stdout: String::new(),
+        stderr: String::new(),
+        rc: None,
+        changed: plan.changed(),
+        failed: false,
+        msg: if plan.changed() {
+            format!(
+                "Service {} {}",
+                name,
+                if check_mode {
+                    "would be changed"
+                } else {
+                    "changed"
+                }
+            )
+        } else {
+            format!("Service {} is already in the requested state", name)
+        },
+    })
+}
+
+pub fn execute_adhoc(
+    host: &Host,
+    args: &Value,
+    use_become: bool,
+    become_user: &str,
+    check_mode: bool,
+) -> Result<ModuleResult> {
+    info!("Opening connection for host: {}", host.name);
+    let connection = Connection::connect(host)?;
+    execute(
+        connection.as_connection(),
+        args,
+        use_become,
+        become_user,
+        check_mode,
+    )
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use serde_yaml::{Mapping, Value};
+    use crate::ssh::connection::MockSshConnection;
 
     #[test]
-    fn test_service_state_from_str() {
-        assert_eq!(
-            ServiceState::from_str("started").unwrap(),
-            ServiceState::Started
+    fn started_and_stopped_are_idempotent() {
+        assert!(
+            !plan_service(Some(ServiceState::Started), Some(true), false)
+                .unwrap()
+                .changed()
         );
-        assert_eq!(
-            ServiceState::from_str("Stopped").unwrap(),
-            ServiceState::Stopped
+        assert!(
+            plan_service(Some(ServiceState::Started), Some(false), false)
+                .unwrap()
+                .changed()
         );
-        assert!(ServiceState::from_str("invalid").is_err());
+        assert!(
+            !plan_service(Some(ServiceState::Stopped), Some(false), false)
+                .unwrap()
+                .changed()
+        );
+        assert!(plan_service(Some(ServiceState::Stopped), Some(true), false)
+            .unwrap()
+            .changed());
     }
 
     #[test]
-    fn test_get_state_past_tense() {
-        assert_eq!(get_state_past_tense(&ServiceState::Restarted), "restarted");
-        assert_eq!(get_state_past_tense(&ServiceState::Reloaded), "reloaded");
+    fn restart_reload_and_enablement_are_changes() {
+        assert!(
+            plan_service(Some(ServiceState::Restarted), Some(true), false)
+                .unwrap()
+                .changed()
+        );
+        assert!(
+            plan_service(Some(ServiceState::Reloaded), Some(false), false)
+                .unwrap()
+                .changed()
+        );
+        assert!(plan_service(Some(ServiceState::Started), Some(true), true)
+            .unwrap()
+            .changed());
     }
 
     #[test]
-    fn test_get_param() {
-        let mut map = Mapping::new();
-        map.insert(
-            Value::String("key".to_string()),
-            Value::String("value".to_string()),
+    fn enablement_only_does_not_plan_a_state_transition() {
+        let plan = plan_service(None, None, true).unwrap();
+        assert!(plan.enable_change);
+        assert!(!plan.state_change);
+    }
+
+    #[test]
+    fn service_name_is_shell_quoted() {
+        assert_eq!(
+            state_command(InitSystem::Systemd, "demo;false", ServiceState::Started).unwrap(),
+            "systemctl start -- 'demo;false'"
         );
-        let args = Value::Mapping(map.clone());
-        assert_eq!(get_param(&args, "key").unwrap(), "value");
-        assert!(get_param(&args, "missing").is_err());
-        let not_map = Value::String("string".to_string());
-        assert!(get_param(&not_map, "key").is_err());
+    }
+
+    #[test]
+    fn enablement_only_check_mode_neither_queries_nor_changes_runtime_state() {
+        let mut connection = MockSshConnection::new();
+        connection
+            .expect_execute_command()
+            .times(2)
+            .returning(|command| {
+                assert!(!command.contains("is-active"));
+                assert!(!command.contains(" start "));
+                if command.contains("/run/systemd/system") {
+                    Ok((0, String::new(), String::new()))
+                } else {
+                    assert!(command.contains("is-enabled"));
+                    Ok((1, "disabled\n".to_string(), String::new()))
+                }
+            });
+        connection.expect_execute_sudo_command().times(0);
+        let args: Value = serde_yaml::from_str("name: demo\nenabled: true\n").unwrap();
+
+        let result = execute(&connection, &args, false, "", true).unwrap();
+        assert!(result.changed);
     }
 }

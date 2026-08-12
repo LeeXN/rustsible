@@ -17,7 +17,7 @@
     - name: Add server configuration
       lineinfile:
         path: "{{ config_file }}"
-        line: "server_name={{ ansible_hostname | default('localhost') }}"
+        line: "server_name={{ ansible_hostname | default(value='localhost') }}"
         regexp: "^server_name="
         backup: "{{ backup_enabled }}"
     
@@ -45,4 +45,4 @@
     
     - name: Show configuration content
       debug:
-        var: config_content.stdout_lines 
+        var: config_content.stdout_lines

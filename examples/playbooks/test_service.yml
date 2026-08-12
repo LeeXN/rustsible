@@ -109,7 +109,7 @@
     
     - name: Show restart results
       debug:
-        msg: "Service {{ item.item.name }}: {{ 'Success' if item.rc == 0 else 'Failed' }}"
+        msg: "Service {{ item.item.name }}: {{ 'Failed' if item.failed else 'Success' }}"
       loop: "{{ restart_results.results }}"
       when: restart_results is defined and item.item is defined
     
@@ -139,6 +139,6 @@
     
     - name: Show enable results
       debug:
-        msg: "Service {{ item.item.name }} enable: {{ 'Success' if item.rc == 0 else 'Failed' }}"
+        msg: "Service {{ item.item.name }} enable: {{ 'Failed' if item.failed else 'Success' }}"
       loop: "{{ enable_results.results }}"
-      when: enable_results is defined and item.item is defined 
+      when: enable_results is defined and item.item is defined

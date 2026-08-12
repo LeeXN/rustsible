@@ -53,22 +53,22 @@ pub fn assert_yaml_eq(actual: &Value, expected: &Value) {
 
 /// Extract the host's SSH user variable, returns Option<String>
 pub fn get_host_ssh_user(host: &crate::inventory::Host) -> Option<String> {
-    host.get_ssh_user().map(|s| s.clone())
+    host.get_ssh_user().cloned()
 }
 
 /// Extract the host's SSH password variable, returns Option<String>
 pub fn get_host_ssh_password(host: &crate::inventory::Host) -> Option<String> {
-    host.get_ssh_password().map(|s| s.clone())
+    host.get_ssh_password().cloned()
 }
 
 /// Extract the host's SSH private key path variable, returns Option<String>
 pub fn get_host_ssh_private_key(host: &crate::inventory::Host) -> Option<String> {
-    host.get_ssh_private_key().map(|s| s.clone())
+    host.get_ssh_private_key().cloned()
 }
 
 /// Extract the host's sudo password variable, returns Option<String>
 pub fn get_host_ssh_sudo_password(host: &crate::inventory::Host) -> Option<String> {
-    host.get_ssh_sudo_password().map(|s| s.clone())
+    host.get_ssh_sudo_password().cloned()
 }
 
 #[cfg(test)]
