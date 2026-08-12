@@ -7,7 +7,7 @@ use serde_yaml::Value;
 #[allow(dead_code)]
 pub fn has_param(args: &Value, name: &str) -> bool {
     match args {
-        Value::Mapping(map) => map.contains_key(&Value::String(name.to_string())),
+        Value::Mapping(map) => map.contains_key(Value::String(name.to_string())),
         _ => false,
     }
 }
@@ -17,10 +17,9 @@ pub fn has_param(args: &Value, name: &str) -> bool {
 pub fn get_param<T: DeserializeOwned>(args: &Value, name: &str) -> Result<T> {
     match args {
         Value::Mapping(map) => {
-            if let Some(val) = map.get(&Value::String(name.to_string())) {
-                serde_yaml::from_value(val.clone()).map_err(|e| {
-                    anyhow::anyhow!("Parameter '{}' type error: {} (value: {:?})", name, e, val)
-                })
+            if let Some(val) = map.get(Value::String(name.to_string())) {
+                serde_yaml::from_value(val.clone())
+                    .map_err(|e| anyhow::anyhow!("Parameter '{}' type error: {}", name, e))
             } else {
                 Err(anyhow::anyhow!("Missing required parameter: {}", name))
             }
@@ -31,16 +30,33 @@ pub fn get_param<T: DeserializeOwned>(args: &Value, name: &str) -> Result<T> {
 
 /// Extract an optional parameter of type T from a YAML mapping.
 /// Returns None if the parameter is missing or type does not match.
-pub fn get_optional_param<T: DeserializeOwned>(args: &Value, name: &str) -> Option<T> {
-    if let Value::Mapping(map) = args {
-        if let Some(val) = map.get(&Value::String(name.to_string())) {
-            serde_yaml::from_value(val.clone()).ok()
-        } else {
-            None
+pub fn get_optional_param<T: DeserializeOwned>(args: &Value, name: &str) -> Result<Option<T>> {
+    let Value::Mapping(map) = args else {
+        return Err(anyhow::anyhow!("Arguments must be a mapping"));
+    };
+    map.get(Value::String(name.to_string()))
+        .map(|value| {
+            serde_yaml::from_value(value.clone())
+                .map_err(|error| anyhow::anyhow!("Parameter '{}' type error: {}", name, error))
+        })
+        .transpose()
+}
+
+/// Reject misspelled or silently unsupported parameters before a module can
+/// report success without applying the requested semantics.
+pub fn validate_params(args: &Value, allowed: &[&str]) -> Result<()> {
+    let Value::Mapping(map) = args else {
+        return Err(anyhow::anyhow!("Arguments must be a mapping"));
+    };
+    for key in map.keys() {
+        let Value::String(key) = key else {
+            return Err(anyhow::anyhow!("Module parameter names must be strings"));
+        };
+        if !allowed.contains(&key.as_str()) {
+            return Err(anyhow::anyhow!("Unsupported module parameter: {}", key));
         }
-    } else {
-        None
     }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -98,7 +114,7 @@ mod tests {
         );
         let args = Value::Mapping(map);
         assert_eq!(
-            get_optional_param::<String>(&args, "foo"),
+            get_optional_param::<String>(&args, "foo").unwrap(),
             Some("bar".to_string())
         );
     }
@@ -107,7 +123,21 @@ mod tests {
     fn test_get_optional_param_none() {
         let map = Mapping::new();
         let args = Value::Mapping(map);
-        assert_eq!(get_optional_param::<String>(&args, "none"), None);
+        assert_eq!(get_optional_param::<String>(&args, "none").unwrap(), None);
+    }
+
+    #[test]
+    fn optional_parameter_type_errors_are_not_silently_ignored() {
+        let mut map = Mapping::new();
+        map.insert(Value::String("mode".into()), Value::Bool(true));
+        assert!(get_optional_param::<String>(&Value::Mapping(map), "mode").is_err());
+    }
+
+    #[test]
+    fn unsupported_parameters_are_rejected() {
+        let mut map = Mapping::new();
+        map.insert(Value::String("recurse".into()), Value::Bool(true));
+        assert!(validate_params(&Value::Mapping(map), &["path", "state"]).is_err());
     }
 
     #[test]

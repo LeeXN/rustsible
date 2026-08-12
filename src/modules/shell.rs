@@ -1,38 +1,50 @@
 use anyhow::Result;
-use log::{info, warn};
+use log::debug;
 use serde_yaml::Value;
 
 use crate::inventory::Host;
 use crate::modules::{ModuleExecutor, ModuleResult};
-use crate::ssh::connection::SshClient;
+use crate::ssh::connection::{shell_quote, SshConnection};
 
 pub struct ShellModule;
 
 impl ModuleExecutor for ShellModule {
     fn execute(
-        ssh_client: &SshClient,
+        connection: &dyn SshConnection,
         shell_args: &Value,
         use_become: bool,
         become_user: &str,
+        check_mode: bool,
     ) -> Result<ModuleResult> {
         let shell_command = Self::extract_command_arg(shell_args)?;
+        if shell_command.trim().is_empty() {
+            return Err(anyhow::anyhow!("Shell module requires a non-empty command"));
+        }
+        if shell_command.contains('\0') {
+            return Err(anyhow::anyhow!("Shell command cannot contain NUL bytes"));
+        }
+        if check_mode {
+            return Ok(ModuleResult {
+                stdout: String::new(),
+                stderr: String::new(),
+                rc: Some(0),
+                changed: false,
+                failed: false,
+                msg: "Check mode: shell was not executed because it has no safe change prediction"
+                    .to_string(),
+            });
+        }
 
-        info!("Executing shell command: {}", shell_command);
+        debug!(
+            "Executing shell module payload ({} bytes)",
+            shell_command.len()
+        );
 
         // Wrap in shell to ensure proper environment and shell features
-        let shell_wrapped = format!("sh -c '{}'", shell_command.replace("'", "'\\''"));
+        let shell_wrapped = format!("sh -c {}", shell_quote(&shell_command));
 
         let (exit_code, stdout, stderr) =
-            Self::execute_command(ssh_client, &shell_wrapped, use_become, become_user)?;
-
-        // 处理结果
-        if !stdout.trim().is_empty() {
-            info!("Shell stdout: {}", stdout);
-        }
-
-        if !stderr.trim().is_empty() {
-            warn!("Shell stderr: {}", stderr);
-        }
+            Self::execute_command(connection, &shell_wrapped, use_become, become_user)?;
 
         Self::process_command_result(
             exit_code,
@@ -44,8 +56,24 @@ impl ModuleExecutor for ShellModule {
     }
 }
 
-pub fn execute_adhoc(host: &Host, shell_args: &Value) -> Result<ModuleResult> {
-    ShellModule::execute_adhoc(host, shell_args)
+pub fn execute(
+    connection: &dyn SshConnection,
+    shell_args: &Value,
+    use_become: bool,
+    become_user: &str,
+    check_mode: bool,
+) -> Result<ModuleResult> {
+    ShellModule::execute(connection, shell_args, use_become, become_user, check_mode)
+}
+
+pub fn execute_adhoc(
+    host: &Host,
+    shell_args: &Value,
+    use_become: bool,
+    become_user: &str,
+    check_mode: bool,
+) -> Result<ModuleResult> {
+    ShellModule::execute_adhoc(host, shell_args, use_become, become_user, check_mode)
 }
 
 #[cfg(test)]

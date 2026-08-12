@@ -3,7 +3,6 @@ use anyhow::{anyhow, Result};
 use log::{debug, warn};
 use serde_yaml::Value;
 use std::collections::HashMap;
-use std::error::Error;
 use tera::{Context as TeraContext, Tera};
 use uuid::Uuid;
 
@@ -22,37 +21,17 @@ pub fn render_value(
     context: &TeraContext,
     force_string: bool,
 ) -> Result<Value> {
-    debug!("Rendering value with Tera (initial): {}", input);
+    debug!("Rendering a Tera value ({} bytes)", input.len());
 
     // 转换 Ansible 语法到 Tera 语法
     let converted_input = convert_ansible_to_tera_syntax(input);
     if converted_input != input {
-        debug!(
-            "Converted Ansible syntax to Tera syntax: {} -> {}",
-            input, converted_input
-        );
+        debug!("Converted Ansible filter syntax to Tera syntax");
     }
 
-    // 预检查：如果模板包含变量，检查这些变量是否在上下文中存在
-    if converted_input.contains("{{") {
-        let potential_issues = check_template_variables(&converted_input, context);
-        if !potential_issues.is_empty() {
-            warn!(
-                "Template '{}' contains potentially undefined variables: {:?}",
-                converted_input, potential_issues
-            );
-
-            // 对于包含 filter 的未定义变量，提供更好的错误信息
-            for var_name in &potential_issues {
-                if converted_input.contains(&format!("{} |", var_name)) {
-                    return Err(anyhow!(
-                        "Variable '{}' is not defined but used with a filter in template '{}'. Please define this variable in your playbook vars section.", 
-                        var_name, input
-                    ));
-                }
-            }
-        }
-    }
+    // Let Tera evaluate undefined values. Filters such as `default` are
+    // specifically designed to handle them; a lexical pre-check would reject
+    // valid expressions before the filter gets a chance to run.
 
     let mut current_str = converted_input.clone();
     let mut depth = 0;
@@ -66,26 +45,14 @@ pub fn render_value(
         match local_tera.add_raw_template(&template_name, &converted_input) {
             Ok(_) => {}
             Err(e) => {
-                warn!(
-                    "add_raw_template failed: {} (template_name: {})",
-                    e, template_name
-                );
-                if let Some(source) = e.source() {
-                    warn!("add_raw_template error source: {}", source);
-                }
+                warn!("Failed to parse a multiline template");
                 return Err(anyhow!("add_raw_template failed: {}", e));
             }
         }
         match local_tera.render(&template_name, context) {
             Ok(rendered) => return Ok(Value::String(rendered)),
             Err(e) => {
-                warn!(
-                    "Tera render failed: {} (template_name: {})",
-                    e, template_name
-                );
-                if let Some(source) = e.source() {
-                    warn!("Tera render error source: {}", source);
-                }
+                warn!("Failed to render a multiline template");
                 return Err(anyhow!("Tera render failed: {}", e));
             }
         }
@@ -94,10 +61,10 @@ pub fn render_value(
     // Loop for recursive rendering
     while depth < MAX_TEMPLATE_RECURSION {
         depth += 1;
-        debug!("Rendering value (depth {}): {}", depth, current_str);
+        debug!("Rendering Tera value at recursion depth {}", depth);
         let last_str = current_str.clone();
 
-        match tera.render_str(&current_str, context) {
+        match tera.render_str(&current_str, context, false) {
             Ok(rendered) => {
                 if rendered == last_str {
                     // No change occurred, break loop
@@ -107,15 +74,7 @@ pub fn render_value(
                 current_str = rendered;
             }
             Err(e) => {
-                warn!(
-                    "Error rendering Tera template '{}' at depth {}: {}",
-                    input, depth, e
-                );
-
-                // 提供更详细的错误信息
-                if let Some(source) = e.source() {
-                    warn!("Tera render error source: {}", source);
-                }
+                warn!("Template rendering failed at recursion depth {}", depth);
 
                 // 检查是否是变量未定义导致的 parse 错误
                 let error_string = format!("{}", e);
@@ -126,40 +85,39 @@ pub fn render_value(
                     let undefined_vars = extract_undefined_variables(input, context);
                     if !undefined_vars.is_empty() {
                         return Err(anyhow!(
-                            "Template parsing failed due to undefined variables: {}. Template: '{}'. Please define these variables in your playbook.", 
-                            undefined_vars.join(", "), input
+                            "Template parsing failed due to undefined variables: {}. Define these variables in the playbook.",
+                            undefined_vars.join(", ")
                         ));
                     }
                 }
 
                 // 检查是否是变量未定义的错误
                 if error_string.contains("Variable") && error_string.contains("not found") {
-                    return Err(anyhow!("Undefined variable in template '{}': {}", input, e));
+                    return Err(anyhow!("Undefined variable in template: {}", e));
                 }
 
                 // 检查是否是filter未找到的错误
                 if error_string.contains("Filter") && error_string.contains("not found") {
-                    return Err(anyhow!("Unknown filter in template '{}': {}", input, e));
+                    return Err(anyhow!("Unknown filter in template: {}", e));
                 }
 
-                return Err(anyhow!(
-                    "Tera rendering error for '{}' at depth {}: {}",
-                    input,
-                    depth,
-                    e
-                ));
+                return Err(anyhow!("Tera rendering error at depth {}: {}", depth, e));
             }
         }
     }
 
-    if depth >= MAX_TEMPLATE_RECURSION {
-        warn!(
-            "Template rendering exceeded maximum recursion depth ({}) for input: {}. Final string: {}",
-            MAX_TEMPLATE_RECURSION, input, current_str
-        );
+    if depth >= MAX_TEMPLATE_RECURSION && (current_str.contains("{{") || current_str.contains("{%"))
+    {
+        return Err(anyhow!(
+            "Template rendering did not converge within {} recursive passes",
+            MAX_TEMPLATE_RECURSION
+        ));
     }
 
-    debug!("Final rendered string after recursion: {}", current_str);
+    debug!(
+        "Finished rendering a Tera value ({} bytes)",
+        current_str.len()
+    );
 
     if force_string {
         return Ok(Value::String(current_str));
@@ -168,25 +126,24 @@ pub fn render_value(
     // If the input didn't contain template syntax and the result is the same as input,
     // return as string directly without trying to parse as YAML/JSON
     if !input.contains("{{") && !input.contains("{%") && current_str == input {
-        debug!(
-            "Input contains no template syntax and unchanged, returning as string: {}",
-            current_str
-        );
+        debug!("Input contains no template syntax; returning it as a string");
         return Ok(Value::String(current_str));
     }
 
     // Check if this looks like a single-line string that should not be parsed as YAML
     // This handles cases like "user ALL=(ALL) NOPASSWD: ALL" which contains colons but should be a string
-    let should_be_string = current_str.lines().count() == 1 && 
-                          current_str.contains(' ') && 
-                          !current_str.trim_start().starts_with('-') &&  // Not a YAML list
-                          !current_str.trim_start().starts_with('{') &&  // Not a JSON object
-                          !current_str.trim_start().starts_with('['); // Not a JSON array
+    let should_be_string = current_str.lines().count() == 1
+        && current_str.contains(' ')
+        && !current_str.trim_start().starts_with('-') // Not a YAML list
+        && !current_str.trim_start().starts_with('{') // Not a JSON object
+        && !current_str.trim_start().starts_with('['); // Not a JSON array
 
     if should_be_string {
         // Test if YAML parsing would create a mapping from a single line
         if let Ok(Value::Mapping(_)) = serde_yaml::from_str(&current_str) {
-            debug!("Single-line string '{}' would be parsed as YAML mapping, returning as string instead", current_str);
+            debug!(
+                "Rendered single-line value resembles a YAML mapping; preserving it as a string"
+            );
             return Ok(Value::String(current_str));
         }
     }
@@ -197,7 +154,7 @@ pub fn render_value(
             match serde_yaml::to_value(json_value) {
                 Ok(yaml_value) => Ok(yaml_value),
                 Err(e) => {
-                    warn!("Failed to convert final rendered JSON value '{}' to YAML: {}. Using string.", current_str, e);
+                    warn!("Failed to convert rendered JSON value to YAML: {}. Preserving it as a string.", e);
                     Ok(Value::String(current_str))
                 }
             }
@@ -207,7 +164,7 @@ pub fn render_value(
                 Ok(yaml_value) => {
                     // Check if YAML parsing resulted in null for what should be a string
                     if yaml_value == Value::Null && !current_str.trim().is_empty() {
-                        debug!("YAML parsing returned null for non-empty string '{}', returning as string", current_str);
+                        debug!("YAML parsing returned null for a non-empty value; preserving it as a string");
                         Ok(Value::String(current_str))
                     } else {
                         Ok(yaml_value)
@@ -223,73 +180,75 @@ pub fn render_value(
 fn check_template_variables(template: &str, context: &TeraContext) -> Vec<String> {
     let mut undefined_vars = Vec::new();
 
-    // 简单的正则表达式来提取 {{ variable_name }} 格式的变量
-    // 这里使用简单的字符串解析，不需要正则表达式库
-    let mut i = 0;
+    // `find` returns byte offsets that are guaranteed to be UTF-8 boundaries.
+    // Keeping all slicing relative to those offsets avoids mixing character and
+    // byte indexes when non-ASCII text appears before or inside an expression.
+    let mut remainder = template;
+    while let Some(open_index) = remainder.find("{{") {
+        let after_open = &remainder[open_index + 2..];
+        let Some(close_index) = after_open.find("}}") else {
+            break;
+        };
+        let expression = after_open[..close_index].trim_start();
 
-    while i < template.len() {
-        if template[i..].starts_with("{{") {
-            // 找到模板开始
-            i += 2;
-
-            // 跳过空格
-            while i < template.len() && template.chars().nth(i).unwrap_or(' ').is_whitespace() {
-                i += 1;
+        if matches!(expression.chars().next(), Some('\'' | '"')) {
+            debug!("Skipping variable check for a string-literal expression");
+        } else if let Some(var_name) = leading_variable_name(expression) {
+            // Skip common Ansible built-in variables that might not be in context.
+            if [
+                "inventory_hostname",
+                "ansible_hostname",
+                "ansible_host",
+                "ansible_port",
+                "ansible_ssh_user",
+                "ansible_user",
+                "group_names",
+                "groups",
+            ]
+            .contains(&var_name)
+            {
+                debug!("Skipping check for built-in Ansible variable: {}", var_name);
+            } else if !context.contains_key(var_name)
+                && !undefined_vars.iter().any(|undefined| undefined == var_name)
+            {
+                undefined_vars.push(var_name.to_string());
             }
-
-            // Check if this is a string literal (starts with ' or ")
-            if i < template.len() {
-                let ch = template.chars().nth(i).unwrap_or(' ');
-                if ch == '\'' || ch == '"' {
-                    // This is a string literal, skip checking for undefined variables
-                    debug!(
-                        "Skipping variable check for string literal in template: {}",
-                        template
-                    );
-                    break;
-                }
-            }
-
-            // 提取变量名（直到空格、| 或 }}）
-            let var_start = i;
-            while i < template.len() {
-                let ch = template.chars().nth(i).unwrap_or(' ');
-                if ch.is_whitespace() || ch == '|' || template[i..].starts_with("}}") {
-                    break;
-                }
-                i += 1;
-            }
-
-            if i > var_start {
-                let var_name = template[var_start..i].to_string();
-
-                // Skip common ansible built-in variables that might not be in context
-                if [
-                    "inventory_hostname",
-                    "ansible_hostname",
-                    "ansible_host",
-                    "ansible_port",
-                    "ansible_ssh_user",
-                    "ansible_user",
-                    "group_names",
-                    "groups",
-                ]
-                .contains(&var_name.as_str())
-                {
-                    debug!("Skipping check for built-in Ansible variable: {}", var_name);
-                } else {
-                    // 检查变量是否在上下文中定义
-                    if !context.contains_key(&var_name) {
-                        undefined_vars.push(var_name);
-                    }
-                }
-            }
-        } else {
-            i += 1;
         }
+
+        remainder = &after_open[close_index + 2..];
     }
 
     undefined_vars
+}
+
+/// Return the root variable at the beginning of a Tera expression.
+///
+/// Attribute/index access is checked against the root value stored in the
+/// context, so `user.name` checks `user`. Literal and operator-led expressions
+/// intentionally return `None` and are left to Tera's parser.
+fn leading_variable_name(expression: &str) -> Option<&str> {
+    let first = expression.chars().next()?;
+    if !(first == '_' || first.is_alphabetic()) {
+        return None;
+    }
+
+    let end = expression
+        .char_indices()
+        .find_map(|(index, ch)| {
+            if ch == '_' || ch.is_alphanumeric() {
+                None
+            } else {
+                Some(index)
+            }
+        })
+        .unwrap_or(expression.len());
+    let candidate = &expression[..end];
+
+    if matches!(candidate, "true" | "false" | "none" | "null") {
+        None
+    } else {
+        Some(candidate)
+    }
 }
 
 /// Helper function to extract undefined variables from a template
@@ -299,22 +258,20 @@ fn extract_undefined_variables(template: &str, context: &TeraContext) -> Vec<Str
 
 /// Helper function to convert a variable map to a Tera Context.
 /// This should ideally happen once before processing a task or loop.
-pub fn create_tera_context(vars: &HashMap<String, Value>) -> TeraContext {
+pub fn create_tera_context(vars: &HashMap<String, Value>) -> Result<TeraContext> {
     let mut context = TeraContext::new();
     for (key, value) in vars {
         // Convert serde_yaml::Value back to serde_json::Value for Tera context
-        match serde_json::to_value(value) {
-            Ok(json_val) => context.insert(key, &json_val),
-            Err(e) => {
-                warn!(
-                    "Could not convert variable '{}' for Tera context: {}",
-                    key, e
-                );
-                // Optionally insert a Null or skip, depending on desired behavior
-            }
-        }
+        let json_val = serde_json::to_value(value).map_err(|error| {
+            anyhow!(
+                "Could not convert variable '{}' to the template context: {}",
+                key,
+                error
+            )
+        })?;
+        context.insert(key.clone(), &json_val);
     }
-    context
+    Ok(context)
 }
 
 /// Evaluate a condition expression using Tera.
@@ -324,7 +281,8 @@ pub fn create_tera_context(vars: &HashMap<String, Value>) -> TeraContext {
 /// * `tera` - A reference to the Tera instance with registered filters.
 /// * `context` - The Tera context containing variables for evaluation.
 pub fn evaluate_condition(condition: &str, tera: &mut Tera, context: &TeraContext) -> Result<bool> {
-    debug!("Evaluating condition with Tera: {}", condition);
+    debug!("Evaluating a Tera condition ({} bytes)", condition.len());
+    register_ansible_filters(tera);
 
     // Render the condition expression directly
     let template = format!("{{{{ {} }}}}", condition);
@@ -334,15 +292,8 @@ pub fn evaluate_condition(condition: &str, tera: &mut Tera, context: &TeraContex
             Ok(evaluate_truthiness(&result_value))
         }
         Err(e) => {
-            warn!(
-                "Error evaluating condition '{}' with Tera: {}",
-                condition, e
-            );
-            Err(anyhow!(
-                "Tera condition evaluation error for '{}': {}",
-                condition,
-                e
-            ))
+            warn!("A Tera condition could not be evaluated");
+            Err(anyhow!("Tera condition evaluation error: {}", e))
         }
     }
 }
@@ -373,42 +324,164 @@ fn evaluate_truthiness(value: &Value) -> bool {
 /// Convert Ansible filter syntax to Tera syntax
 /// Converts {{ var | filter('arg') }} to {{ var | filter(arg='arg') }}
 fn convert_ansible_to_tera_syntax(input: &str) -> String {
-    let mut result = input.to_string();
+    let converted = convert_filter_calls(input, "password_hash", &["hash_type", "salt"]);
+    convert_filter_calls(&converted, "selectattr", &["key", "test", "value"])
+}
 
-    // 处理 password_hash filter
-    if result.contains("password_hash(") {
-        // 匹配 password_hash('value') 并转换为 password_hash(hash_type='value')
-        result = result.replace(
-            "password_hash('sha512')",
-            "password_hash(hash_type='sha512')",
-        );
-        result = result.replace(
-            "password_hash('sha256')",
-            "password_hash(hash_type='sha256')",
-        );
-        result = result.replace("password_hash('md5')", "password_hash(hash_type='md5')");
-        result = result.replace(
-            "password_hash('bcrypt')",
-            "password_hash(hash_type='bcrypt')",
-        );
+/// Tera requires named filter arguments while Ansible commonly uses positional
+/// filter arguments. Convert the supported filters without making assumptions
+/// about the actual expressions used as arguments.
+fn convert_filter_calls(input: &str, filter_name: &str, argument_names: &[&str]) -> String {
+    let prefix = format!("{}(", filter_name);
+    let mut output = String::with_capacity(input.len());
+    let mut remaining = input;
 
-        // 处理动态值的情况
-        result = result.replace(
-            "password_hash(\"sha512\")",
-            "password_hash(hash_type=\"sha512\")",
-        );
-        result = result.replace(
-            "password_hash(\"sha256\")",
-            "password_hash(hash_type=\"sha256\")",
-        );
-        result = result.replace("password_hash(\"md5\")", "password_hash(hash_type=\"md5\")");
-        result = result.replace(
-            "password_hash(\"bcrypt\")",
-            "password_hash(hash_type=\"bcrypt\")",
-        );
+    while let Some(start) = remaining.find(&prefix) {
+        output.push_str(&remaining[..start]);
+        let args_start = start + prefix.len();
+        let Some(close_offset) = find_call_end(&remaining[args_start..]) else {
+            output.push_str(&remaining[start..]);
+            return output;
+        };
+        let args_end = args_start + close_offset;
+        let args = &remaining[args_start..args_end];
+        let parts = split_filter_args(args);
+        output.push_str(&prefix);
+        if (1..=argument_names.len()).contains(&parts.len())
+            && parts.iter().all(|part| !part.trim().is_empty())
+        {
+            for (index, part) in parts.iter().enumerate() {
+                if index > 0 {
+                    output.push_str(", ");
+                }
+                let part = part.trim();
+                if has_top_level_assignment(part) {
+                    output.push_str(part);
+                } else {
+                    output.push_str(argument_names[index]);
+                    output.push('=');
+                    output.push_str(part);
+                }
+            }
+        } else {
+            output.push_str(args);
+        }
+        output.push(')');
+        remaining = &remaining[args_end + 1..];
     }
 
-    result
+    output.push_str(remaining);
+    output
+}
+
+fn find_call_end(input: &str) -> Option<usize> {
+    let mut quote = None;
+    let mut escaped = false;
+    let mut nested = 0usize;
+    for (index, character) in input.char_indices() {
+        if escaped {
+            escaped = false;
+            continue;
+        }
+        if character == '\\' && quote.is_some() {
+            escaped = true;
+            continue;
+        }
+        if matches!(character, '\'' | '"') {
+            if quote == Some(character) {
+                quote = None;
+            } else if quote.is_none() {
+                quote = Some(character);
+            }
+            continue;
+        }
+        if quote.is_some() {
+            continue;
+        }
+        match character {
+            '(' | '[' | '{' => nested += 1,
+            ')' if nested == 0 => return Some(index),
+            ')' | ']' | '}' => nested = nested.saturating_sub(1),
+            _ => {}
+        }
+    }
+    None
+}
+
+fn split_filter_args(input: &str) -> Vec<&str> {
+    let mut parts = Vec::new();
+    let mut start = 0usize;
+    let mut quote = None;
+    let mut escaped = false;
+    let mut nested = 0usize;
+    for (index, character) in input.char_indices() {
+        if escaped {
+            escaped = false;
+            continue;
+        }
+        if character == '\\' && quote.is_some() {
+            escaped = true;
+            continue;
+        }
+        if matches!(character, '\'' | '"') {
+            if quote == Some(character) {
+                quote = None;
+            } else if quote.is_none() {
+                quote = Some(character);
+            }
+            continue;
+        }
+        if quote.is_some() {
+            continue;
+        }
+        match character {
+            '(' | '[' | '{' => nested += 1,
+            ')' | ']' | '}' => nested = nested.saturating_sub(1),
+            ',' if nested == 0 => {
+                parts.push(&input[start..index]);
+                start = index + 1;
+            }
+            _ => {}
+        }
+    }
+    if !input.trim().is_empty() || !parts.is_empty() {
+        parts.push(&input[start..]);
+    }
+    parts
+}
+
+fn has_top_level_assignment(input: &str) -> bool {
+    let mut quote = None;
+    let mut escaped = false;
+    let mut nested = 0usize;
+    for character in input.chars() {
+        if escaped {
+            escaped = false;
+            continue;
+        }
+        if character == '\\' && quote.is_some() {
+            escaped = true;
+            continue;
+        }
+        if matches!(character, '\'' | '"') {
+            if quote == Some(character) {
+                quote = None;
+            } else if quote.is_none() {
+                quote = Some(character);
+            }
+            continue;
+        }
+        if quote.is_some() {
+            continue;
+        }
+        match character {
+            '(' | '[' | '{' => nested += 1,
+            ')' | ']' | '}' => nested = nested.saturating_sub(1),
+            '=' if nested == 0 => return true,
+            _ => {}
+        }
+    }
+    false
 }
 
 #[cfg(test)]
@@ -418,13 +491,12 @@ mod tests {
 
     // Helper to create Tera instance for tests
     fn create_test_tera() -> Tera {
-        let tera = Tera::default();
-        tera
+        Tera::default()
     }
 
     // Helper to create Tera context from HashMap<String, Value>
     fn create_test_context_from_map(vars: &HashMap<String, Value>) -> TeraContext {
-        create_tera_context(vars)
+        create_tera_context(vars).unwrap()
     }
 
     #[test]
@@ -436,6 +508,70 @@ mod tests {
 
         let result = render_value("Hello {{ name }}!", &mut tera, &context, false).unwrap();
         assert_eq!(result, Value::String("Hello World!".to_string()));
+    }
+
+    #[test]
+    fn template_context_rejects_values_that_json_cannot_represent() {
+        let mut invalid_mapping = Mapping::new();
+        invalid_mapping.insert(
+            Value::Sequence(vec![Value::String("compound".to_string())]),
+            Value::String("value".to_string()),
+        );
+        let vars = HashMap::from([("invalid".to_string(), Value::Mapping(invalid_mapping))]);
+
+        let error = create_tera_context(&vars).unwrap_err();
+        assert!(error.to_string().contains("template context"));
+    }
+
+    #[test]
+    fn test_render_value_with_chinese_and_emoji_is_utf8_safe() {
+        let mut tera = create_test_tera();
+        let mut vars = HashMap::new();
+        vars.insert("name".to_string(), Value::String("世界".to_string()));
+        vars.insert("emoji".to_string(), Value::String("🚀".to_string()));
+        let context = create_test_context_from_map(&vars);
+
+        let result = render_value(
+            "你好，{{ name }}！准备出发 {{ emoji }}",
+            &mut tera,
+            &context,
+            false,
+        )
+        .unwrap();
+
+        assert_eq!(result, Value::String("你好，世界！准备出发 🚀".to_string()));
+    }
+
+    #[test]
+    fn test_template_variable_check_scans_multiple_utf8_expressions() {
+        let mut context = TeraContext::new();
+        context.insert("defined", "值😀");
+
+        let undefined = check_template_variables(
+            "前缀😀 {{ defined }} / {{ first_missing | default(value='中文') }} / {{ second_missing }} / {{ first_missing }}",
+            &context,
+        );
+
+        assert_eq!(undefined, vec!["first_missing", "second_missing"]);
+    }
+
+    #[test]
+    fn test_template_variable_check_continues_after_utf8_string_literal() {
+        let context = TeraContext::new();
+
+        let undefined = check_template_variables("{{ '中文😀' }} then {{ missing }}", &context);
+
+        assert_eq!(undefined, vec!["missing"]);
+    }
+
+    #[test]
+    fn test_template_variable_check_uses_root_for_attribute_access() {
+        let mut context = TeraContext::new();
+        context.insert("user", &serde_json::json!({ "name": "测试" }));
+
+        let undefined = check_template_variables("👤 {{ user.name }}", &context);
+
+        assert!(undefined.is_empty());
     }
 
     #[test]
@@ -581,7 +717,7 @@ mod tests {
 
         // 测试未定义变量与 filter 的组合
         let result = render_value(
-            "{{ root_password | password_hash('sha512') }}",
+            "{{ root_password | password_hash('sha512', 'testsalt') }}",
             &mut tera,
             &context,
             false,
@@ -603,6 +739,22 @@ mod tests {
     }
 
     #[test]
+    fn default_filter_can_handle_an_undefined_variable() {
+        let mut tera = create_test_tera();
+        let context = TeraContext::new();
+
+        let result = render_value(
+            "{{ missing | default(value='fallback') }}",
+            &mut tera,
+            &context,
+            false,
+        )
+        .unwrap();
+
+        assert_eq!(result, Value::String("fallback".to_string()));
+    }
+
+    #[test]
     fn test_render_value_defined_variable_with_filter() {
         let mut tera = create_test_tera();
         // 注册 password_hash filter
@@ -618,7 +770,7 @@ mod tests {
 
         // 测试已定义变量与 filter 的组合
         let result = render_value(
-            "{{ test_password | password_hash('sha512') }}",
+            "{{ test_password | password_hash('sha512', 'testsalt') }}",
             &mut tera,
             &context,
             false,
@@ -665,7 +817,7 @@ mod tests {
         assert!(result.is_ok());
 
         // 测试 Tera 的 render_str 直接调用
-        let direct_result = tera.render_str("{{ test_password }}", &context);
+        let direct_result = tera.render_str("{{ test_password }}", &context, false);
         println!("Direct Tera result: {:?}", direct_result);
         assert!(direct_result.is_ok());
 
@@ -673,20 +825,64 @@ mod tests {
         register_ansible_filters(&mut tera);
 
         // 测试 filter 是否注册成功
-        let filter_result =
-            tera.render_str("{{ test_password | password_hash('sha512') }}", &context);
-        println!("Filter result with quotes: {:?}", filter_result);
+        let filter_result = render_value(
+            "{{ test_password | password_hash('sha512', 'testsalt') }}",
+            &mut tera,
+            &context,
+            false,
+        );
+        assert!(filter_result.is_ok());
 
         // 尝试不同的语法
         let filter_result2 = tera.render_str(
-            "{{ test_password | password_hash(hash_type='sha512') }}",
+            "{{ test_password | password_hash(hash_type='sha512', salt='testsalt') }}",
             &context,
+            false,
         );
-        println!("Filter result with named param: {:?}", filter_result2);
+        assert!(filter_result2.is_ok());
 
         // 尝试没有引号的语法
-        let filter_result3 =
-            tera.render_str("{{ test_password | password_hash(sha512) }}", &context);
-        println!("Filter result without quotes: {:?}", filter_result3);
+        let filter_result3 = tera.render_str(
+            "{{ test_password | password_hash(hash_type='sha512') }}",
+            &context,
+            false,
+        );
+        assert!(filter_result3.is_err());
+    }
+
+    #[test]
+    fn converts_ansible_password_hash_positional_arguments() {
+        assert_eq!(
+            convert_ansible_to_tera_syntax(
+                "{{ secret | password_hash('sha512', inventory_hostname) }}"
+            ),
+            "{{ secret | password_hash(hash_type='sha512', salt=inventory_hostname) }}"
+        );
+        assert_eq!(
+            convert_ansible_to_tera_syntax(
+                "{{ secret | password_hash(hash_type='sha256', salt='stable') }}"
+            ),
+            "{{ secret | password_hash(hash_type='sha256', salt='stable') }}"
+        );
+        assert_eq!(
+            convert_ansible_to_tera_syntax("{{ users | selectattr('enabled', 'equalto', true) }}"),
+            "{{ users | selectattr(key='enabled', test='equalto', value=true) }}"
+        );
+    }
+
+    #[test]
+    fn tera_string_iteration_preserves_grapheme_clusters() {
+        let tera = Tera::default();
+        let mut context = TeraContext::new();
+        context.insert("text", "👨‍👩‍👧‍👦a");
+
+        let rendered = tera
+            .render_str(
+                "{% for character in text %}{{ character }}|{% endfor %}",
+                &context,
+                false,
+            )
+            .unwrap();
+        assert_eq!(rendered, "👨‍👩‍👧‍👦|a|");
     }
 }

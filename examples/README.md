@@ -1,80 +1,53 @@
-# Rustsible 示例 Playbook
+# Rustsible 示例
 
-这个目录包含一些示例 playbook，展示了如何使用 Rustsible 进行各种自动化任务。
+这个目录展示 Rustsible 当前注册的模块和 playbook 写法。项目并非 Ansible 的
+完整替代品；运行示例前，请先使用 `--check`，并把 inventory 中的占位主机和
+凭据替换为测试环境配置。
 
-## 目录结构
+## 目录
 
-```
+```text
 examples/
-├── inventory/    # 主机清单文件
-│   └── hosts     # 默认主机清单文件
-├── playbooks/    # Playbook 定义文件
-│   ├── node_exporter.yml    # 批量安装 Prometheus Node Exporter
-│   ├── k8s_cluster.yml      # 使用 kubeadm 安装 Kubernetes 集群
-│   ├── software_install.yml # 批量下载和安装软件
-│   └── service_config.yml   # 批量配置和启动服务
-├── templates/    # Jinja2 模板文件
-│   ├── nginx.conf.j2          # Nginx 主配置模板
-│   ├── nginx_vhost.conf.j2    # Nginx 虚拟主机模板
-│   └── node_exporter.service.j2  # Node Exporter 服务模板
-├── tasks/        # 可重用的任务文件
-│   └── install_software.yml   # 软件安装任务
-└── files/        # 静态文件
+├── inventory/hosts
+├── playbooks/
+│   ├── test_all_features.yml
+│   ├── test_all_modules.yml
+│   ├── test_command.yml
+│   ├── test_lineinfile.yml
+│   ├── test_package.yml
+│   ├── test_service.yml
+│   ├── test_shell.yml
+│   └── test_user.yml
+└── templates/motd.j2
 ```
 
-## 示例清单
+`test_all_features.yml` 和 `test_package.yml` 是迁移审查素材，刻意保留了
+`group`、`set_fact` 等尚未实现的 Ansible 功能，当前会被明确拒绝。其余文件
+用于当前子集的示例，但也不构成完整兼容性保证。遇到不支持的模块、关键字或表达式时，
+Rustsible 会返回错误，而不会静默忽略。
 
-- **node_exporter.yml**: 批量安装 Prometheus Node Exporter
-- **k8s_cluster.yml**: 使用 kubeadm 安装 Kubernetes 集群
-- **software_install.yml**: 批量下载和安装软件
-- **service_config.yml**: 批量配置和启动服务
-
-## 使用方法
-
-所有示例都可以使用 Rustsible 的 playbook 命令运行：
+## 运行
 
 ```bash
-# 使用示例 inventory 文件运行 playbook
-rustsible playbook -i examples/inventory/hosts examples/playbooks/node_exporter.yml
+# 先预览，不写入目标机器
+rustsible playbook examples/playbooks/test_command.yml \
+  -i examples/inventory/hosts --limit localhost --check
 
-# 使用自定义 inventory 文件
-rustsible playbook -i your_inventory.ini examples/playbooks/k8s_cluster.yml
+# 确认目标和变更后再执行
+rustsible playbook examples/playbooks/test_command.yml \
+  -i examples/inventory/hosts --limit localhost
+
+# 临时命令
+rustsible ad-hoc localhost -i examples/inventory/hosts \
+  -m command -a "uptime"
 ```
 
-## 自定义变量
+`command` 按参数列表执行，不解释管道、重定向或变量展开；需要这些 shell
+语法时请显式使用 `shell`。远程 SSH 默认严格校验 host key。
 
-所有 playbook 都包含默认变量，您可以在执行时覆盖这些变量：
+## 安全提示
 
-```bash
-# 使用自定义变量
-rustsible playbook -i examples/inventory/hosts examples/playbooks/service_config.yml -e "nginx_worker_processes=4 nginx_worker_connections=2048"
-```
-
-## 针对特定主机组运行
-
-您可以使用 `-l` 或 `--limit` 选项限制 playbook 在特定主机上运行：
-
-```bash
-# 仅在 web1.example.com 上运行
-rustsible playbook -i examples/inventory/hosts examples/playbooks/service_config.yml -l web1.example.com
-```
-
-## 运行临时命令
-
-```bash
-# 在 web 服务器上执行命令
-rustsible ad-hoc -i examples/inventory/hosts web_servers -m command -a "uptime"
-
-# 使用 shell 模块在数据库服务器上执行命令
-rustsible ad-hoc -i examples/inventory/hosts db_servers -m shell -a "ps aux | grep mysql"
-
-# 使用文件模块创建目录
-rustsible ad-hoc -i examples/inventory/hosts all -m file -a "path=/tmp/rustsible-test state=directory"
-```
-
-## 注意事项
-
-- 示例配置假设目标主机运行的是基于 Debian/Ubuntu 的操作系统
-- 执行 playbook 前请确保您可以通过 SSH 密钥或密码访问目标主机
-- 部分模块如 `selinux`、`systemd` 可能需要 Python 模块支持，请确保目标系统已安装
-- 请根据您的实际环境修改主机清单和变量 
+- 示例 inventory 只应放测试值，不要提交真实密码或私钥。
+- `package`、`service` 和 `user` 会调用目标系统工具，通常需要 `become`。
+- `--check` 是最佳努力的预测，不替代隔离环境中的实际验证。
+- 修改用户、服务、软件包或 `/etc` 下文件前，请准备可恢复方案。

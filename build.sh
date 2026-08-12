@@ -1,1 +1,4 @@
-CC=/usr/local/musl/bin/x86_64-linux-musl-gcc cargo build  --target x86_64-unknown-linux-musl --release
+#!/usr/bin/env sh
+set -eu
+
+cargo build --release --locked "$@"

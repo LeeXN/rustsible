@@ -1,96 +1,29 @@
-use anyhow::{Context, Result};
+use anyhow::{bail, Context, Result};
 use log::info;
+use serde::de::DeserializeOwned;
 use serde_yaml::Value;
-use std::process::Command;
-use uuid::Uuid;
+use std::collections::BTreeSet;
 
 use crate::inventory::Host;
-use crate::modules::param::{get_optional_param, get_param};
+use crate::modules::file::quote_posix_shell_arg;
+use crate::modules::param::get_param;
 use crate::modules::ModuleResult;
-use crate::ssh::connection::SshClient;
+use crate::ssh::connection::{Connection, SshConnection};
 
-/// Execute the user module logic: manage user accounts
-pub fn execute(
-    ssh_client: &SshClient,
-    args: &Value,
-    use_become: bool,
-    _become_user: &str,
-) -> Result<ModuleResult> {
-    let name = get_param::<String>(args, "name")?;
-
-    // Extract parameters
-    let state =
-        get_optional_param::<String>(args, "state").unwrap_or_else(|| "present".to_string());
-    let uid = get_optional_param::<i64>(args, "uid");
-    let gid = get_optional_param::<i64>(args, "gid");
-    let groups = get_optional_param::<Vec<String>>(args, "groups");
-    let append = get_optional_param::<bool>(args, "append").unwrap_or(false);
-    let home = get_optional_param::<String>(args, "home");
-    let shell = get_optional_param::<String>(args, "shell");
-    let comment = get_optional_param::<String>(args, "comment");
-    let password = get_optional_param::<String>(args, "password");
-    let create_home = get_optional_param::<bool>(args, "create_home").unwrap_or(true);
-    let system = get_optional_param::<bool>(args, "system").unwrap_or(false);
-    let remove = get_optional_param::<bool>(args, "remove").unwrap_or(false);
-
-    info!("Managing user: {}", name);
-
-    // Check if we need _host_type for local execution
-    let is_local = if let Value::Mapping(args_map) = args {
-        if let Some(Value::String(host_type)) =
-            args_map.get(&Value::String("_host_type".to_string()))
-        {
-            host_type == "local"
-        } else {
-            false
-        }
-    } else {
-        false
-    };
-
-    if is_local {
-        execute_local(
-            &name,
-            &state,
-            uid,
-            gid,
-            groups,
-            append,
-            home,
-            shell,
-            comment,
-            password,
-            create_home,
-            system,
-            remove,
-        )
-    } else {
-        execute_remote(
-            ssh_client,
-            &name,
-            &state,
-            uid,
-            gid,
-            groups,
-            append,
-            home,
-            shell,
-            comment,
-            password,
-            create_home,
-            system,
-            remove,
-            use_become,
-        )
-    }
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct AccountState {
+    uid: i64,
+    gid: i64,
+    comment: String,
+    home: String,
+    shell: String,
 }
 
-/// Execute user management locally
-fn execute_local(
-    name: &str,
-    state: &str,
+#[derive(Debug, Clone)]
+struct DesiredAccount {
     uid: Option<i64>,
     gid: Option<i64>,
+    primary_group: Option<String>,
     groups: Option<Vec<String>>,
     append: bool,
     home: Option<String>,
@@ -99,785 +32,716 @@ fn execute_local(
     password: Option<String>,
     create_home: bool,
     system: bool,
-    remove: bool,
-) -> Result<ModuleResult> {
-    let user_exists = check_user_exists_local(name)?;
-    let mut changed = false;
-    let mut msg;
-
-    match state {
-        "present" => {
-            if !user_exists {
-                // Create user
-                create_user_local(
-                    name,
-                    uid,
-                    gid,
-                    home.as_deref(),
-                    shell.as_deref(),
-                    comment.as_deref(),
-                    create_home,
-                    system,
-                )?;
-                changed = true;
-                msg = format!("User {} created", name);
-            } else {
-                // Modify existing user
-                let modify_result = modify_user_local(
-                    name,
-                    uid,
-                    gid,
-                    home.as_deref(),
-                    shell.as_deref(),
-                    comment.as_deref(),
-                )?;
-                changed = modify_result;
-                msg = if changed {
-                    format!("User {} modified", name)
-                } else {
-                    format!("User {} already exists with correct configuration", name)
-                };
-            }
-
-            // Handle password if provided
-            if let Some(password_hash) = password {
-                set_user_password_local(name, &password_hash)?;
-                if !changed {
-                    changed = true;
-                    msg = format!("User {} password updated", name);
-                }
-            }
-
-            // Handle groups if provided
-            if let Some(group_list) = groups {
-                manage_user_groups_local(name, &group_list, append)?;
-                if !changed {
-                    changed = true;
-                    msg = format!("User {} groups updated", name);
-                }
-            }
-        }
-        "absent" => {
-            if user_exists {
-                remove_user_local(name, remove)?;
-                changed = true;
-                msg = format!("User {} removed", name);
-            } else {
-                msg = format!("User {} already absent", name);
-            }
-        }
-        _ => {
-            return Err(anyhow::anyhow!(
-                "Invalid state: {}. Must be 'present' or 'absent'",
-                state
-            ));
-        }
-    }
-
-    Ok(ModuleResult {
-        stdout: String::new(),
-        stderr: String::new(),
-        changed,
-        failed: false,
-        msg,
-    })
 }
 
-/// Execute user management remotely via SSH
-fn execute_remote(
-    ssh_client: &SshClient,
-    name: &str,
-    state: &str,
-    uid: Option<i64>,
-    gid: Option<i64>,
-    groups: Option<Vec<String>>,
-    append: bool,
-    home: Option<String>,
-    shell: Option<String>,
-    comment: Option<String>,
-    password: Option<String>,
-    create_home: bool,
-    system: bool,
-    remove: bool,
-    use_become: bool,
-) -> Result<ModuleResult> {
-    let user_exists = check_user_exists_remote(ssh_client, name, use_become)?;
-    let mut changed = false;
-    let mut msg;
+const SUPPORTED_PARAMETERS: &[&str] = &[
+    "name",
+    "state",
+    "uid",
+    "gid",
+    "group",
+    "groups",
+    "append",
+    "home",
+    "shell",
+    "comment",
+    "password",
+    "create_home",
+    "system",
+    "remove",
+];
 
-    match state {
-        "present" => {
-            if !user_exists {
-                // Create user
-                create_user_remote(
-                    ssh_client,
-                    name,
-                    uid,
-                    gid,
-                    home.as_deref(),
-                    shell.as_deref(),
-                    comment.as_deref(),
-                    create_home,
-                    system,
-                    use_become,
-                )?;
-                changed = true;
-                msg = format!("User {} created", name);
-            } else {
-                // Modify existing user
-                let modify_result = modify_user_remote(
-                    ssh_client,
-                    name,
-                    uid,
-                    gid,
-                    home.as_deref(),
-                    shell.as_deref(),
-                    comment.as_deref(),
-                    use_become,
-                )?;
-                changed = modify_result;
-                msg = if changed {
-                    format!("User {} modified", name)
-                } else {
-                    format!("User {} already exists with correct configuration", name)
-                };
-            }
-
-            // Handle password if provided
-            if let Some(password_hash) = password {
-                set_user_password_remote(ssh_client, name, &password_hash, use_become)?;
-                if !changed {
-                    changed = true;
-                    msg = format!("User {} password updated", name);
-                }
-            }
-
-            // Handle groups if provided
-            if let Some(group_list) = groups {
-                manage_user_groups_remote(ssh_client, name, &group_list, append, use_become)?;
-                if !changed {
-                    changed = true;
-                    msg = format!("User {} groups updated", name);
-                }
-            }
-        }
-        "absent" => {
-            if user_exists {
-                remove_user_remote(ssh_client, name, remove, use_become)?;
-                changed = true;
-                msg = format!("User {} removed", name);
-            } else {
-                msg = format!("User {} already absent", name);
-            }
-        }
-        _ => {
-            return Err(anyhow::anyhow!(
-                "Invalid state: {}. Must be 'present' or 'absent'",
-                state
-            ));
-        }
-    }
-
-    Ok(ModuleResult {
-        stdout: String::new(),
-        stderr: String::new(),
-        changed,
-        failed: false,
-        msg,
-    })
-}
-
-/// Check if user exists locally
-fn check_user_exists_local(name: &str) -> Result<bool> {
-    let output = Command::new("id")
-        .arg(name)
-        .output()
-        .with_context(|| format!("Failed to check if user {} exists", name))?;
-
-    Ok(output.status.success())
-}
-
-/// Check if user exists remotely
-fn check_user_exists_remote(ssh_client: &SshClient, name: &str, use_become: bool) -> Result<bool> {
-    let cmd = format!("id {}", name);
-    let (exit_code, _, _) = if use_become {
-        ssh_client.execute_sudo_command(&cmd, "")?
-    } else {
-        ssh_client.execute_command(&cmd)?
-    };
-
-    Ok(exit_code == 0)
-}
-
-/// Create user locally
-fn create_user_local(
-    name: &str,
-    uid: Option<i64>,
-    gid: Option<i64>,
-    home: Option<&str>,
-    shell: Option<&str>,
-    comment: Option<&str>,
-    create_home: bool,
-    system: bool,
-) -> Result<()> {
-    let mut cmd = Command::new("useradd");
-
-    if let Some(uid_val) = uid {
-        cmd.args(&["--uid", &uid_val.to_string()]);
-    }
-
-    if let Some(gid_val) = gid {
-        cmd.args(&["--gid", &gid_val.to_string()]);
-    }
-
-    if let Some(home_dir) = home {
-        cmd.args(&["--home-dir", home_dir]);
-    }
-
-    if let Some(shell_path) = shell {
-        cmd.args(&["--shell", shell_path]);
-    }
-
-    if let Some(comment_text) = comment {
-        cmd.args(&["--comment", comment_text]);
-    }
-
-    if create_home {
-        cmd.arg("--create-home");
-    } else {
-        cmd.arg("--no-create-home");
-    }
-
-    if system {
-        cmd.arg("--system");
-    }
-
-    cmd.arg(name);
-
-    let output = cmd
-        .output()
-        .with_context(|| format!("Failed to create user {}", name))?;
-
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        return Err(anyhow::anyhow!(
-            "Failed to create user {}: {}",
-            name,
-            stderr
-        ));
-    }
-
-    Ok(())
-}
-
-/// Create user remotely
-fn create_user_remote(
-    ssh_client: &SshClient,
-    name: &str,
-    uid: Option<i64>,
-    gid: Option<i64>,
-    home: Option<&str>,
-    shell: Option<&str>,
-    comment: Option<&str>,
-    create_home: bool,
-    system: bool,
-    use_become: bool,
-) -> Result<()> {
-    let mut cmd = vec!["useradd".to_string()];
-
-    if let Some(uid_val) = uid {
-        cmd.push("--uid".to_string());
-        cmd.push(uid_val.to_string());
-    }
-
-    if let Some(gid_val) = gid {
-        cmd.push("--gid".to_string());
-        cmd.push(gid_val.to_string());
-    }
-
-    if let Some(home_dir) = home {
-        cmd.push("--home-dir".to_string());
-        cmd.push(home_dir.to_string());
-    }
-
-    if let Some(shell_path) = shell {
-        cmd.push("--shell".to_string());
-        cmd.push(shell_path.to_string());
-    }
-
-    if let Some(comment_text) = comment {
-        cmd.push("--comment".to_string());
-        cmd.push(format!("\"{}\"", comment_text));
-    }
-
-    if create_home {
-        cmd.push("--create-home".to_string());
-    } else {
-        cmd.push("--no-create-home".to_string());
-    }
-
-    if system {
-        cmd.push("--system".to_string());
-    }
-
-    cmd.push(name.to_string());
-
-    let full_cmd = cmd.join(" ");
-    let (exit_code, _, stderr) = if use_become {
-        ssh_client.execute_sudo_command(&full_cmd, "")?
-    } else {
-        ssh_client.execute_command(&full_cmd)?
-    };
-
-    if exit_code != 0 {
-        return Err(anyhow::anyhow!(
-            "Failed to create user {}: {}",
-            name,
-            stderr
-        ));
-    }
-
-    Ok(())
-}
-
-/// Modify user locally
-fn modify_user_local(
-    name: &str,
-    uid: Option<i64>,
-    gid: Option<i64>,
-    home: Option<&str>,
-    shell: Option<&str>,
-    comment: Option<&str>,
-) -> Result<bool> {
-    let mut changed = false;
-    let mut cmd = Command::new("usermod");
-    let mut has_changes = false;
-
-    if let Some(uid_val) = uid {
-        cmd.args(&["--uid", &uid_val.to_string()]);
-        has_changes = true;
-    }
-
-    if let Some(gid_val) = gid {
-        cmd.args(&["--gid", &gid_val.to_string()]);
-        has_changes = true;
-    }
-
-    if let Some(home_dir) = home {
-        cmd.args(&["--home", home_dir]);
-        has_changes = true;
-    }
-
-    if let Some(shell_path) = shell {
-        cmd.args(&["--shell", shell_path]);
-        has_changes = true;
-    }
-
-    if let Some(comment_text) = comment {
-        cmd.args(&["--comment", comment_text]);
-        has_changes = true;
-    }
-
-    if has_changes {
-        cmd.arg(name);
-
-        let output = cmd
-            .output()
-            .with_context(|| format!("Failed to modify user {}", name))?;
-
-        if !output.status.success() {
-            let stderr = String::from_utf8_lossy(&output.stderr);
-            return Err(anyhow::anyhow!(
-                "Failed to modify user {}: {}",
-                name,
-                stderr
-            ));
-        }
-
-        changed = true;
-    }
-
-    Ok(changed)
-}
-
-/// Modify user remotely
-fn modify_user_remote(
-    ssh_client: &SshClient,
-    name: &str,
-    uid: Option<i64>,
-    gid: Option<i64>,
-    home: Option<&str>,
-    shell: Option<&str>,
-    comment: Option<&str>,
-    use_become: bool,
-) -> Result<bool> {
-    let mut cmd = vec!["usermod".to_string()];
-    let mut has_changes = false;
-
-    if let Some(uid_val) = uid {
-        cmd.push("--uid".to_string());
-        cmd.push(uid_val.to_string());
-        has_changes = true;
-    }
-
-    if let Some(gid_val) = gid {
-        cmd.push("--gid".to_string());
-        cmd.push(gid_val.to_string());
-        has_changes = true;
-    }
-
-    if let Some(home_dir) = home {
-        cmd.push("--home".to_string());
-        cmd.push(home_dir.to_string());
-        has_changes = true;
-    }
-
-    if let Some(shell_path) = shell {
-        cmd.push("--shell".to_string());
-        cmd.push(shell_path.to_string());
-        has_changes = true;
-    }
-
-    if let Some(comment_text) = comment {
-        cmd.push("--comment".to_string());
-        cmd.push(format!("\"{}\"", comment_text));
-        has_changes = true;
-    }
-
-    if has_changes {
-        cmd.push(name.to_string());
-
-        let full_cmd = cmd.join(" ");
-        let (exit_code, _, stderr) = if use_become {
-            ssh_client.execute_sudo_command(&full_cmd, "")?
-        } else {
-            ssh_client.execute_command(&full_cmd)?
+fn validate_parameters(args: &Value) -> Result<()> {
+    let map = args
+        .as_mapping()
+        .context("User arguments must be a mapping")?;
+    for key in map.keys() {
+        let Value::String(key) = key else {
+            bail!("User parameter names must be strings");
         };
-
-        if exit_code != 0 {
-            return Err(anyhow::anyhow!(
-                "Failed to modify user {}: {}",
-                name,
-                stderr
-            ));
+        if !SUPPORTED_PARAMETERS.contains(&key.as_str()) {
+            bail!("Unsupported user parameter: {key}");
         }
-
-        return Ok(true);
     }
-
-    Ok(false)
-}
-
-/// Set user password locally
-fn set_user_password_local(name: &str, password_hash: &str) -> Result<()> {
-    // Use sudo directly for local operations as well to ensure proper permissions
-    let cmd = format!("echo '{}:{}' | sudo chpasswd -e", name, password_hash);
-
-    let output = Command::new("sh")
-        .args(&["-c", &cmd])
-        .output()
-        .with_context(|| format!("Failed to set password for user {}", name))?;
-
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        return Err(anyhow::anyhow!(
-            "Failed to set password for user {}: {}",
-            name,
-            stderr
-        ));
-    }
-
     Ok(())
 }
 
-/// Set user password remotely
-fn set_user_password_remote(
-    ssh_client: &SshClient,
-    name: &str,
-    password_hash: &str,
-    use_become: bool,
-) -> Result<()> {
-    // Use a different approach for setting passwords with sudo
-    // Instead of using pipe with sudo, use usermod command which works better with sudo
-    let cmd = if use_become {
-        // Use usermod --password instead of chpasswd for better sudo compatibility
-        format!("usermod --password '{}' {}", password_hash, name)
-    } else {
-        // For non-sudo, use the original approach
-        format!("echo '{}:{}' | chpasswd -e", name, password_hash)
+fn optional<T: DeserializeOwned>(args: &Value, name: &str) -> Result<Option<T>> {
+    let map = args
+        .as_mapping()
+        .context("User arguments must be a mapping")?;
+    match map.get(Value::String(name.to_string())) {
+        Some(value) => serde_yaml::from_value(value.clone())
+            .with_context(|| format!("Invalid value for user parameter '{name}'"))
+            .map(Some),
+        None => Ok(None),
+    }
+}
+
+fn parse_groups(args: &Value) -> Result<Option<Vec<String>>> {
+    let map = args
+        .as_mapping()
+        .context("User arguments must be a mapping")?;
+    let Some(value) = map.get(Value::String("groups".to_string())) else {
+        return Ok(None);
     };
-
-    let (exit_code, _, stderr) = if use_become {
-        ssh_client.execute_sudo_command(&cmd, "")?
-    } else {
-        ssh_client.execute_command(&cmd)?
-    };
-
-    if exit_code != 0 {
-        // If usermod fails, try alternative approach
-        if use_become && cmd.contains("usermod") {
-            info!(
-                "usermod password failed, trying alternative method for user {}",
-                name
-            );
-
-            // Alternative: Create a temporary script and execute it with sudo
-            let script_content = format!(
-                "#!/bin/bash\necho '{}:{}' | chpasswd -e",
-                name, password_hash
-            );
-            let script_path = format!("/tmp/set_password_{}.sh", Uuid::new_v4());
-
-            // Create the script file
-            let create_script_cmd =
-                format!("cat > {} << 'EOF'\n{}\nEOF", script_path, script_content);
-            let (create_exit, _, create_stderr) = ssh_client.execute_command(&create_script_cmd)?;
-
-            if create_exit != 0 {
-                return Err(anyhow::anyhow!(
-                    "Failed to create password script for user {}: {}",
-                    name,
-                    create_stderr
-                ));
+    let groups = match value {
+        Value::String(value) => {
+            if value.is_empty() {
+                Vec::new()
+            } else {
+                value.split(',').map(str::to_string).collect()
             }
-
-            // Make it executable
-            let chmod_cmd = format!("chmod +x {}", script_path);
-            let (chmod_exit, _, chmod_stderr) = ssh_client.execute_command(&chmod_cmd)?;
-
-            if chmod_exit != 0 {
-                // Clean up and return error
-                let _ = ssh_client.execute_command(&format!("rm -f {}", script_path));
-                return Err(anyhow::anyhow!(
-                    "Failed to make password script executable for user {}: {}",
-                    name,
-                    chmod_stderr
-                ));
-            }
-
-            // Execute the script with sudo
-            let exec_cmd = format!("bash {}", script_path);
-            let (exec_exit, _, exec_stderr) = ssh_client.execute_sudo_command(&exec_cmd, "")?;
-
-            // Clean up the script
-            let _ = ssh_client.execute_command(&format!("rm -f {}", script_path));
-
-            if exec_exit != 0 {
-                return Err(anyhow::anyhow!(
-                    "Failed to set password for user {} using script method: {}",
-                    name,
-                    exec_stderr
-                ));
-            }
-
-            info!(
-                "Successfully set password for user {} using alternative method",
-                name
-            );
-            return Ok(());
         }
-
-        return Err(anyhow::anyhow!(
-            "Failed to set password for user {}: {}",
-            name,
-            stderr
-        ));
+        Value::Sequence(values) => values
+            .iter()
+            .map(|value| match value {
+                Value::String(group) => Ok(group.clone()),
+                _ => bail!("Every user group must be a string"),
+            })
+            .collect::<Result<Vec<_>>>()?,
+        _ => bail!("User 'groups' must be a string or a list of strings"),
+    };
+    for group in &groups {
+        if group.is_empty() || group.contains([',', '\n', '\r', '\0']) || group.starts_with('-') {
+            bail!("Invalid group name");
+        }
     }
-
-    Ok(())
+    Ok(Some(groups))
 }
 
-/// Manage user groups locally
-fn manage_user_groups_local(name: &str, groups: &[String], append: bool) -> Result<()> {
-    let mut cmd = Command::new("usermod");
-
-    if append {
-        cmd.args(&["-a", "-G"]);
-    } else {
-        cmd.args(&["-G"]);
-    }
-
-    cmd.arg(groups.join(","));
-    cmd.arg(name);
-
-    let output = cmd
-        .output()
-        .with_context(|| format!("Failed to manage groups for user {}", name))?;
-
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        return Err(anyhow::anyhow!(
-            "Failed to manage groups for user {}: {}",
-            name,
-            stderr
-        ));
-    }
-
-    Ok(())
-}
-
-/// Manage user groups remotely
-fn manage_user_groups_remote(
-    ssh_client: &SshClient,
-    name: &str,
-    groups: &[String],
-    append: bool,
+fn run(
+    connection: &dyn SshConnection,
+    command: &str,
     use_become: bool,
-) -> Result<()> {
-    let cmd = if append {
-        format!("usermod -a -G {} {}", groups.join(","), name)
+    become_user: &str,
+) -> Result<(i32, String, String)> {
+    if use_become {
+        connection.execute_sudo_command(command, become_user)
     } else {
-        format!("usermod -G {} {}", groups.join(","), name)
-    };
-
-    let (exit_code, _, stderr) = if use_become {
-        ssh_client.execute_sudo_command(&cmd, "")?
-    } else {
-        ssh_client.execute_command(&cmd)?
-    };
-
-    if exit_code != 0 {
-        return Err(anyhow::anyhow!(
-            "Failed to manage groups for user {}: {}",
-            name,
-            stderr
-        ));
+        connection.execute_command(command)
     }
-
-    Ok(())
 }
 
-/// Remove user locally
-fn remove_user_local(name: &str, remove_home: bool) -> Result<()> {
-    let mut cmd = Command::new("userdel");
-
-    if remove_home {
-        cmd.arg("--remove");
-    }
-
-    cmd.arg(name);
-
-    let output = cmd
-        .output()
-        .with_context(|| format!("Failed to remove user {}", name))?;
-
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        return Err(anyhow::anyhow!(
-            "Failed to remove user {}: {}",
-            name,
-            stderr
-        ));
-    }
-
-    Ok(())
-}
-
-/// Remove user remotely
-fn remove_user_remote(
-    ssh_client: &SshClient,
-    name: &str,
-    remove_home: bool,
+fn run_mutation(
+    connection: &dyn SshConnection,
+    command: &str,
     use_become: bool,
+    become_user: &str,
+    operation: &str,
 ) -> Result<()> {
-    let cmd = if remove_home {
-        format!("userdel --remove {}", name)
-    } else {
-        format!("userdel {}", name)
-    };
-
-    let (exit_code, _, stderr) = if use_become {
-        ssh_client.execute_sudo_command(&cmd, "")?
-    } else {
-        ssh_client.execute_command(&cmd)?
-    };
-
-    if exit_code != 0 {
-        return Err(anyhow::anyhow!(
-            "Failed to remove user {}: {}",
-            name,
-            stderr
-        ));
+    let (code, _, stderr) = run(connection, command, use_become, become_user)?;
+    if code != 0 {
+        bail!("Failed to {operation} (exit {code}): {}", stderr.trim());
     }
-
     Ok(())
 }
 
-/// Execute the user module in ad-hoc mode for a single host.
-pub fn execute_adhoc(host: &Host, args: &Value) -> Result<ModuleResult> {
-    if host.hostname == "localhost" || host.hostname == "127.0.0.1" {
-        // For localhost, execute directly without SSH
-        let name = get_param::<String>(args, "name")?;
-        let state =
-            get_optional_param::<String>(args, "state").unwrap_or_else(|| "present".to_string());
-        let uid = get_optional_param::<i64>(args, "uid");
-        let gid = get_optional_param::<i64>(args, "gid");
-        let groups = get_optional_param::<Vec<String>>(args, "groups");
-        let append = get_optional_param::<bool>(args, "append").unwrap_or(false);
-        let home = get_optional_param::<String>(args, "home");
-        let shell = get_optional_param::<String>(args, "shell");
-        let comment = get_optional_param::<String>(args, "comment");
-        let password = get_optional_param::<String>(args, "password");
-        let create_home = get_optional_param::<bool>(args, "create_home").unwrap_or(true);
-        let system = get_optional_param::<bool>(args, "system").unwrap_or(false);
-        let remove = get_optional_param::<bool>(args, "remove").unwrap_or(false);
+fn parse_passwd_line(line: &str, expected_name: &str) -> Result<AccountState> {
+    let fields = line
+        .trim_end_matches(['\r', '\n'])
+        .splitn(7, ':')
+        .collect::<Vec<_>>();
+    if fields.len() != 7 || fields[0] != expected_name {
+        bail!("Unexpected passwd database response for user {expected_name}");
+    }
+    Ok(AccountState {
+        uid: fields[2]
+            .parse()
+            .with_context(|| format!("Invalid uid in passwd entry for {expected_name}"))?,
+        gid: fields[3]
+            .parse()
+            .with_context(|| format!("Invalid gid in passwd entry for {expected_name}"))?,
+        comment: fields[4].to_string(),
+        home: fields[5].to_string(),
+        shell: fields[6].to_string(),
+    })
+}
 
-        return execute_local(
-            &name,
-            &state,
-            uid,
+fn account_state(
+    connection: &dyn SshConnection,
+    name: &str,
+    use_become: bool,
+    become_user: &str,
+) -> Result<Option<AccountState>> {
+    let command = format!("getent passwd {}", quote_posix_shell_arg(name)?);
+    let (code, stdout, stderr) = run(connection, &command, use_become, become_user)?;
+    match code {
+        0 => Ok(Some(parse_passwd_line(&stdout, name)?)),
+        2 => Ok(None),
+        code => bail!(
+            "Failed to query user {} (exit {}): {}",
+            name,
+            code,
+            stderr.trim()
+        ),
+    }
+}
+
+fn primary_group_name(
+    connection: &dyn SshConnection,
+    gid: i64,
+    use_become: bool,
+    become_user: &str,
+) -> Result<String> {
+    let command = format!("getent group {}", quote_posix_shell_arg(&gid.to_string())?);
+    let (code, stdout, stderr) = run(connection, &command, use_become, become_user)?;
+    if code != 0 {
+        bail!(
+            "Failed to resolve primary group {} (exit {}): {}",
             gid,
-            groups,
-            append,
-            home,
-            shell,
-            comment,
-            password,
-            create_home,
-            system,
-            remove,
+            code,
+            stderr.trim()
         );
     }
+    stdout
+        .split(':')
+        .next()
+        .filter(|name| !name.is_empty())
+        .map(str::to_string)
+        .context("Group database returned an invalid primary group")
+}
 
-    info!("Connecting to host: {}", host.name);
-    let ssh_client = SshClient::connect(host)?;
-    execute(&ssh_client, args, false, "")
+fn resolve_group_gid(
+    connection: &dyn SshConnection,
+    group: &str,
+    use_become: bool,
+    become_user: &str,
+) -> Result<i64> {
+    if group.is_empty() || group.starts_with('-') || group.contains([':', '\n', '\r', '\0']) {
+        bail!("Invalid primary group name");
+    }
+    let command = format!("getent group {}", quote_posix_shell_arg(group)?);
+    let (code, stdout, stderr) = run(connection, &command, use_become, become_user)?;
+    if code != 0 {
+        bail!(
+            "Failed to resolve primary group '{}' (exit {}): {}",
+            group,
+            code,
+            stderr.trim()
+        );
+    }
+    let fields = stdout
+        .trim_end_matches(['\r', '\n'])
+        .splitn(4, ':')
+        .collect::<Vec<_>>();
+    if fields.len() != 4 {
+        bail!("Group database returned an invalid entry for '{group}'");
+    }
+    fields[2]
+        .parse::<i64>()
+        .with_context(|| format!("Group database returned an invalid gid for '{group}'"))
+}
+
+fn supplementary_groups(
+    connection: &dyn SshConnection,
+    name: &str,
+    primary_gid: i64,
+    use_become: bool,
+    become_user: &str,
+) -> Result<BTreeSet<String>> {
+    let command = format!("id -nG -- {}", quote_posix_shell_arg(name)?);
+    let (code, stdout, stderr) = run(connection, &command, use_become, become_user)?;
+    if code != 0 {
+        bail!(
+            "Failed to query groups for {} (exit {}): {}",
+            name,
+            code,
+            stderr.trim()
+        );
+    }
+    let primary = primary_group_name(connection, primary_gid, use_become, become_user)?;
+    let mut groups = stdout
+        .split_whitespace()
+        .map(str::to_string)
+        .collect::<BTreeSet<_>>();
+    groups.remove(&primary);
+    Ok(groups)
+}
+
+fn shadow_hash(
+    connection: &dyn SshConnection,
+    name: &str,
+    use_become: bool,
+    become_user: &str,
+) -> Result<String> {
+    let command = format!("getent shadow {}", quote_posix_shell_arg(name)?);
+    let (code, stdout, stderr) = run(connection, &command, use_become, become_user)?;
+    if code != 0 {
+        bail!(
+            "Cannot compare the password hash for user {} (exit {}): {}. Use become with an account allowed to read the shadow database",
+            name,
+            code,
+            stderr.trim()
+        );
+    }
+    let mut fields = stdout.trim_end_matches(['\r', '\n']).split(':');
+    let returned_name = fields.next().unwrap_or_default();
+    let hash = fields.next().unwrap_or_default();
+    if returned_name != name || hash.is_empty() {
+        bail!(
+            "Cannot compare the password hash for user {}: the shadow database returned no usable hash",
+            name
+        );
+    }
+    Ok(hash.to_string())
+}
+
+fn groups_need_change(current: &BTreeSet<String>, desired: &[String], append: bool) -> bool {
+    let desired = desired.iter().cloned().collect::<BTreeSet<_>>();
+    if append {
+        !desired.is_subset(current)
+    } else {
+        current != &desired
+    }
+}
+
+fn attribute_changes(
+    current: &AccountState,
+    desired: &DesiredAccount,
+    desired_primary_gid: Option<i64>,
+    primary_group_argument: Option<&str>,
+) -> Result<Vec<String>> {
+    let mut arguments = Vec::new();
+    if let Some(uid) = desired.uid {
+        if uid < 0 {
+            bail!("uid cannot be negative");
+        }
+        if current.uid != uid {
+            arguments.extend([
+                "--uid".to_string(),
+                quote_posix_shell_arg(&uid.to_string())?,
+            ]);
+        }
+    }
+    if let Some(gid) = desired_primary_gid {
+        if gid < 0 {
+            bail!("gid cannot be negative");
+        }
+        if current.gid != gid {
+            arguments.extend([
+                "--gid".to_string(),
+                quote_posix_shell_arg(
+                    primary_group_argument
+                        .context("Internal primary-group plan is missing its argument")?,
+                )?,
+            ]);
+        }
+    }
+    for (flag, actual, wanted) in [
+        ("--home", current.home.as_str(), desired.home.as_deref()),
+        ("--shell", current.shell.as_str(), desired.shell.as_deref()),
+        (
+            "--comment",
+            current.comment.as_str(),
+            desired.comment.as_deref(),
+        ),
+    ] {
+        if let Some(wanted) = wanted {
+            if actual != wanted {
+                arguments.extend([flag.to_string(), quote_posix_shell_arg(wanted)?]);
+            }
+        }
+    }
+    Ok(arguments)
+}
+
+fn create_command(
+    name: &str,
+    desired: &DesiredAccount,
+    primary_group_argument: Option<&str>,
+) -> Result<String> {
+    let mut command = vec!["useradd".to_string()];
+    if let Some(uid) = desired.uid {
+        if uid < 0 {
+            bail!("uid cannot be negative");
+        }
+        command.extend([
+            "--uid".to_string(),
+            quote_posix_shell_arg(&uid.to_string())?,
+        ]);
+    }
+    if let Some(group) = primary_group_argument {
+        command.extend(["--gid".to_string(), quote_posix_shell_arg(group)?]);
+    }
+    for (flag, value) in [
+        ("--home-dir", desired.home.as_deref()),
+        ("--shell", desired.shell.as_deref()),
+        ("--comment", desired.comment.as_deref()),
+    ] {
+        if let Some(value) = value {
+            command.extend([flag.to_string(), quote_posix_shell_arg(value)?]);
+        }
+    }
+    command.push(
+        if desired.create_home {
+            "--create-home"
+        } else {
+            "--no-create-home"
+        }
+        .to_string(),
+    );
+    if desired.system {
+        command.push("--system".to_string());
+    }
+    command.extend(["--".to_string(), quote_posix_shell_arg(name)?]);
+    Ok(command.join(" "))
+}
+
+fn groups_command(name: &str, groups: &[String], append: bool) -> Result<String> {
+    let mut command = vec!["usermod".to_string()];
+    if append {
+        command.push("--append".to_string());
+    }
+    command.extend([
+        "--groups".to_string(),
+        quote_posix_shell_arg(&groups.join(","))?,
+        "--".to_string(),
+        quote_posix_shell_arg(name)?,
+    ]);
+    Ok(command.join(" "))
+}
+
+fn chpasswd_record(name: &str, password_hash: &str) -> Result<Vec<u8>> {
+    if name.contains([':', '\n', '\r', '\0']) || password_hash.contains([':', '\n', '\r', '\0']) {
+        bail!("User name and password hash must form one chpasswd record");
+    }
+    let mut record = format!("{}:{}", name, password_hash).into_bytes();
+    record.push(b'\n');
+    Ok(record)
+}
+
+fn set_password(
+    connection: &dyn SshConnection,
+    name: &str,
+    password: &str,
+    use_become: bool,
+    become_user: &str,
+) -> Result<()> {
+    let record = chpasswd_record(name, password)?;
+    let (code, _, stderr) = if use_become {
+        connection.execute_sudo_command_with_input("chpasswd -e", become_user, &record)?
+    } else {
+        connection.execute_command_with_input("chpasswd -e", &record)?
+    };
+    if code != 0 {
+        bail!("Failed to set password for {}: {}", name, stderr.trim());
+    }
+    Ok(())
+}
+
+pub fn execute(
+    connection: &dyn SshConnection,
+    args: &Value,
+    use_become: bool,
+    become_user: &str,
+    check_mode: bool,
+) -> Result<ModuleResult> {
+    validate_parameters(args)?;
+    let name = get_param::<String>(args, "name")?;
+    if name.is_empty() || name.starts_with('-') || name.contains([':', '\n', '\r', '\0']) {
+        bail!("Invalid user name");
+    }
+    let state = optional::<String>(args, "state")?.unwrap_or_else(|| "present".to_string());
+    if !matches!(state.as_str(), "present" | "absent") {
+        bail!("Invalid user state: {state}");
+    }
+    let remove = optional::<bool>(args, "remove")?.unwrap_or(false);
+    let requested_gid = optional::<i64>(args, "gid")?;
+    let primary_group = optional::<String>(args, "group")?;
+    if requested_gid.is_some() && primary_group.is_some() {
+        bail!("User parameters 'group' and 'gid' are mutually exclusive");
+    }
+    let desired = DesiredAccount {
+        uid: optional(args, "uid")?,
+        gid: requested_gid,
+        primary_group,
+        groups: parse_groups(args)?,
+        append: optional::<bool>(args, "append")?.unwrap_or(false),
+        home: optional(args, "home")?,
+        shell: optional(args, "shell")?,
+        comment: optional(args, "comment")?,
+        password: optional(args, "password")?,
+        create_home: optional::<bool>(args, "create_home")?.unwrap_or(true),
+        system: optional::<bool>(args, "system")?.unwrap_or(false),
+    };
+
+    info!("Managing a user account");
+    let current = account_state(connection, &name, use_become, become_user)?;
+    if state == "absent" {
+        let changed = current.is_some();
+        if changed && !check_mode {
+            let command = format!(
+                "userdel {}-- {}",
+                if remove { "--remove " } else { "" },
+                quote_posix_shell_arg(&name)?
+            );
+            run_mutation(connection, &command, use_become, become_user, "remove user")?;
+        }
+        return Ok(ModuleResult {
+            stdout: String::new(),
+            stderr: String::new(),
+            rc: None,
+            changed,
+            failed: false,
+            msg: if changed {
+                format!(
+                    "User {} {}",
+                    name,
+                    if check_mode {
+                        "would be removed"
+                    } else {
+                        "removed"
+                    }
+                )
+            } else {
+                format!("User {} is already absent", name)
+            },
+        });
+    }
+
+    let primary_group_argument = desired
+        .primary_group
+        .clone()
+        .or_else(|| desired.gid.map(|gid| gid.to_string()));
+    let desired_primary_gid = match desired.primary_group.as_deref() {
+        Some(group) => Some(resolve_group_gid(
+            connection,
+            group,
+            use_become,
+            become_user,
+        )?),
+        None => desired.gid,
+    };
+    let creating = current.is_none();
+    let attribute_arguments = current
+        .as_ref()
+        .map(|current| {
+            attribute_changes(
+                current,
+                &desired,
+                desired_primary_gid,
+                primary_group_argument.as_deref(),
+            )
+        })
+        .transpose()?
+        .unwrap_or_default();
+    let groups_changed = match (&current, desired.groups.as_deref()) {
+        (Some(current), Some(groups)) => {
+            let actual =
+                supplementary_groups(connection, &name, current.gid, use_become, become_user)?;
+            groups_need_change(&actual, groups, desired.append)
+        }
+        (None, Some(groups)) => !groups.is_empty(),
+        (_, None) => false,
+    };
+    let password_changed = match (&current, desired.password.as_deref()) {
+        (Some(_), Some(password)) => {
+            shadow_hash(connection, &name, use_become, become_user)? != password
+        }
+        (None, Some(_)) => true,
+        (_, None) => false,
+    };
+    let changed = creating || !attribute_arguments.is_empty() || groups_changed || password_changed;
+
+    if changed && !check_mode {
+        if creating {
+            let command = create_command(&name, &desired, primary_group_argument.as_deref())?;
+            run_mutation(connection, &command, use_become, become_user, "create user")?;
+        } else if !attribute_arguments.is_empty() {
+            let command = format!(
+                "usermod {} -- {}",
+                attribute_arguments.join(" "),
+                quote_posix_shell_arg(&name)?
+            );
+            run_mutation(connection, &command, use_become, become_user, "modify user")?;
+        }
+        if groups_changed {
+            let groups = desired
+                .groups
+                .as_deref()
+                .context("Internal user group plan error")?;
+            let command = groups_command(&name, groups, desired.append)?;
+            run_mutation(
+                connection,
+                &command,
+                use_become,
+                become_user,
+                "change user groups",
+            )?;
+        }
+        if password_changed {
+            set_password(
+                connection,
+                &name,
+                desired
+                    .password
+                    .as_deref()
+                    .context("Internal user password plan error")?,
+                use_become,
+                become_user,
+            )?;
+        }
+    }
+
+    Ok(ModuleResult {
+        stdout: String::new(),
+        stderr: String::new(),
+        rc: None,
+        changed,
+        failed: false,
+        msg: if changed {
+            format!(
+                "User {} {}",
+                name,
+                if check_mode {
+                    "would be changed"
+                } else {
+                    "changed"
+                }
+            )
+        } else {
+            format!("User {} is already in the requested state", name)
+        },
+    })
+}
+
+pub fn execute_adhoc(
+    host: &Host,
+    args: &Value,
+    use_become: bool,
+    become_user: &str,
+    check_mode: bool,
+) -> Result<ModuleResult> {
+    info!("Opening connection for host: {}", host.name);
+    let connection = Connection::connect(host)?;
+    execute(
+        connection.as_connection(),
+        args,
+        use_become,
+        become_user,
+        check_mode,
+    )
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use serde_yaml::{Mapping, Value};
+    use crate::ssh::connection::MockSshConnection;
 
-    #[test]
-    fn test_check_user_exists_local() {
-        // Test with a user that should exist on most systems
-        let result = check_user_exists_local("root");
-        assert!(result.is_ok());
+    fn current() -> AccountState {
+        AccountState {
+            uid: 1000,
+            gid: 1000,
+            comment: "Alice".to_string(),
+            home: "/home/alice".to_string(),
+            shell: "/bin/sh".to_string(),
+        }
+    }
 
-        // Test with a user that should not exist
-        let result = check_user_exists_local("nonexistent_user_12345");
-        assert!(result.is_ok());
-        assert!(!result.unwrap());
+    fn desired() -> DesiredAccount {
+        DesiredAccount {
+            uid: Some(1000),
+            gid: Some(1000),
+            primary_group: None,
+            groups: None,
+            append: false,
+            home: Some("/home/alice".to_string()),
+            shell: Some("/bin/sh".to_string()),
+            comment: Some("Alice".to_string()),
+            password: None,
+            create_home: true,
+            system: false,
+        }
     }
 
     #[test]
-    fn test_user_module_params() {
-        let mut map = Mapping::new();
-        map.insert(
-            Value::String("name".to_string()),
-            Value::String("testuser".to_string()),
-        );
-        map.insert(
-            Value::String("state".to_string()),
-            Value::String("present".to_string()),
-        );
-        let args = Value::Mapping(map);
-
-        assert_eq!(get_param::<String>(&args, "name").unwrap(), "testuser");
+    fn passwd_state_and_attributes_are_compared() {
         assert_eq!(
-            get_optional_param::<String>(&args, "state").unwrap(),
-            "present"
+            parse_passwd_line("alice:x:1000:1000:Alice:/home/alice:/bin/sh\n", "alice").unwrap(),
+            current()
         );
+        assert!(
+            attribute_changes(&current(), &desired(), Some(1000), Some("1000"))
+                .unwrap()
+                .is_empty()
+        );
+        let mut changed = desired();
+        changed.shell = Some("/bin/bash".to_string());
+        assert_eq!(
+            attribute_changes(&current(), &changed, Some(1000), Some("1000")).unwrap(),
+            vec!["--shell", "'/bin/bash'"]
+        );
+    }
+
+    #[test]
+    fn group_append_and_replace_plans_are_idempotent() {
+        let current = ["adm".to_string(), "wheel".to_string()]
+            .into_iter()
+            .collect::<BTreeSet<_>>();
+        assert!(!groups_need_change(&current, &["adm".to_string()], true));
+        assert!(groups_need_change(&current, &["adm".to_string()], false));
+        assert!(!groups_need_change(
+            &current,
+            &["wheel".to_string(), "adm".to_string()],
+            false
+        ));
+    }
+
+    #[test]
+    fn password_record_is_not_shell_interpolated() {
+        assert_eq!(
+            chpasswd_record("alice", "$6$salt$hash").unwrap(),
+            b"alice:$6$salt$hash\n"
+        );
+        assert!(chpasswd_record("alice\nroot", "hash").is_err());
+        assert!(chpasswd_record("alice", "hash\nroot:hash").is_err());
+        assert!(chpasswd_record("alice", "hash:extra-field").is_err());
+    }
+
+    #[test]
+    fn primary_group_generates_gid_arguments() {
+        let mut desired = desired();
+        desired.gid = None;
+        desired.primary_group = Some("operators".to_string());
+        assert_eq!(
+            attribute_changes(&current(), &desired, Some(2000), Some("operators")).unwrap(),
+            vec!["--gid", "'operators'"]
+        );
+        assert!(create_command("alice", &desired, Some("operators"))
+            .unwrap()
+            .contains("--gid 'operators'"));
+    }
+
+    #[test]
+    fn check_mode_only_reads_when_attributes_differ() {
+        let mut connection = MockSshConnection::new();
+        connection
+            .expect_execute_command()
+            .times(1)
+            .returning(|command| {
+                assert!(command.starts_with("getent passwd "));
+                Ok((
+                    0,
+                    "alice:x:1000:1000:Alice:/home/alice:/bin/sh\n".to_string(),
+                    String::new(),
+                ))
+            });
+        connection.expect_execute_sudo_command().times(0);
+        let args: Value =
+            serde_yaml::from_str("name: alice\nstate: present\nshell: /bin/bash\ncomment: Alice\n")
+                .unwrap();
+
+        let result = execute(&connection, &args, false, "", true).unwrap();
+        assert!(result.changed);
+    }
+
+    #[test]
+    fn misspelled_parameters_are_rejected() {
+        let args: Value = serde_yaml::from_str("name: alice\nsheel: /bin/bash\n").unwrap();
+        assert!(validate_parameters(&args)
+            .unwrap_err()
+            .to_string()
+            .contains("sheel"));
     }
 }

@@ -1,5 +1,5 @@
 use anyhow::{Context, Result};
-use log::{debug, error, info, warn};
+use log::{debug, error, info};
 use serde_json;
 use serde_yaml::Value;
 use std::error::Error;
@@ -8,38 +8,52 @@ use std::path::Path;
 use tera::{Context as TeraContext, Tera};
 
 use crate::inventory::Host;
-use crate::modules::param::{get_optional_param, get_param};
+use crate::modules::file::{apply_metadata_changes, inspect_path, plan_metadata_changes, PathKind};
+use crate::modules::param::{get_optional_param, get_param, validate_params};
 use crate::modules::ModuleResult;
 use crate::playbook::filters::register_ansible_filters;
-use crate::ssh::connection::SshClient;
+use crate::ssh::connection::{Connection, SshConnection};
 
 /// Execute the template module logic: render and upload a template, set permissions/ownership if needed.
 pub fn execute(
-    ssh_client: &SshClient,
+    connection: &dyn SshConnection,
     template_args: &Value,
     use_become: bool,
-    _become_user: &str,
+    become_user: &str,
+    check_mode: bool,
 ) -> Result<ModuleResult> {
+    validate_params(
+        template_args,
+        &["src", "content", "dest", "mode", "owner", "group", "vars"],
+    )?;
     let dest = get_param::<String>(template_args, "dest")?;
+    if dest.is_empty() {
+        return Err(anyhow::anyhow!("Template destination cannot be empty"));
+    }
 
     // Extract optional parameters
-    let mode = get_optional_param::<String>(template_args, "mode");
-    let owner = get_optional_param::<String>(template_args, "owner");
-    let group = get_optional_param::<String>(template_args, "group");
+    let mode = get_optional_param::<String>(template_args, "mode")?;
+    let owner = get_optional_param::<String>(template_args, "owner")?;
+    let group = get_optional_param::<String>(template_args, "group")?;
 
     // 解析模板内容 - 可以来自文件或直接内容
     let template_string: String;
-    let src_display: String; // 用于日志和消息
 
     // 检查是否提供了内联内容
     if let Value::Mapping(args_map) = template_args {
-        if let Some(content_value) = args_map.get(&Value::String("content".to_string())) {
+        let src_value = args_map.get(Value::String("src".to_string()));
+        let content_value = args_map.get(Value::String("content".to_string()));
+        if src_value.is_some() && content_value.is_some() {
+            return Err(anyhow::anyhow!(
+                "Template parameters 'src' and 'content' are mutually exclusive"
+            ));
+        }
+        if let Some(content_value) = content_value {
             template_string = match content_value {
                 Value::String(s) => s.clone(),
-                _ => format!("{:?}", content_value),
+                _ => return Err(anyhow::anyhow!("Template content must be a string")),
             };
-            src_display = "<inline_template>".to_string();
-        } else if let Some(Value::String(src)) = args_map.get(&Value::String("src".to_string())) {
+        } else if let Some(Value::String(src)) = src_value {
             // 从文件读取模板内容
             let src_path = Path::new(src);
             if !src_path.exists() {
@@ -47,7 +61,8 @@ pub fn execute(
             }
             template_string = fs::read_to_string(src)
                 .with_context(|| format!("Failed to read template file: {}", src))?;
-            src_display = src.clone();
+        } else if src_value.is_some() {
+            return Err(anyhow::anyhow!("Template src must be a string"));
         } else {
             return Err(anyhow::anyhow!(
                 "Template requires either 'src' or 'content' parameter"
@@ -57,14 +72,14 @@ pub fn execute(
         return Err(anyhow::anyhow!("Template arguments must be a mapping"));
     }
 
-    info!("Rendering template: {} -> {}", src_display, dest);
+    info!("Rendering a template");
 
     // 创建 Tera 上下文
     let mut tera_context = TeraContext::new();
 
     // Extract vars parameter if present and convert ALL variables to Tera context
     if let Value::Mapping(args_map) = template_args {
-        if let Some(vars_value) = args_map.get(&Value::String("vars".to_string())) {
+        if let Some(vars_value) = args_map.get(Value::String("vars".to_string())) {
             debug!(
                 "Found 'vars' parameter with {} items",
                 if let Value::Mapping(m) = vars_value {
@@ -76,74 +91,24 @@ pub fn execute(
 
             if let Value::Mapping(vars_map) = vars_value {
                 // 首先创建一个临时的Tera上下文用于预渲染变量
-                let mut temp_tera = Tera::default();
+                let temp_tera = Tera::default();
                 let mut temp_context = TeraContext::new();
 
                 // 先添加所有简单变量到临时上下文
                 for (key, value) in vars_map {
-                    if let Value::String(key_str) = key {
-                        match value {
-                            Value::String(s) if !s.contains("{{") && !s.contains("{%") => {
-                                // 不包含模板表达式的字符串直接添加
-                                match serde_json::to_value(value) {
-                                    Ok(json_val) => {
-                                        temp_context.insert(key_str, &json_val);
-                                        tera_context.insert(key_str, &json_val);
-                                        debug!(
-                                            "Added simple variable '{}' to Tera context",
-                                            key_str
-                                        );
-                                    }
-                                    Err(e) => {
-                                        warn!(
-                                            "Failed to convert simple variable '{}' to JSON: {}",
-                                            key_str, e
-                                        );
-                                    }
-                                }
-                            }
-                            Value::Number(_) | Value::Bool(_) => {
-                                // 数字和布尔值直接添加
-                                match serde_json::to_value(value) {
-                                    Ok(json_val) => {
-                                        temp_context.insert(key_str, &json_val);
-                                        tera_context.insert(key_str, &json_val);
-                                        debug!(
-                                            "Added primitive variable '{}' to Tera context",
-                                            key_str
-                                        );
-                                    }
-                                    Err(e) => {
-                                        warn!(
-                                            "Failed to convert primitive variable '{}' to JSON: {}",
-                                            key_str, e
-                                        );
-                                    }
-                                }
-                            }
-                            Value::Mapping(_) | Value::Sequence(_) => {
-                                // 复杂对象直接添加（不需要预渲染）
-                                match serde_json::to_value(value) {
-                                    Ok(json_val) => {
-                                        temp_context.insert(key_str, &json_val);
-                                        tera_context.insert(key_str, &json_val);
-                                        debug!(
-                                            "Added complex variable '{}' to Tera context",
-                                            key_str
-                                        );
-                                    }
-                                    Err(e) => {
-                                        warn!(
-                                            "Failed to convert complex variable '{}' to JSON: {}",
-                                            key_str, e
-                                        );
-                                    }
-                                }
-                            }
-                            _ => {
-                                debug!("Processing template variable '{}' (will handle in second pass)", key_str);
-                            }
-                        }
+                    let Value::String(key_str) = key else {
+                        return Err(anyhow::anyhow!("Template variable names must be strings"));
+                    };
+                    let dynamic = matches!(
+                        value,
+                        Value::String(value) if value.contains("{{") || value.contains("{%")
+                    );
+                    if !dynamic {
+                        let json_value = serde_json::to_value(value).with_context(|| {
+                            format!("Failed to convert template variable '{}'", key_str)
+                        })?;
+                        temp_context.insert(key_str.clone(), &json_value);
+                        tera_context.insert(key_str.clone(), &json_value);
                     }
                 }
 
@@ -152,33 +117,31 @@ pub fn execute(
                     if let Value::String(key_str) = key {
                         if let Value::String(s) = value {
                             if s.contains("{{") || s.contains("{%") {
-                                debug!("Rendering template variable '{}': {}", key_str, s);
+                                debug!(
+                                    "Rendering template variable '{}' ({} bytes)",
+                                    key_str,
+                                    s.len()
+                                );
 
                                 // 尝试渲染包含模板表达式的字符串
-                                match temp_tera.render_str(s, &temp_context) {
-                                    Ok(rendered_value) => {
-                                        debug!(
-                                            "Successfully pre-rendered variable '{}': {}",
-                                            key_str, rendered_value
-                                        );
-                                        tera_context.insert(key_str, &rendered_value);
-
-                                        // 也更新临时上下文，以供后续变量使用
-                                        temp_context.insert(key_str, &rendered_value);
-                                    }
-                                    Err(e) => {
-                                        warn!("Failed to pre-render template variable '{}': {}. Using original value.", key_str, e);
-                                        // 如果渲染失败，使用原始值
-                                        tera_context.insert(key_str, s);
-                                        temp_context.insert(key_str, s);
-                                    }
-                                }
+                                let rendered_value = temp_tera
+                                    .render_str(s, &temp_context, false)
+                                    .with_context(|| {
+                                        format!(
+                                            "Failed to pre-render template variable '{}'",
+                                            key_str
+                                        )
+                                    })?;
+                                tera_context.insert(key_str.clone(), &rendered_value);
+                                temp_context.insert(key_str.clone(), &rendered_value);
                             }
                         }
                     }
                 }
             } else {
-                warn!("'vars' parameter is not a mapping: {:?}", vars_value);
+                return Err(anyhow::anyhow!(
+                    "Template 'vars' parameter must be a mapping"
+                ));
             }
         } else {
             debug!("No 'vars' parameter found in template arguments");
@@ -192,10 +155,9 @@ pub fn execute(
     register_ansible_filters(&mut tera);
 
     let rendered_content = tera
-        .render_str(&template_string, &tera_context)
+        .render_str(&template_string, &tera_context, false)
         .map_err(|e| {
-            error!("Template rendering failed: {}", e);
-            error!("Template content: {}", template_string);
+            error!("Template rendering failed");
             debug!("Template rendering context variables were available");
 
             // Try to provide more detailed error information
@@ -207,100 +169,110 @@ pub fn execute(
             }
         })?;
 
-    info!(
-        "Template rendered successfully, uploading to remote host{}",
-        if use_become { " (with sudo)" } else { "" }
-    );
-
-    // Write the rendered template to the destination using appropriate method
-    if use_become {
-        // Use sudo-aware file writing method
-        ssh_client.write_file_with_sudo(
-            &rendered_content,
-            &dest,
-            mode.as_deref(),
-            owner.as_deref(),
-            group.as_deref(),
-        )?;
+    let current = inspect_path(connection, &dest, use_become, become_user)?;
+    if !matches!(current.kind, PathKind::Absent | PathKind::File) {
+        return Err(anyhow::anyhow!(
+            "Template destination {} exists but is not a regular file",
+            dest
+        ));
+    }
+    let rendered_bytes = rendered_content.as_bytes();
+    let existing_content = if use_become {
+        connection.read_file_bytes_with_sudo(&dest, become_user)?
     } else {
-        // Write file normally
-        ssh_client.write_file_content(&dest, &rendered_content)?;
+        connection.read_file_bytes(&dest)?
+    };
+    let content_changed = existing_content.as_deref() != Some(rendered_bytes);
+    let metadata_changes = plan_metadata_changes(
+        &current,
+        mode.as_deref(),
+        owner.as_deref(),
+        group.as_deref(),
+    )?;
+    let changed = content_changed || metadata_changes.is_changed();
 
-        // Set permissions and ownership if specified (without sudo)
-        if let Some(mode_str) = mode.as_deref() {
-            let chmod_cmd = format!("chmod {} {}", mode_str, dest);
-            let (exit_code, _, stderr) = ssh_client.execute_command(&chmod_cmd)?;
-            if exit_code != 0 {
-                return Err(anyhow::anyhow!("Failed to set file mode: {}", stderr));
+    if changed && !check_mode {
+        if content_changed {
+            if use_become {
+                connection.write_file_bytes_with_sudo(
+                    rendered_bytes,
+                    &dest,
+                    become_user,
+                    mode.clone(),
+                    owner.clone(),
+                    group.clone(),
+                )?;
+            } else {
+                connection.write_file_bytes(&dest, rendered_bytes)?;
             }
         }
 
-        if owner.is_some() || group.is_some() {
-            let ownership = match (owner.as_deref(), group.as_deref()) {
-                (Some(o), Some(g)) => format!("{}:{}", o, g),
-                (Some(o), None) => o.to_string(),
-                (None, Some(g)) => format!(":{}", g),
-                (None, None) => String::new(),
-            };
-
-            if !ownership.is_empty() {
-                let chown_cmd = format!("chown {} {}", ownership, dest);
-                let (exit_code, _, stderr) = ssh_client.execute_command(&chown_cmd)?;
-                if exit_code != 0 {
-                    return Err(anyhow::anyhow!("Failed to set file ownership: {}", stderr));
-                }
-            }
+        if metadata_changes.is_changed() && (!use_become || !content_changed) {
+            apply_metadata_changes(
+                connection,
+                &dest,
+                &metadata_changes,
+                false,
+                use_become,
+                become_user,
+            )?;
         }
     }
 
-    info!("Template rendered and uploaded successfully");
+    info!("Template rendering completed successfully");
     Ok(ModuleResult {
         stdout: String::new(),
         stderr: String::new(),
-        changed: true,
+        rc: None,
+        changed,
         failed: false,
-        msg: format!("Template {} applied to {}", src_display, dest),
+        msg: if changed {
+            format!("Template applied to {}", dest)
+        } else {
+            format!("Template destination {} is already up to date", dest)
+        },
     })
 }
 
 /// Execute the template module in ad-hoc mode for a single host.
-pub fn execute_adhoc(host: &Host, template_args: &Value) -> Result<ModuleResult> {
-    info!("Connecting to host: {}", host.name);
-    let ssh_client = SshClient::connect(host)?;
+pub fn execute_adhoc(
+    host: &Host,
+    template_args: &Value,
+    use_become: bool,
+    become_user: &str,
+    check_mode: bool,
+) -> Result<ModuleResult> {
+    info!("Opening connection for host: {}", host.name);
+    let connection = Connection::connect(host)?;
 
-    // 解析目标文件路径
-    let dest_file = get_param::<String>(template_args, "dest")?;
-
-    // 检查是否使用 src 或 content
-    let src_display = if let Value::Mapping(args_map) = template_args {
-        if let Some(Value::String(_)) = args_map.get(&Value::String("content".to_string())) {
-            "<inline_template>".to_string()
-        } else if let Some(Value::String(src)) = args_map.get(&Value::String("src".to_string())) {
-            src.clone()
-        } else {
-            return Err(anyhow::anyhow!(
-                "Template requires either 'src' or 'content' parameter"
-            ));
-        }
-    } else {
-        return Err(anyhow::anyhow!("Template arguments must be a mapping"));
-    };
-
-    execute(&ssh_client, template_args, false, "")?;
-
-    Ok(ModuleResult {
-        stdout: String::new(),
-        stderr: String::new(),
-        changed: true,
-        failed: false,
-        msg: format!("Template {} applied to {}", src_display, dest_file),
-    })
+    execute(
+        connection.as_connection(),
+        template_args,
+        use_become,
+        become_user,
+        check_mode,
+    )
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ssh::connection::LocalConnection;
     use serde_yaml::{Mapping, Value};
+
+    fn template_args(content: &str, dest: &str) -> Value {
+        let mut map = Mapping::new();
+        map.insert(
+            Value::String("content".into()),
+            Value::String(content.into()),
+        );
+        map.insert(Value::String("dest".into()), Value::String(dest.into()));
+        Value::Mapping(map)
+    }
+
+    fn local_connection() -> LocalConnection {
+        LocalConnection::new(&Host::new("localhost")).unwrap()
+    }
 
     #[test]
     fn test_template_params() {
@@ -318,9 +290,42 @@ mod tests {
         assert_eq!(get_param::<String>(&args, "dest").unwrap(), "/tmp/test");
 
         if let Value::Mapping(args_map) = &args {
-            assert!(args_map
-                .get(&Value::String("content".to_string()))
-                .is_some());
+            assert!(args_map.get(Value::String("content".to_string())).is_some());
         }
+    }
+
+    #[test]
+    fn rendered_template_is_idempotent_and_check_mode_does_not_write() {
+        let directory = tempfile::tempdir().unwrap();
+        let destination = directory.path().join("rendered");
+        let args = template_args("hello {{ name }}", destination.to_str().unwrap());
+        let mut vars = Mapping::new();
+        vars.insert(Value::String("name".into()), Value::String("world".into()));
+        let args = match args {
+            Value::Mapping(mut map) => {
+                map.insert(Value::String("vars".into()), Value::Mapping(vars));
+                Value::Mapping(map)
+            }
+            _ => unreachable!(),
+        };
+        let connection = local_connection();
+
+        let first = execute(&connection, &args, false, "", false).unwrap();
+        assert!(first.changed);
+        assert_eq!(
+            std::fs::read_to_string(&destination).unwrap(),
+            "hello world"
+        );
+
+        let second = execute(&connection, &args, false, "", false).unwrap();
+        assert!(!second.changed);
+
+        let checked_args = template_args("changed", destination.to_str().unwrap());
+        let checked = execute(&connection, &checked_args, false, "", true).unwrap();
+        assert!(checked.changed);
+        assert_eq!(
+            std::fs::read_to_string(&destination).unwrap(),
+            "hello world"
+        );
     }
 }

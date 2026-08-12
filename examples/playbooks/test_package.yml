@@ -161,7 +161,7 @@
     
     # List installed packages (sample)
     - name: List some installed packages (APT)
-      command: dpkg -l | head -20
+      shell: dpkg -l | head -20
       register: apt_packages
       ignore_errors: true
       when: has_apt
@@ -172,7 +172,7 @@
       when: has_apt and apt_packages.rc == 0
     
     - name: List some installed packages (YUM/DNF)
-      command: "{{ 'dnf' if has_dnf else 'yum' }} list installed | head -20"
+      shell: "{{ 'dnf' if has_dnf else 'yum' }} list installed | head -20"
       register: yum_packages
       ignore_errors: true
       when: has_yum or has_dnf
@@ -180,4 +180,4 @@
     - name: Show some YUM/DNF packages
       debug:
         var: yum_packages.stdout_lines
-      when: (has_yum or has_dnf) and yum_packages.rc == 0 
+      when: (has_yum or has_dnf) and yum_packages.rc == 0

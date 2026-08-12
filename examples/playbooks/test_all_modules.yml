@@ -70,14 +70,10 @@
         line: "log_level=DEBUG"
         insertafter: "^environment="
     
-    - name: Add security settings section
+    - name: Add security setting
       lineinfile:
         path: "{{ config_file }}"
-        line: |
-          
-          # Security settings
-          ssl_enabled=true
-          ssl_cert=/etc/ssl/certs/app.crt
+        line: "ssl_enabled=true"
         insertbefore: "EOF"
     
     # Template module test
@@ -158,7 +154,7 @@
     
     # Package module test (basic check)
     - name: Check package manager
-      command: which yum || which apt || which dnf || which zypper
+      shell: which yum || which apt || which dnf || which zypper
       register: pkg_manager
       ignore_errors: true
     
@@ -195,4 +191,4 @@
           - ✅ command: Executed system commands
           - ✅ debug: Displayed information
           
-          Check the files in {{ test_dir }} for results. 
+          Check the files in {{ test_dir }} for results.

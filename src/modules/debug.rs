@@ -1,38 +1,41 @@
 use anyhow::{anyhow, Result};
-use log::{debug, info, warn};
+use log::debug;
 use serde_yaml::Value;
 
 use crate::inventory::Host;
+use crate::modules::param::validate_params;
 use crate::modules::ModuleResult;
-use crate::ssh::connection::SshClient;
+use crate::ssh::connection::SshConnection;
 
 /// Execute the debug module - outputs the given debug message or variable value
 #[allow(dead_code)]
 pub fn execute(
-    _ssh_client: &SshClient,
+    _connection: &dyn SshConnection,
     args: &Value,
     _use_become: bool,
     _become_user: &str,
+    _check_mode: bool,
 ) -> Result<ModuleResult> {
-    // Add detailed logging
-    debug!("DEBUG MODULE EXECUTE: Received args: {:#?}", args);
+    execute_without_connection(args)
+}
+
+/// Debug is a controller-side action and must not require an SSH connection
+/// merely to display an already-resolved value.
+pub fn execute_without_connection(args: &Value) -> Result<ModuleResult> {
+    validate_params(args, &["msg", "var", "_var_value"])?;
+    debug!("Executing debug module");
 
     match args {
         Value::Mapping(map) => {
-            debug!("DEBUG MODULE EXECUTE: Args map content: {:#?}", map);
-
             // Case 1: 'msg' parameter is present - Check in two steps
-            if let Some(value) = map.get(&Value::String("msg".to_string())) {
-                debug!(
-                    "DEBUG MODULE EXECUTE: Found 'msg' key with value: {:?}",
-                    value
-                );
+            if let Some(value) = map.get(Value::String("msg".to_string())) {
+                debug!("Debug module received a 'msg' parameter");
                 if let Value::String(msg) = value {
-                    debug!("DEBUG MODULE EXECUTE: 'msg' value is a String.");
-                    info!("Debug message: {}", msg);
+                    debug!("Debug module message is {} bytes", msg.len());
                     return Ok(ModuleResult {
                         stdout: msg.clone(),
                         stderr: String::new(),
+                        rc: None,
                         changed: false,
                         failed: false,
                         msg: msg.clone(),
@@ -42,56 +45,58 @@ pub fn execute(
                     return Ok(ModuleResult {
                         stdout: msg_str.clone(),
                         stderr: String::new(),
+                        rc: None,
                         changed: false,
                         failed: false,
                         msg: msg_str.clone(),
                     });
                 }
             } else {
-                debug!("DEBUG MODULE EXECUTE: Did not find 'msg' key.");
+                debug!("Debug module did not receive a 'msg' parameter");
             }
 
             // Case 2: 'var' parameter is present
-            if let Some(var_param_value) = map.get(&Value::String("var".to_string())) {
-                debug!("DEBUG MODULE EXECUTE: Found 'var' key.");
+            if let Some(var_param_value) = map.get(Value::String("var".to_string())) {
+                debug!("Debug module received a 'var' parameter");
                 // Subcase 2a: '_var_value' is also present (meaning 'var' was a variable name)
-                if let Some(resolved_value) = map.get(&Value::String("_var_value".to_string())) {
+                if let Some(resolved_value) = map.get(Value::String("_var_value".to_string())) {
                     debug!("DEBUG MODULE EXECUTE: Found '_var_value' key.");
                     let value_str = format_value(resolved_value);
                     let var_name = match var_param_value {
                         Value::String(s) => s.clone(),
                         _ => "<unknown>".to_string(), // Should ideally be string
                     };
-                    info!("Debug var '{}': {}", var_name, value_str);
-                    return Ok(ModuleResult {
+                    Ok(ModuleResult {
                         stdout: value_str.clone(),
                         stderr: String::new(),
+                        rc: None,
                         changed: false,
                         failed: false,
                         msg: format!("{} = {}", var_name, value_str),
-                    });
+                    })
                 // Subcase 2b: '_var_value' is NOT present, check if 'var' holds a rendered string
                 } else if let Value::String(rendered_string) = var_param_value {
                     debug!("DEBUG MODULE EXECUTE: 'var' key holds a string.");
-                    info!("Debug var (direct string): {}", rendered_string);
-                    return Ok(ModuleResult {
+                    Ok(ModuleResult {
                         stdout: rendered_string.clone(),
                         stderr: String::new(),
+                        rc: None,
                         changed: false,
                         failed: false,
                         msg: rendered_string.clone(),
-                    });
+                    })
                 // Subcase 2c: 'var' exists but is not a string, and '_var_value' is missing
                 } else {
                     debug!("DEBUG MODULE EXECUTE: 'var' key holds non-string value.");
                     let var_content_str = format!("{:?}", var_param_value);
-                    return Ok(ModuleResult {
+                    Ok(ModuleResult {
                         stdout: var_content_str.clone(),
                         stderr: String::new(),
+                        rc: None,
                         changed: false,
                         failed: false,
                         msg: var_content_str.clone(),
-                    });
+                    })
                 }
             }
             // Case 3: Neither 'msg' nor 'var' parameter found
@@ -101,75 +106,22 @@ pub fn execute(
             }
         }
         _ => {
-            debug!(
-                "DEBUG MODULE EXECUTE: Received args were not a Mapping: {:?}",
-                args
-            );
+            debug!("Debug module arguments were not a mapping");
             Err(anyhow!("Debug module requires parameters as a YAML map"))
         }
     }
 }
 
 /// Execute the debug module for ad-hoc commands
-pub fn execute_adhoc(host: &Host, args: &Value) -> Result<ModuleResult> {
-    info!("Debug [{}]: {:?}", host.name, args);
-    match args {
-        Value::Mapping(map) => {
-            // Case 1: 'msg' parameter is present
-            if let Some(Value::String(msg)) = map.get(&Value::String("msg".to_string())) {
-                info!("Debug: {}", msg);
-                return Ok(ModuleResult {
-                    stdout: msg.clone(),
-                    stderr: String::new(),
-                    changed: false,
-                    failed: false,
-                    msg: msg.clone(),
-                });
-            }
-
-            // Case 2: 'var' parameter is present
-            if let Some(var_param_value) = map.get(&Value::String("var".to_string())) {
-                // Subcase 2a: '_var_value' is also present (meaning 'var' was a variable name)
-                if let Some(resolved_value) = map.get(&Value::String("_var_value".to_string())) {
-                    let value_str = format_value(resolved_value);
-                    let var_name = match var_param_value {
-                        Value::String(s) => s.clone(),
-                        _ => "<unknown>".to_string(), // Should ideally be string
-                    };
-                    info!("Debug var '{}': {}", var_name, value_str);
-                    return Ok(ModuleResult {
-                        stdout: value_str.clone(),
-                        stderr: String::new(),
-                        changed: false,
-                        failed: false,
-                        msg: format!("{} = {}", var_name, value_str),
-                    });
-                    // Subcase 2b: '_var_value' is NOT present, check if 'var' holds a rendered string
-                } else if let Value::String(rendered_string) = var_param_value {
-                    info!("Debug var (direct string): {}", rendered_string);
-                    return Ok(ModuleResult {
-                        stdout: rendered_string.clone(),
-                        stderr: String::new(),
-                        changed: false,
-                        failed: false,
-                        msg: rendered_string.clone(),
-                    });
-                // Subcase 2c: 'var' exists but is not a string, and '_var_value' is missing
-                } else {
-                    let var_content_str = format!("{:?}", var_param_value);
-                    warn!("Debug module found 'var' parameter, but its value is not a string and _var_value is missing: {}", var_content_str);
-                    return Err(anyhow!(
-                        "Invalid value type for 'var' parameter in debug module: {}",
-                        var_content_str
-                    ));
-                }
-            }
-
-            // Case 3: Neither 'msg' nor 'var' parameter found
-            Err(anyhow!("Debug module requires a 'msg' or 'var' parameter"))
-        }
-        _ => Err(anyhow!("Debug module requires parameters")),
-    }
+pub fn execute_adhoc(
+    host: &Host,
+    args: &Value,
+    _use_become: bool,
+    _become_user: &str,
+    _check_mode: bool,
+) -> Result<ModuleResult> {
+    debug!("Executing ad-hoc debug module for host {}", host.name);
+    execute_without_connection(args)
 }
 
 /// Format YAML values in a human-readable way

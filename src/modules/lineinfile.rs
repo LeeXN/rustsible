@@ -1,309 +1,274 @@
-use anyhow::{Context, Result};
-use log::{info, warn};
+use anyhow::{bail, Context, Result};
+use log::info;
 use regex::Regex;
 use serde_yaml::Value;
-use std::fs;
 
 use crate::inventory::Host;
-use crate::modules::param::{get_optional_param, get_param};
+use crate::modules::file::{
+    apply_metadata_changes, inspect_path, plan_metadata_changes, quote_posix_shell_arg, PathKind,
+};
+use crate::modules::param::{get_optional_param, get_param, validate_params};
 use crate::modules::ModuleResult;
-use crate::ssh::connection::SshClient;
+use crate::ssh::connection::{Connection, SshConnection};
 
-/// Execute the lineinfile module logic: manage lines in a file
+fn run(
+    connection: &dyn SshConnection,
+    command: &str,
+    use_become: bool,
+    become_user: &str,
+) -> Result<(i32, String, String)> {
+    if use_become {
+        connection.execute_sudo_command(command, become_user)
+    } else {
+        connection.execute_command(command)
+    }
+}
+
+fn read_content(
+    connection: &dyn SshConnection,
+    path: &str,
+    use_become: bool,
+    become_user: &str,
+) -> Result<String> {
+    let bytes = if use_become {
+        let command = format!("cat -- {}", quote_posix_shell_arg(path)?);
+        let (code, stdout, stderr) = connection.execute_sudo_command(&command, become_user)?;
+        if code != 0 {
+            bail!("Failed to read file {}: {}", path, stderr.trim());
+        }
+        stdout.into_bytes()
+    } else {
+        connection
+            .read_file_bytes(path)?
+            .with_context(|| format!("File {} disappeared while it was being inspected", path))?
+    };
+    String::from_utf8(bytes).with_context(|| format!("File {} is not valid UTF-8", path))
+}
+
+fn write_content(
+    connection: &dyn SshConnection,
+    path: &str,
+    content: &str,
+    use_become: bool,
+    become_user: &str,
+) -> Result<()> {
+    if use_become {
+        // Feed file data over stdin: content is never interpolated into a
+        // shell command, and the selected become user is preserved.
+        let command = format!("tee -- {} >/dev/null", quote_posix_shell_arg(path)?);
+        let (code, _, stderr) = connection.execute_sudo_command_with_input(
+            &command,
+            become_user,
+            content.as_bytes(),
+        )?;
+        if code != 0 {
+            bail!("Failed to write file {}: {}", path, stderr.trim());
+        }
+    } else {
+        connection.write_file_content(path, content)?;
+    }
+    Ok(())
+}
+
+fn validate_new_metadata(
+    mode: Option<&str>,
+    owner: Option<&str>,
+    group: Option<&str>,
+) -> Result<()> {
+    if let Some(mode) = mode {
+        if mode.is_empty() || !mode.chars().all(|character| matches!(character, '0'..='7')) {
+            bail!("File mode must be a non-empty octal string");
+        }
+        let parsed = u32::from_str_radix(mode, 8).context("Invalid file mode")?;
+        if parsed > 0o7777 {
+            bail!("File mode is outside the supported range");
+        }
+    }
+    for (kind, value) in [("owner", owner), ("group", group)] {
+        if value.is_some_and(str::is_empty) {
+            bail!("File {kind} cannot be empty");
+        }
+    }
+    Ok(())
+}
+
+fn validate_line(line: Option<&str>) -> Result<()> {
+    if line.is_some_and(|value| value.contains(['\n', '\r'])) {
+        bail!("'line' must be a single line and cannot contain newline characters");
+    }
+    Ok(())
+}
+
 pub fn execute(
-    ssh_client: &SshClient,
+    connection: &dyn SshConnection,
     args: &Value,
     use_become: bool,
-    _become_user: &str,
+    become_user: &str,
+    check_mode: bool,
 ) -> Result<ModuleResult> {
+    validate_params(
+        args,
+        &[
+            "path",
+            "line",
+            "regexp",
+            "state",
+            "backup",
+            "create",
+            "insertafter",
+            "insertbefore",
+            "owner",
+            "group",
+            "mode",
+        ],
+    )?;
     let path = get_param::<String>(args, "path")?;
-
-    // Extract parameters
-    let line = get_optional_param::<String>(args, "line");
-    let regexp = get_optional_param::<String>(args, "regexp");
+    let line = get_optional_param::<String>(args, "line")?;
+    let regexp = get_optional_param::<String>(args, "regexp")?;
     let state =
-        get_optional_param::<String>(args, "state").unwrap_or_else(|| "present".to_string());
-    let backup = get_optional_param::<bool>(args, "backup").unwrap_or(false);
-    let create = get_optional_param::<bool>(args, "create").unwrap_or(false);
-    let insertafter = get_optional_param::<String>(args, "insertafter");
-    let insertbefore = get_optional_param::<String>(args, "insertbefore");
-    let owner = get_optional_param::<String>(args, "owner");
-    let group = get_optional_param::<String>(args, "group");
-    let mode = get_optional_param::<String>(args, "mode");
+        get_optional_param::<String>(args, "state")?.unwrap_or_else(|| "present".to_string());
+    let backup = get_optional_param::<bool>(args, "backup")?.unwrap_or(false);
+    let create = get_optional_param::<bool>(args, "create")?.unwrap_or(false);
+    let insertafter = get_optional_param::<String>(args, "insertafter")?;
+    let insertbefore = get_optional_param::<String>(args, "insertbefore")?;
+    let owner = get_optional_param::<String>(args, "owner")?;
+    let group = get_optional_param::<String>(args, "group")?;
+    let mode = get_optional_param::<String>(args, "mode")?;
 
-    info!("Managing line in file: {}", path);
+    validate_line(line.as_deref())?;
+    if insertafter.is_some() && insertbefore.is_some() {
+        bail!("'insertafter' and 'insertbefore' are mutually exclusive");
+    }
+    if !matches!(state.as_str(), "present" | "absent") {
+        bail!("Invalid state: {}. Must be 'present' or 'absent'", state);
+    }
 
-    // Check if we need _host_type for local execution
-    let is_local = if let Value::Mapping(args_map) = args {
-        if let Some(Value::String(host_type)) =
-            args_map.get(&Value::String("_host_type".to_string()))
-        {
-            host_type == "local"
-        } else {
-            false
-        }
+    info!("Managing a line in a file");
+    let current = inspect_path(connection, &path, use_become, become_user)?;
+    if !matches!(current.kind, PathKind::Absent | PathKind::File) {
+        bail!("Path {} exists but is not a regular file", path);
+    }
+    let file_exists = current.kind == PathKind::File;
+    if !file_exists && state == "present" && !create {
+        bail!("File {} does not exist and create=false", path);
+    }
+
+    let mut content = if file_exists {
+        read_content(connection, &path, use_become, become_user)?
     } else {
+        String::new()
+    };
+    let content_changed = process_line_modifications(
+        &mut content,
+        line,
+        regexp,
+        &state,
+        insertafter,
+        insertbefore,
+    )?;
+    let creates_file = !file_exists && state == "present";
+
+    validate_new_metadata(mode.as_deref(), owner.as_deref(), group.as_deref())?;
+    let existing_metadata_changes = if file_exists {
+        Some(plan_metadata_changes(
+            &current,
+            mode.as_deref(),
+            owner.as_deref(),
+            group.as_deref(),
+        )?)
+    } else {
+        None
+    };
+    let metadata_changed = if state == "absent" && !file_exists {
         false
-    };
-
-    if is_local {
-        execute_local(
-            &path,
-            line,
-            regexp,
-            &state,
-            backup,
-            create,
-            insertafter,
-            insertbefore,
-            owner,
-            group,
-            mode,
-        )
     } else {
-        execute_remote(
-            ssh_client,
-            &path,
-            line,
-            regexp,
-            &state,
-            backup,
-            create,
-            insertafter,
-            insertbefore,
-            owner,
-            group,
-            mode,
-            use_become,
-        )
-    }
-}
-
-/// Execute lineinfile locally
-fn execute_local(
-    path: &str,
-    line: Option<String>,
-    regexp: Option<String>,
-    state: &str,
-    backup: bool,
-    create: bool,
-    insertafter: Option<String>,
-    insertbefore: Option<String>,
-    owner: Option<String>,
-    group: Option<String>,
-    mode: Option<String>,
-) -> Result<ModuleResult> {
-    let path_obj = std::path::Path::new(path);
-
-    // Check if file exists
-    let file_exists = path_obj.exists();
-
-    if !file_exists && !create {
-        return Err(anyhow::anyhow!(
-            "File {} does not exist and create=false",
-            path
-        ));
-    }
-
-    let mut content = if file_exists {
-        fs::read_to_string(path).with_context(|| format!("Failed to read file: {}", path))?
-    } else {
-        String::new()
+        existing_metadata_changes
+            .as_ref()
+            .is_some_and(|changes| changes.is_changed())
+            || (creates_file && (mode.is_some() || owner.is_some() || group.is_some()))
     };
+    let changed = content_changed || creates_file || metadata_changed;
 
-    let _original_content = content.clone();
-
-    // Create backup if requested
-    if backup && file_exists {
-        let backup_path = format!("{}.backup", path);
-        fs::copy(path, &backup_path)
-            .with_context(|| format!("Failed to create backup: {}", backup_path))?;
-        info!("Created backup: {}", backup_path);
-    }
-
-    let result =
-        process_line_modifications(&mut content, line, regexp, state, insertafter, insertbefore)?;
-    let changed = result;
-
-    if changed || !file_exists {
-        // Write the file
-        fs::write(path, &content).with_context(|| format!("Failed to write file: {}", path))?;
-
-        // Set permissions if specified
-        if let Some(mode_str) = mode {
-            set_file_permissions(path, &mode_str)?;
+    if !check_mode {
+        if content_changed || creates_file {
+            // Backups correspond to content replacements only. Metadata-only
+            // changes and check mode never create a backup.
+            if backup && file_exists && content_changed {
+                let backup_path = format!("{}.backup", path);
+                let command = format!(
+                    "cp -- {} {}",
+                    quote_posix_shell_arg(&path)?,
+                    quote_posix_shell_arg(&backup_path)?
+                );
+                let (code, _, stderr) = run(connection, &command, use_become, become_user)?;
+                if code != 0 {
+                    bail!("Failed to create backup {}: {}", backup_path, stderr.trim());
+                }
+            }
+            write_content(connection, &path, &content, use_become, become_user)?;
         }
 
-        // Set ownership if specified (Unix only)
-        #[cfg(unix)]
-        if owner.is_some() || group.is_some() {
-            set_file_ownership(path, owner.as_deref(), group.as_deref())?;
-        }
-    }
-
-    let msg = if !file_exists {
-        format!("File {} created", path)
-    } else if changed {
-        format!(
-            "Line {} in {}",
-            if state == "present" {
-                "added/updated"
-            } else {
-                "removed"
-            },
-            path
-        )
-    } else {
-        format!("File {} unchanged", path)
-    };
-
-    Ok(ModuleResult {
-        stdout: String::new(),
-        stderr: String::new(),
-        changed: changed || !file_exists,
-        failed: false,
-        msg,
-    })
-}
-
-/// Execute lineinfile remotely via SSH
-fn execute_remote(
-    ssh_client: &SshClient,
-    path: &str,
-    line: Option<String>,
-    regexp: Option<String>,
-    state: &str,
-    backup: bool,
-    create: bool,
-    insertafter: Option<String>,
-    insertbefore: Option<String>,
-    owner: Option<String>,
-    group: Option<String>,
-    mode: Option<String>,
-    use_become: bool,
-) -> Result<ModuleResult> {
-    // Check if file exists
-    let check_cmd = format!("test -f {}", path);
-    let (exit_code, _, _) = if use_become {
-        ssh_client.execute_sudo_command(&check_cmd, "")?
-    } else {
-        ssh_client.execute_command(&check_cmd)?
-    };
-
-    let file_exists = exit_code == 0;
-
-    if !file_exists && !create {
-        return Err(anyhow::anyhow!(
-            "File {} does not exist and create=false",
-            path
-        ));
-    }
-
-    // Read file content if it exists
-    let mut content = if file_exists {
-        let read_cmd = format!("cat {}", path);
-        let (exit_code, stdout, stderr) = if use_become {
-            ssh_client.execute_sudo_command(&read_cmd, "")?
-        } else {
-            ssh_client.execute_command(&read_cmd)?
-        };
-
-        if exit_code != 0 {
-            return Err(anyhow::anyhow!("Failed to read file {}: {}", path, stderr));
-        }
-        stdout
-    } else {
-        String::new()
-    };
-
-    let _original_content = content.clone();
-
-    // Create backup if requested
-    if backup && file_exists {
-        let backup_cmd = format!("cp {} {}.backup", path, path);
-        let (exit_code, _, stderr) = if use_become {
-            ssh_client.execute_sudo_command(&backup_cmd, "")?
-        } else {
-            ssh_client.execute_command(&backup_cmd)?
-        };
-
-        if exit_code != 0 {
-            warn!("Failed to create backup: {}", stderr);
-        } else {
-            info!("Created backup: {}.backup", path);
-        }
-    }
-
-    let changed =
-        process_line_modifications(&mut content, line, regexp, state, insertafter, insertbefore)?;
-
-    if changed || !file_exists {
-        // Write the modified content to the file
-        if use_become {
-            ssh_client.write_file_with_sudo(
-                &content,
-                path,
+        if file_exists {
+            if let Some(changes) = existing_metadata_changes.as_ref() {
+                if changes.is_changed() {
+                    apply_metadata_changes(
+                        connection,
+                        &path,
+                        changes,
+                        false,
+                        use_become,
+                        become_user,
+                    )?;
+                }
+            }
+        } else if creates_file && (mode.is_some() || owner.is_some() || group.is_some()) {
+            // Inspect the actual defaults after creation, then apply only the
+            // requested differences.
+            let created = inspect_path(connection, &path, use_become, become_user)?;
+            if created.kind != PathKind::File {
+                bail!("Newly created path {} is not a regular file", path);
+            }
+            let changes = plan_metadata_changes(
+                &created,
                 mode.as_deref(),
                 owner.as_deref(),
                 group.as_deref(),
             )?;
-        } else {
-            ssh_client.write_file_content(path, &content)?;
-
-            // Set permissions and ownership if specified (without sudo)
-            if let Some(mode_str) = mode {
-                let chmod_cmd = format!("chmod {} {}", mode_str, path);
-                let (exit_code, _, stderr) = ssh_client.execute_command(&chmod_cmd)?;
-                if exit_code != 0 {
-                    return Err(anyhow::anyhow!("Failed to set file mode: {}", stderr));
-                }
-            }
-
-            if owner.is_some() || group.is_some() {
-                let ownership = match (owner.as_deref(), group.as_deref()) {
-                    (Some(o), Some(g)) => format!("{}:{}", o, g),
-                    (Some(o), None) => o.to_string(),
-                    (None, Some(g)) => format!(":{}", g),
-                    (None, None) => String::new(),
-                };
-
-                if !ownership.is_empty() {
-                    let chown_cmd = format!("chown {} {}", ownership, path);
-                    let (exit_code, _, stderr) = ssh_client.execute_command(&chown_cmd)?;
-                    if exit_code != 0 {
-                        return Err(anyhow::anyhow!("Failed to set file ownership: {}", stderr));
-                    }
-                }
+            if changes.is_changed() {
+                apply_metadata_changes(
+                    connection,
+                    &path,
+                    &changes,
+                    false,
+                    use_become,
+                    become_user,
+                )?;
             }
         }
     }
 
-    let msg = if !file_exists {
-        format!("File {} created", path)
-    } else if changed {
-        format!(
-            "Line {} in {}",
-            if state == "present" {
-                "added/updated"
-            } else {
-                "removed"
-            },
-            path
-        )
-    } else {
-        format!("File {} unchanged", path)
-    };
-
     Ok(ModuleResult {
         stdout: String::new(),
         stderr: String::new(),
-        changed: changed || !file_exists,
+        rc: None,
+        changed,
         failed: false,
-        msg,
+        msg: if changed {
+            format!(
+                "File {} {}",
+                path,
+                if check_mode {
+                    "would be updated"
+                } else {
+                    "updated"
+                }
+            )
+        } else {
+            format!("File {} is already in the requested state", path)
+        },
     })
 }
 
-/// Process line modifications to content
 fn process_line_modifications(
     content: &mut String,
     line: Option<String>,
@@ -312,291 +277,223 @@ fn process_line_modifications(
     insertafter: Option<String>,
     insertbefore: Option<String>,
 ) -> Result<bool> {
-    let mut lines: Vec<String> = content.lines().map(|s| s.to_string()).collect();
-    let mut changed = false;
+    validate_line(line.as_deref())?;
 
-    match state {
+    let mut lines: Vec<String> = content.lines().map(str::to_string).collect();
+    let changed = match state {
         "present" => {
-            let line_to_add = line.as_ref().ok_or_else(|| {
-                anyhow::anyhow!("'line' parameter is required when state=present")
-            })?;
-
-            if let Some(regex_pattern) = regexp {
-                // Find and replace line matching regexp
-                let regex = Regex::new(&regex_pattern)
-                    .with_context(|| format!("Invalid regexp: {}", regex_pattern))?;
-
-                let mut found = false;
-                for line in lines.iter_mut() {
-                    if regex.is_match(line) {
-                        if line != line_to_add {
-                            *line = line_to_add.clone();
-                            changed = true;
-                        }
-                        found = true;
-                        break;
+            let desired = line
+                .as_ref()
+                .context("'line' parameter is required when state=present")?;
+            if let Some(pattern) = regexp {
+                let regex =
+                    Regex::new(&pattern).with_context(|| format!("Invalid regexp: {pattern}"))?;
+                if let Some(existing) = lines.iter_mut().find(|entry| regex.is_match(entry)) {
+                    if existing == desired {
+                        false
+                    } else {
+                        *existing = desired.clone();
+                        true
                     }
-                }
-
-                if !found {
-                    // Line doesn't exist, add it
+                } else {
                     insert_line(
                         &mut lines,
-                        line_to_add,
+                        desired,
                         insertafter.as_deref(),
                         insertbefore.as_deref(),
                     )?;
-                    changed = true;
+                    true
                 }
+            } else if lines.iter().any(|entry| entry == desired) {
+                false
             } else {
-                // Check if line already exists
-                if !lines
-                    .iter()
-                    .any(|existing_line| existing_line == line_to_add)
-                {
-                    insert_line(
-                        &mut lines,
-                        line_to_add,
-                        insertafter.as_deref(),
-                        insertbefore.as_deref(),
-                    )?;
-                    changed = true;
-                }
+                insert_line(
+                    &mut lines,
+                    desired,
+                    insertafter.as_deref(),
+                    insertbefore.as_deref(),
+                )?;
+                true
             }
         }
         "absent" => {
-            if let Some(regex_pattern) = regexp {
-                // Remove lines matching regexp
-                let regex = Regex::new(&regex_pattern)
-                    .with_context(|| format!("Invalid regexp: {}", regex_pattern))?;
-
+            if let Some(pattern) = regexp {
+                let regex =
+                    Regex::new(&pattern).with_context(|| format!("Invalid regexp: {pattern}"))?;
                 let original_len = lines.len();
-                lines.retain(|line| !regex.is_match(line));
-                changed = lines.len() != original_len;
-            } else if let Some(line_to_remove) = line {
-                // Remove specific line
+                lines.retain(|entry| !regex.is_match(entry));
+                lines.len() != original_len
+            } else if let Some(desired) = line {
                 let original_len = lines.len();
-                lines.retain(|line| *line != line_to_remove);
-                changed = lines.len() != original_len;
+                lines.retain(|entry| entry != &desired);
+                lines.len() != original_len
             } else {
-                return Err(anyhow::anyhow!(
-                    "Either 'line' or 'regexp' parameter is required when state=absent"
-                ));
+                bail!("Either 'line' or 'regexp' is required when state=absent")
             }
         }
-        _ => {
-            return Err(anyhow::anyhow!(
-                "Invalid state: {}. Must be 'present' or 'absent'",
-                state
-            ));
+        _ => bail!("Invalid state: {state}"),
+    };
+
+    // Leave byte-for-byte content alone on a no-op. In particular, do not add
+    // a trailing newline to an otherwise unchanged file.
+    if changed {
+        *content = lines.join("\n");
+        if !content.is_empty() {
+            content.push('\n');
         }
     }
-
-    *content = lines.join("\n");
-    if !content.is_empty() && !content.ends_with('\n') {
-        content.push('\n');
-    }
-
     Ok(changed)
 }
 
-/// Insert line at appropriate position
 fn insert_line(
     lines: &mut Vec<String>,
-    line_to_add: &str,
+    line: &str,
     insertafter: Option<&str>,
     insertbefore: Option<&str>,
 ) -> Result<()> {
     if let Some(pattern) = insertafter {
         if pattern == "EOF" {
-            lines.push(line_to_add.to_string());
+            lines.push(line.to_string());
         } else {
             let regex = Regex::new(pattern)
-                .with_context(|| format!("Invalid insertafter regexp: {}", pattern))?;
-
-            let mut insert_pos = lines.len(); // Default to end
-            for (i, line) in lines.iter().enumerate() {
-                if regex.is_match(line) {
-                    insert_pos = i + 1;
-                    break;
-                }
-            }
-            lines.insert(insert_pos, line_to_add.to_string());
+                .with_context(|| format!("Invalid insertafter regexp: {pattern}"))?;
+            let position = lines
+                .iter()
+                .position(|entry| regex.is_match(entry))
+                .map_or(lines.len(), |index| index + 1);
+            lines.insert(position, line.to_string());
         }
     } else if let Some(pattern) = insertbefore {
         if pattern == "BOF" {
-            lines.insert(0, line_to_add.to_string());
+            lines.insert(0, line.to_string());
         } else {
             let regex = Regex::new(pattern)
-                .with_context(|| format!("Invalid insertbefore regexp: {}", pattern))?;
-
-            let mut insert_pos = lines.len(); // Default to end
-            for (i, line) in lines.iter().enumerate() {
-                if regex.is_match(line) {
-                    insert_pos = i;
-                    break;
-                }
-            }
-            lines.insert(insert_pos, line_to_add.to_string());
+                .with_context(|| format!("Invalid insertbefore regexp: {pattern}"))?;
+            let position = lines
+                .iter()
+                .position(|entry| regex.is_match(entry))
+                .unwrap_or(lines.len());
+            lines.insert(position, line.to_string());
         }
     } else {
-        lines.push(line_to_add.to_string());
+        lines.push(line.to_string());
     }
-
     Ok(())
 }
 
-/// Set file permissions (Unix only)
-#[cfg(unix)]
-fn set_file_permissions(path: &str, mode: &str) -> Result<()> {
-    use std::os::unix::fs::PermissionsExt;
-
-    let mode_value =
-        u32::from_str_radix(mode, 8).with_context(|| format!("Invalid file mode: {}", mode))?;
-
-    let perms = std::fs::Permissions::from_mode(mode_value);
-    std::fs::set_permissions(path, perms)
-        .with_context(|| format!("Failed to set permissions on {}", path))?;
-
-    Ok(())
-}
-
-/// Set file permissions (Windows - limited support)
-#[cfg(windows)]
-fn set_file_permissions(_path: &str, _mode: &str) -> Result<()> {
-    warn!("File mode setting is not supported on Windows");
-    Ok(())
-}
-
-/// Set file ownership (Unix only)
-#[cfg(unix)]
-fn set_file_ownership(path: &str, owner: Option<&str>, group: Option<&str>) -> Result<()> {
-    use std::process::Command;
-
-    if let Some(owner_name) = owner {
-        let chown_cmd = if let Some(group_name) = group {
-            format!("chown {}:{} {}", owner_name, group_name, path)
-        } else {
-            format!("chown {} {}", owner_name, path)
-        };
-
-        let output = Command::new("sh")
-            .args(&["-c", &chown_cmd])
-            .output()
-            .with_context(|| format!("Failed to execute chown command: {}", chown_cmd))?;
-
-        if !output.status.success() {
-            let stderr = String::from_utf8_lossy(&output.stderr);
-            return Err(anyhow::anyhow!("Failed to set ownership: {}", stderr));
-        }
-    } else if let Some(group_name) = group {
-        let chgrp_cmd = format!("chgrp {} {}", group_name, path);
-
-        let output = Command::new("sh")
-            .args(&["-c", &chgrp_cmd])
-            .output()
-            .with_context(|| format!("Failed to execute chgrp command: {}", chgrp_cmd))?;
-
-        if !output.status.success() {
-            let stderr = String::from_utf8_lossy(&output.stderr);
-            return Err(anyhow::anyhow!("Failed to set group ownership: {}", stderr));
-        }
-    }
-
-    Ok(())
-}
-
-/// Execute the lineinfile module in ad-hoc mode for a single host.
-pub fn execute_adhoc(host: &Host, args: &Value) -> Result<ModuleResult> {
-    if host.hostname == "localhost" || host.hostname == "127.0.0.1" {
-        // For localhost, execute directly without SSH
-        let path = get_param::<String>(args, "path")?;
-        let line = get_optional_param::<String>(args, "line");
-        let regexp = get_optional_param::<String>(args, "regexp");
-        let state =
-            get_optional_param::<String>(args, "state").unwrap_or_else(|| "present".to_string());
-        let backup = get_optional_param::<bool>(args, "backup").unwrap_or(false);
-        let create = get_optional_param::<bool>(args, "create").unwrap_or(false);
-        let insertafter = get_optional_param::<String>(args, "insertafter");
-        let insertbefore = get_optional_param::<String>(args, "insertbefore");
-        let owner = get_optional_param::<String>(args, "owner");
-        let group = get_optional_param::<String>(args, "group");
-        let mode = get_optional_param::<String>(args, "mode");
-
-        return execute_local(
-            &path,
-            line,
-            regexp,
-            &state,
-            backup,
-            create,
-            insertafter,
-            insertbefore,
-            owner,
-            group,
-            mode,
-        );
-    }
-
-    info!("Connecting to host: {}", host.name);
-    let ssh_client = SshClient::connect(host)?;
-    execute(&ssh_client, args, false, "")
+pub fn execute_adhoc(
+    host: &Host,
+    args: &Value,
+    use_become: bool,
+    become_user: &str,
+    check_mode: bool,
+) -> Result<ModuleResult> {
+    info!("Opening connection for host: {}", host.name);
+    let connection = Connection::connect(host)?;
+    execute(
+        connection.as_connection(),
+        args,
+        use_become,
+        become_user,
+        check_mode,
+    )
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use serde_yaml::{Mapping, Value};
+    use std::fs;
 
     #[test]
-    fn test_process_line_modifications_present() {
+    fn process_present_absent_and_regexp() {
         let mut content = "line1\nline2\nline3\n".to_string();
-        let changed = process_line_modifications(
+        assert!(process_line_modifications(
             &mut content,
-            Some("new_line".to_string()),
-            None,
+            Some("replacement".to_string()),
+            Some("^line2$".to_string()),
             "present",
             None,
             None,
         )
-        .unwrap();
-
-        assert!(changed);
-        assert!(content.contains("new_line"));
-    }
-
-    #[test]
-    fn test_process_line_modifications_absent() {
-        let mut content = "line1\nline2\nline3\n".to_string();
-        let changed = process_line_modifications(
+        .unwrap());
+        assert_eq!(content, "line1\nreplacement\nline3\n");
+        assert!(process_line_modifications(
             &mut content,
-            Some("line2".to_string()),
             None,
+            Some("^line3$".to_string()),
             "absent",
             None,
             None,
         )
-        .unwrap();
-
-        assert!(changed);
-        assert!(!content.contains("line2"));
+        .unwrap());
+        assert_eq!(content, "line1\nreplacement\n");
     }
 
     #[test]
-    fn test_process_line_modifications_regexp() {
-        let mut content = "config_option=old_value\nother_line\n".to_string();
-        let changed = process_line_modifications(
+    fn no_op_preserves_missing_trailing_newline() {
+        let mut content = "already present".to_string();
+        assert!(!process_line_modifications(
             &mut content,
-            Some("config_option=new_value".to_string()),
-            Some("^config_option=".to_string()),
+            Some("already present".to_string()),
+            None,
             "present",
             None,
             None,
         )
+        .unwrap());
+        assert_eq!(content, "already present");
+    }
+
+    #[test]
+    fn rejects_multiline_line_without_modifying_content() {
+        for invalid_line in ["first\nsecond", "first\r\nsecond", "first\rsecond"] {
+            let mut content = "existing\n".to_string();
+            let error = process_line_modifications(
+                &mut content,
+                Some(invalid_line.to_string()),
+                None,
+                "present",
+                None,
+                None,
+            )
+            .unwrap_err()
+            .to_string();
+
+            assert!(error.contains("single line"), "{error}");
+            assert_eq!(content, "existing\n");
+        }
+    }
+
+    #[test]
+    fn check_mode_does_not_write_or_backup() {
+        let temporary = tempfile::NamedTempFile::new().unwrap();
+        fs::write(temporary.path(), "before\n").unwrap();
+        let host = Host::new("localhost");
+        let connection = Connection::connect(&host).unwrap();
+        let backup = format!("{}.backup", temporary.path().display());
+
+        let mut args = Mapping::new();
+        args.insert(
+            Value::String("path".to_string()),
+            Value::String(temporary.path().to_string_lossy().into_owned()),
+        );
+        args.insert(
+            Value::String("line".to_string()),
+            Value::String("after".to_string()),
+        );
+        args.insert(Value::String("backup".to_string()), Value::Bool(true));
+        let result = execute(
+            connection.as_connection(),
+            &Value::Mapping(args),
+            false,
+            "",
+            true,
+        )
         .unwrap();
 
-        assert!(changed);
-        assert!(content.contains("config_option=new_value"));
-        assert!(!content.contains("config_option=old_value"));
+        assert!(result.changed);
+        assert_eq!(fs::read_to_string(temporary.path()).unwrap(), "before\n");
+        assert!(!std::path::Path::new(&backup).exists());
     }
 }

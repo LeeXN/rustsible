@@ -48,7 +48,7 @@
     - name: List each file
       debug:
         msg: "{{ item }}"
-      loop: "{{ txt_files.stdout_lines | default([]) }}"
+      loop: "{{ txt_files.stdout_lines | default(value=[]) }}"
     
     - name: Check disk usage
       command: df -h
@@ -91,4 +91,4 @@
     
     - name: Cleanup test directory
       command: rm -rf {{ test_dir }}
-      ignore_errors: true 
+      ignore_errors: true

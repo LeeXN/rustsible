@@ -14,54 +14,96 @@ pub mod user;
 
 use anyhow::Result;
 use colored::Colorize;
-use log::info;
+use log::{debug, info};
 use serde_yaml::Value;
-use std::collections::HashMap;
 use std::time::Instant;
 
 use crate::inventory::Host;
-use crate::ssh::connection::SshClient;
+use crate::ssh::connection::{Connection, SshConnection};
 
 /// Result structure for unified handling of module returns
 #[derive(Default)]
 pub struct ModuleResult {
     pub stdout: String,
     pub stderr: String,
+    pub rc: Option<i32>,
     pub changed: bool,
     pub failed: bool,
     pub msg: String,
+}
+
+/// Controls an ad-hoc run. `become_override` is optional so an explicit
+/// command-line request can override inventory while an omitted flag still
+/// inherits the per-host `ansible_become` setting.
+#[derive(Debug, Clone)]
+pub struct AdHocOptions {
+    pub become_override: Option<bool>,
+    pub become_user: Option<String>,
+    pub check_mode: bool,
+    pub forks: usize,
+}
+
+impl Default for AdHocOptions {
+    fn default() -> Self {
+        Self {
+            become_override: None,
+            become_user: None,
+            check_mode: false,
+            forks: 5,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct EffectiveAdHocOptions {
+    use_become: bool,
+    become_user: String,
+    check_mode: bool,
 }
 
 /// Trait for common module execution patterns
 pub trait ModuleExecutor {
     /// Execute the module with the given SSH client and arguments
     fn execute(
-        ssh_client: &SshClient,
+        connection: &dyn SshConnection,
         args: &Value,
         use_become: bool,
         become_user: &str,
+        check_mode: bool,
     ) -> Result<ModuleResult>;
 
     /// Execute the module in ad-hoc mode for a single host
-    fn execute_adhoc(host: &Host, args: &Value) -> Result<ModuleResult> {
-        info!("Connecting to host: {}", host.name);
-        let ssh_client = SshClient::connect(host)?;
-        Self::execute(&ssh_client, args, false, "")
+    fn execute_adhoc(
+        host: &Host,
+        args: &Value,
+        use_become: bool,
+        become_user: &str,
+        check_mode: bool,
+    ) -> Result<ModuleResult> {
+        info!("Opening connection for host: {}", host.name);
+        let connection = Connection::connect(host)?;
+        Self::execute(
+            connection.as_connection(),
+            args,
+            use_become,
+            become_user,
+            check_mode,
+        )
     }
 
     /// Helper to execute a command on a remote host with proper sudo handling
     fn execute_command(
-        ssh_client: &SshClient,
+        connection: &dyn SshConnection,
         cmd: &str,
         use_become: bool,
         become_user: &str,
     ) -> Result<(i32, String, String)> {
-        info!("Executing command: {}", cmd);
+        debug!("Executing module command ({} bytes)", cmd.len());
 
         if use_become {
-            ssh_client.execute_sudo_command(cmd, become_user)
+            connection.execute_sudo_command(cmd, become_user)
         } else {
-            ssh_client.execute_command(cmd)
+            connection.execute_command(cmd)
         }
     }
 
@@ -76,13 +118,12 @@ pub trait ModuleExecutor {
         let module_result = ModuleResult {
             stdout,
             stderr: stderr.clone(),
+            rc: Some(exit_code),
             changed: true,
-            failed: false,
-            msg: format!("{} (exit code: {})", success_msg, exit_code),
-        };
-
-        if exit_code != 0 {
-            let error_msg = if stderr.trim().is_empty() {
+            failed: exit_code != 0,
+            msg: if exit_code == 0 {
+                format!("{} (exit code: {})", success_msg, exit_code)
+            } else if stderr.trim().is_empty() {
                 format!("{} (exit code: {})", error_prefix, exit_code)
             } else {
                 format!(
@@ -91,8 +132,11 @@ pub trait ModuleExecutor {
                     exit_code,
                     stderr.trim()
                 )
-            };
-            return Err(anyhow::anyhow!(error_msg));
+            },
+        };
+
+        if exit_code != 0 {
+            return Ok(module_result);
         }
 
         info!("{}", success_msg);
@@ -104,7 +148,12 @@ pub trait ModuleExecutor {
         match args {
             Value::String(cmd) => Ok(cmd.clone()),
             Value::Mapping(map) => {
-                if let Some(Value::String(cmd)) = map.get(&Value::String("cmd".to_string())) {
+                if map.len() != 1 {
+                    return Err(anyhow::anyhow!(
+                        "Command modules accept only the 'cmd' parameter"
+                    ));
+                }
+                if let Some(Value::String(cmd)) = map.get(Value::String("cmd".to_string())) {
                     Ok(cmd.clone())
                 } else {
                     Err(anyhow::anyhow!("Module requires a valid command string"))
@@ -117,141 +166,160 @@ pub trait ModuleExecutor {
 
 /// Run an ad-hoc command on a list of hosts
 pub fn run_adhoc(hosts: &[Host], module_name: &str, args: &str) -> Result<()> {
+    run_adhoc_with_options(hosts, module_name, args, &AdHocOptions::default())
+}
+
+/// Run an ad-hoc command with explicit execution controls.
+pub fn run_adhoc_with_options(
+    hosts: &[Host],
+    module_name: &str,
+    args: &str,
+    options: &AdHocOptions,
+) -> Result<()> {
+    if hosts.is_empty() {
+        return Err(anyhow::anyhow!(
+            "Cannot run an ad-hoc command without any target hosts"
+        ));
+    }
+    if options.forks == 0 {
+        return Err(anyhow::anyhow!("--forks must be greater than zero"));
+    }
+    if options
+        .become_user
+        .as_deref()
+        .is_some_and(|user| user.trim().is_empty() || user.chars().any(char::is_control))
+    {
+        return Err(anyhow::anyhow!(
+            "--become-user must be non-empty and contain no control characters"
+        ));
+    }
+
+    let module_name = module_name
+        .strip_prefix("ansible.builtin.")
+        .or_else(|| module_name.strip_prefix("ansible.legacy."))
+        .unwrap_or(module_name);
+
+    // Validate the module and parse mapped arguments before starting any
+    // connections. Besides failing fast, this deliberately parses the command
+    // line only once rather than once per host.
+    let module_args = prepare_adhoc_args(module_name, args)?;
+
     info!(
         "Running ad-hoc module '{}' on {} hosts",
         module_name,
         hosts.len()
     );
 
-    let mut success_count = 0;
-    let mut failed_hosts = Vec::new();
-    let mut results: HashMap<String, ModuleResult> = HashMap::new();
-
     println!("\n{}", "TASK [Execute ad-hoc command]".bold());
     println!("{}\n", "------------------------------".dimmed());
 
-    for host in hosts {
-        info!("Running module {} on host {}", module_name, host.name);
-        let start_time = Instant::now();
+    // Keep the amount of simultaneous SSH/local work bounded. Chunks are
+    // joined in their original order so user-visible output and recap remain
+    // deterministic even though execution within each chunk is concurrent.
+    let mut executions = Vec::with_capacity(hosts.len());
+    for chunk in hosts.chunks(options.forks) {
+        let chunk_executions = std::thread::scope(|scope| {
+            let module_args = &module_args;
+            let handles = chunk
+                .iter()
+                .map(|host| {
+                    let effective_options = effective_adhoc_options(host, options);
+                    scope.spawn(move || {
+                        info!("Running module {} on host {}", module_name, host.name);
+                        let start_time = Instant::now();
+                        let result = execute_adhoc_module(
+                            host,
+                            module_name,
+                            module_args,
+                            &effective_options,
+                        );
+                        HostExecution {
+                            result,
+                            duration: start_time.elapsed(),
+                        }
+                    })
+                })
+                .collect::<Vec<_>>();
 
-        let result = match module_name {
-            "command" => {
-                let value = Value::String(args.to_string());
-                command::execute_adhoc(host, &value)
-            }
-            "shell" => {
-                let value = Value::String(args.to_string());
-                shell::execute_adhoc(host, &value)
-            }
-            "copy" => {
-                // Parse args in the format "src=file dest=path"
-                let params = parse_args(args)?;
-                let value = Value::Mapping(params);
-                copy::execute_adhoc(host, &value)
-            }
-            "file" => {
-                // Parse args in the format "path=file state=absent"
-                let params = parse_args(args)?;
-                let value = Value::Mapping(params);
-                file::execute_adhoc(host, &value)
-            }
-            "template" => {
-                // Parse args in the format "src=file dest=path"
-                let params = parse_args(args)?;
-                let value = Value::Mapping(params);
-                template::execute_adhoc(host, &value)
-            }
-            "service" => {
-                // Parse args in the format "name=service state=started"
-                let params = parse_args(args)?;
-                let value = Value::Mapping(params);
-                service::execute_adhoc(host, &value)
-            }
-            "package" => {
-                // Parse args in the format "name=package state=present"
-                let params = parse_args(args)?;
-                let value = Value::Mapping(params);
-                package::execute_adhoc(host, &value)
-            }
-            "debug" => {
-                // Parse args in the format "name=package state=present"
-                let params = parse_args(args)?;
-                let value = Value::Mapping(params);
-                debug::execute_adhoc(host, &value)
-            }
-            "lineinfile" => {
-                // Parse args in the format "path=file state=absent"
-                let params = parse_args(args)?;
-                let value = Value::Mapping(params);
-                lineinfile::execute_adhoc(host, &value)
-            }
-            "user" => {
-                // Parse args in the format "name=user state=present"
-                let params = parse_args(args)?;
-                let value = Value::Mapping(params);
-                user::execute_adhoc(host, &value)
-            }
-            _ => {
-                return Err(anyhow::anyhow!("Unsupported module: {}", module_name));
-            }
-        };
+            handles
+                .into_iter()
+                .map(|handle| {
+                    handle.join().unwrap_or_else(|_| HostExecution {
+                        result: Err(anyhow::anyhow!("Ad-hoc host worker panicked")),
+                        duration: std::time::Duration::ZERO,
+                    })
+                })
+                .collect::<Vec<_>>()
+        });
+        executions.extend(chunk_executions);
+    }
 
-        match result {
-            Ok(module_result) => {
+    let mut success_count = 0;
+    let mut failed_details = Vec::new();
+
+    for (host, execution) in hosts.iter().zip(&executions) {
+        match &execution.result {
+            Ok(module_result) if !module_result_failed(module_result) => {
                 success_count += 1;
                 println!(
                     "{} | {} | rc={} >>>\n{}",
                     host.name.green(),
                     "SUCCESS".green(),
-                    0,
+                    module_result_rc(module_result),
                     if !module_result.stdout.trim().is_empty() {
                         module_result.stdout.trim()
                     } else {
                         module_result.msg.as_str()
                     }
                 );
-                results.insert(host.name.clone(), module_result);
+            }
+            Ok(module_result) => {
+                let detail = if !module_result.stderr.trim().is_empty() {
+                    module_result.stderr.trim().to_string()
+                } else if !module_result.msg.trim().is_empty() {
+                    module_result.msg.trim().to_string()
+                } else {
+                    format!("Module failed with rc={}", module_result_rc(module_result))
+                };
+                failed_details.push(format!("{}: {}", host.name, detail));
+                println!(
+                    "{} | {} | rc={} >>>\n{}",
+                    host.name.red(),
+                    "FAILED".red(),
+                    module_result_rc(module_result),
+                    &detail
+                );
             }
             Err(e) => {
-                failed_hosts.push(host.name.clone());
+                failed_details.push(format!("{}: {}", host.name, e));
                 println!("{} | {} | rc=1 >>>\n{}", host.name.red(), "FAILED".red(), e);
             }
         }
 
-        let duration = start_time.elapsed();
         println!(
             "\n{}\n",
-            format!("Execution time: {:.2?}", duration).dimmed()
+            format!("Execution time: {:.2?}", execution.duration).dimmed()
         );
     }
 
     println!("\n{}", "PLAY RECAP".bold());
     println!("{}\n", "----------".dimmed());
 
-    for host in hosts {
-        if failed_hosts.contains(&host.name) {
-            println!(
-                "{}: {}={} {}={} {}={}",
-                host.name.bold(),
-                "ok".green(),
-                0,
-                "changed".yellow(),
-                0,
-                "failed".red(),
-                1
-            );
-        } else if let Some(result) = results.get(&host.name) {
-            println!(
-                "{}: {}={} {}={} {}={}",
-                host.name.bold(),
-                "ok".green(),
-                1,
-                "changed".yellow(),
-                if result.changed { 1 } else { 0 },
-                "failed".red(),
-                0
-            );
-        }
+    for (host, execution) in hosts.iter().zip(&executions) {
+        let successful_result = match &execution.result {
+            Ok(result) if !module_result_failed(result) => Some(result),
+            _ => None,
+        };
+        println!(
+            "{}: {}={} {}={} {}={}",
+            host.name.bold(),
+            "ok".green(),
+            usize::from(successful_result.is_some()),
+            "changed".yellow(),
+            usize::from(successful_result.is_some_and(|result| result.changed)),
+            "failed".red(),
+            usize::from(successful_result.is_none())
+        );
     }
 
     println!(
@@ -261,42 +329,309 @@ pub fn run_adhoc(hosts: &[Host], module_name: &str, args: &str) -> Result<()> {
         hosts.len()
     );
 
-    if !failed_hosts.is_empty() {
+    if !failed_details.is_empty() {
         return Err(anyhow::anyhow!(
-            "Failed to execute on {} hosts: {}",
-            failed_hosts.len(),
-            failed_hosts.join(", ")
+            "Failed to execute on {} host(s): {}",
+            failed_details.len(),
+            failed_details.join("; ")
         ));
     }
 
     Ok(())
 }
 
+struct HostExecution {
+    result: Result<ModuleResult>,
+    duration: std::time::Duration,
+}
+
+fn prepare_adhoc_args(module_name: &str, args: &str) -> Result<Value> {
+    match module_name {
+        "command" | "shell" => Ok(Value::String(args.to_string())),
+        "copy" | "file" | "template" | "service" | "package" | "debug" | "lineinfile" | "user" => {
+            Ok(Value::Mapping(parse_args(args)?))
+        }
+        _ => Err(anyhow::anyhow!("Unsupported module: {}", module_name)),
+    }
+}
+
+fn effective_adhoc_options(host: &Host, options: &AdHocOptions) -> EffectiveAdHocOptions {
+    let use_become = options
+        .become_override
+        .unwrap_or_else(|| host.get_become().unwrap_or(false));
+    let become_user = options
+        .become_user
+        .as_deref()
+        .or_else(|| host.get_become_user().map(String::as_str))
+        .filter(|user| !user.is_empty())
+        .unwrap_or("root")
+        .to_string();
+
+    EffectiveAdHocOptions {
+        use_become,
+        become_user,
+        check_mode: options.check_mode,
+    }
+}
+
+fn module_result_rc(result: &ModuleResult) -> i32 {
+    result.rc.unwrap_or(if result.failed { 1 } else { 0 })
+}
+
+fn module_result_failed(result: &ModuleResult) -> bool {
+    result.failed || result.rc.is_some_and(|rc| rc != 0)
+}
+
+fn execute_adhoc_module(
+    host: &Host,
+    module_name: &str,
+    args: &Value,
+    options: &EffectiveAdHocOptions,
+) -> Result<ModuleResult> {
+    // Arbitrary commands have no generally safe change prediction. Return a
+    // check-mode result before opening a transport, while still validating the
+    // arguments exactly enough to reject an empty command.
+    if options.check_mode && matches!(module_name, "command" | "shell") {
+        let command = match module_name {
+            "command" => command::CommandModule::extract_command_arg(args)?,
+            "shell" => shell::ShellModule::extract_command_arg(args)?,
+            _ => unreachable!(),
+        };
+        let command_args = (module_name == "command")
+            .then(|| tokenize_args(&command))
+            .transpose()?;
+        if command.trim().is_empty() || command_args.as_ref().is_some_and(Vec::is_empty) {
+            return Err(anyhow::anyhow!(
+                "{} module requires a non-empty command",
+                module_name
+            ));
+        }
+        if module_name == "shell" && command.contains('\0') {
+            return Err(anyhow::anyhow!("Shell command cannot contain NUL bytes"));
+        }
+        if let Some(command_args) = command_args {
+            for argument in command_args {
+                file::quote_posix_shell_arg(&argument)?;
+            }
+        }
+        return Ok(ModuleResult {
+            stdout: String::new(),
+            stderr: String::new(),
+            rc: Some(0),
+            changed: false,
+            failed: false,
+            msg: format!(
+                "Check mode: {} was not executed because it has no safe change prediction",
+                module_name
+            ),
+        });
+    }
+
+    match module_name {
+        "command" => command::execute_adhoc(
+            host,
+            args,
+            options.use_become,
+            &options.become_user,
+            options.check_mode,
+        ),
+        "shell" => shell::execute_adhoc(
+            host,
+            args,
+            options.use_become,
+            &options.become_user,
+            options.check_mode,
+        ),
+        "copy" => copy::execute_adhoc(
+            host,
+            args,
+            options.use_become,
+            &options.become_user,
+            options.check_mode,
+        ),
+        "file" => file::execute_adhoc(
+            host,
+            args,
+            options.use_become,
+            &options.become_user,
+            options.check_mode,
+        ),
+        "template" => template::execute_adhoc(
+            host,
+            args,
+            options.use_become,
+            &options.become_user,
+            options.check_mode,
+        ),
+        "service" => service::execute_adhoc(
+            host,
+            args,
+            options.use_become,
+            &options.become_user,
+            options.check_mode,
+        ),
+        "package" => package::execute_adhoc(
+            host,
+            args,
+            options.use_become,
+            &options.become_user,
+            options.check_mode,
+        ),
+        "debug" => debug::execute_adhoc(
+            host,
+            args,
+            options.use_become,
+            &options.become_user,
+            options.check_mode,
+        ),
+        "lineinfile" => lineinfile::execute_adhoc(
+            host,
+            args,
+            options.use_become,
+            &options.become_user,
+            options.check_mode,
+        ),
+        "user" => user::execute_adhoc(
+            host,
+            args,
+            options.use_become,
+            &options.become_user,
+            options.check_mode,
+        ),
+        _ => Err(anyhow::anyhow!("Unsupported module: {}", module_name)),
+    }
+}
+
 /// Parse command line arguments in format "key1=value1 key2=value2"
 fn parse_args(args_str: &str) -> Result<serde_yaml::Mapping> {
     let mut mapping = serde_yaml::Mapping::new();
-    for part in args_str.split_whitespace() {
-        let mut kv = part.splitn(2, '=');
-        if let (Some(key), Some(value)) = (kv.next(), kv.next()) {
-            // Try to parse as different types
-            let parsed_value = if value.eq_ignore_ascii_case("true") {
-                Value::Bool(true)
-            } else if value.eq_ignore_ascii_case("false") {
-                Value::Bool(false)
-            } else if let Ok(num) = value.parse::<i64>() {
-                Value::Number(serde_yaml::Number::from(num))
-            } else if let Ok(num) = value.parse::<f64>() {
-                Value::Number(serde_yaml::Number::from(num))
-            } else {
-                Value::String(value.to_string())
-            };
-
-            mapping.insert(Value::String(key.to_string()), parsed_value);
-        } else {
-            return Err(anyhow::anyhow!("Invalid argument format: {}", part));
+    for (index, part) in tokenize_args(args_str)?.into_iter().enumerate() {
+        let (key, value) = part
+            .split_once('=')
+            .ok_or_else(|| anyhow::anyhow!("Argument {} must use key=value format", index + 1))?;
+        if key.is_empty() {
+            return Err(anyhow::anyhow!("Argument {} has an empty key", index + 1));
         }
+
+        let key = Value::String(key.to_string());
+        if mapping.contains_key(&key) {
+            return Err(anyhow::anyhow!("Duplicate argument key"));
+        }
+
+        mapping.insert(key, infer_arg_value(value));
     }
     Ok(mapping)
+}
+
+/// Split a module argument string using the parts of POSIX shell tokenization
+/// that are useful for `key=value` input: whitespace separation, adjacent
+/// quoted segments, and backslash escaping. No expansion or command execution
+/// is performed.
+pub(crate) fn tokenize_args(input: &str) -> Result<Vec<String>> {
+    #[derive(Clone, Copy)]
+    enum Quote {
+        Single,
+        Double,
+    }
+
+    let mut tokens = Vec::new();
+    let mut token = String::new();
+    let mut token_started = false;
+    let mut quote = None;
+    let mut chars = input.chars().peekable();
+
+    while let Some(ch) = chars.next() {
+        match quote {
+            Some(Quote::Single) => {
+                if ch == '\'' {
+                    quote = None;
+                } else {
+                    token.push(ch);
+                }
+            }
+            Some(Quote::Double) => match ch {
+                '"' => quote = None,
+                '\\' => {
+                    let escaped = chars
+                        .next()
+                        .ok_or_else(|| anyhow::anyhow!("Trailing escape in quoted argument"))?;
+                    match escaped {
+                        '$' | '`' | '"' | '\\' => token.push(escaped),
+                        '\n' => {}
+                        other => {
+                            // POSIX double quotes preserve a backslash unless
+                            // it precedes a character that can be escaped.
+                            token.push('\\');
+                            token.push(other);
+                        }
+                    }
+                }
+                _ => token.push(ch),
+            },
+            None => match ch {
+                ch if ch.is_whitespace() => {
+                    if token_started {
+                        tokens.push(std::mem::take(&mut token));
+                        token_started = false;
+                    }
+                }
+                '\'' => {
+                    token_started = true;
+                    quote = Some(Quote::Single);
+                }
+                '"' => {
+                    token_started = true;
+                    quote = Some(Quote::Double);
+                }
+                '\\' => {
+                    token_started = true;
+                    let escaped = chars
+                        .next()
+                        .ok_or_else(|| anyhow::anyhow!("Trailing escape in argument list"))?;
+                    if escaped != '\n' {
+                        token.push(escaped);
+                    }
+                }
+                _ => {
+                    token_started = true;
+                    token.push(ch);
+                }
+            },
+        }
+    }
+
+    if quote.is_some() {
+        return Err(anyhow::anyhow!("Unclosed quote in argument list"));
+    }
+    if token_started {
+        tokens.push(token);
+    }
+
+    Ok(tokens)
+}
+
+fn infer_arg_value(value: &str) -> Value {
+    if value.eq_ignore_ascii_case("true") {
+        return Value::Bool(true);
+    }
+    if value.eq_ignore_ascii_case("false") {
+        return Value::Bool(false);
+    }
+
+    let digits = value
+        .strip_prefix('-')
+        .or_else(|| value.strip_prefix('+'))
+        .unwrap_or(value);
+    let is_decimal_integer = !digits.is_empty() && digits.chars().all(|ch| ch.is_ascii_digit());
+    let has_significant_leading_zero = digits.len() > 1 && digits.starts_with('0');
+
+    if is_decimal_integer && !has_significant_leading_zero {
+        if let Ok(number) = value.parse::<i64>() {
+            return Value::Number(serde_yaml::Number::from(number));
+        }
+    }
+
+    Value::String(value.to_string())
 }
 
 #[cfg(test)]
@@ -309,28 +644,247 @@ mod tests {
         let result = ModuleResult::default();
         assert_eq!(result.stdout, "");
         assert_eq!(result.stderr, "");
-        assert_eq!(result.changed, false);
+        assert_eq!(result.rc, None);
+        assert!(!result.changed);
         assert_eq!(result.msg, "");
     }
 
     #[test]
     fn test_parse_args() {
-        // Test normal parameter parsing
         let args = "key1=value1 key2=value2";
         let mapping = parse_args(args).unwrap();
 
         assert_eq!(
-            mapping.get(&Value::String("key1".to_string())),
+            mapping.get(Value::String("key1".to_string())),
             Some(&Value::String("value1".to_string()))
         );
 
         assert_eq!(
-            mapping.get(&Value::String("key2".to_string())),
+            mapping.get(Value::String("key2".to_string())),
             Some(&Value::String("value2".to_string()))
         );
 
-        // Test invalid parameters
-        let invalid_args = "invalid_format";
-        assert!(parse_args(invalid_args).is_err());
+        assert!(parse_args("invalid_format").is_err());
+    }
+
+    #[test]
+    fn test_tokenize_shell_like_arguments() {
+        assert_eq!(
+            tokenize_args(r#"msg="hello world" other='a=b' escaped=hello\ world empty="""#)
+                .unwrap(),
+            vec![
+                "msg=hello world",
+                "other=a=b",
+                "escaped=hello world",
+                "empty=",
+            ]
+        );
+
+        assert_eq!(
+            tokenize_args(r#"msg="say \"hello\"" path="C:\tmp""#).unwrap(),
+            vec![r#"msg=say "hello""#, r#"path=C:\tmp"#]
+        );
+    }
+
+    #[test]
+    fn test_parse_args_preserves_modes_and_does_not_infer_floats() {
+        let mapping = parse_args("mode=0644 count=42 zero=0 negative=-12 ratio=1.5").unwrap();
+
+        assert_eq!(
+            mapping.get(Value::String("mode".to_string())),
+            Some(&Value::String("0644".to_string()))
+        );
+        assert_eq!(
+            mapping.get(Value::String("count".to_string())),
+            Some(&Value::Number(42.into()))
+        );
+        assert_eq!(
+            mapping.get(Value::String("zero".to_string())),
+            Some(&Value::Number(0.into()))
+        );
+        assert_eq!(
+            mapping.get(Value::String("negative".to_string())),
+            Some(&Value::Number((-12).into()))
+        );
+        assert_eq!(
+            mapping.get(Value::String("ratio".to_string())),
+            Some(&Value::String("1.5".to_string()))
+        );
+    }
+
+    #[test]
+    fn test_parse_args_quoted_content_and_empty_value() {
+        let mapping =
+            parse_args(r#"msg='hello = world' empty="" enabled=TRUE disabled=false"#).unwrap();
+
+        assert_eq!(
+            mapping.get(Value::String("msg".to_string())),
+            Some(&Value::String("hello = world".to_string()))
+        );
+        assert_eq!(
+            mapping.get(Value::String("empty".to_string())),
+            Some(&Value::String(String::new()))
+        );
+        assert_eq!(
+            mapping.get(Value::String("enabled".to_string())),
+            Some(&Value::Bool(true))
+        );
+        assert_eq!(
+            mapping.get(Value::String("disabled".to_string())),
+            Some(&Value::Bool(false))
+        );
+    }
+
+    #[test]
+    fn test_parse_args_rejects_duplicate_and_malformed_arguments() {
+        for invalid in [
+            "key=one key=two",
+            "missing_equals",
+            "=empty-key",
+            "key='unclosed",
+            "key=\"unclosed",
+            "key=value\\",
+        ] {
+            assert!(
+                parse_args(invalid).is_err(),
+                "accepted invalid argument list"
+            );
+        }
+    }
+
+    #[test]
+    fn test_run_adhoc_rejects_unknown_module_before_connecting() {
+        let host = Host::new("unreachable.invalid");
+        let error = run_adhoc(&[host], "not_a_module", "key=value").unwrap_err();
+        assert!(error.to_string().contains("Unsupported module"));
+    }
+
+    #[test]
+    fn test_run_adhoc_rejects_zero_hosts() {
+        let error = run_adhoc(&[], "debug", "msg=test").unwrap_err();
+        assert!(error.to_string().contains("without any target hosts"));
+    }
+
+    #[test]
+    fn ad_hoc_options_inherit_inventory_and_explicit_values_win() {
+        let mut host = Host::new("localhost");
+        host.set_variable("ansible_become", "true");
+        host.set_variable("ansible_become_user", "inventory-user");
+
+        assert_eq!(
+            effective_adhoc_options(&host, &AdHocOptions::default()),
+            EffectiveAdHocOptions {
+                use_become: true,
+                become_user: "inventory-user".to_string(),
+                check_mode: false,
+            }
+        );
+
+        let explicit = AdHocOptions {
+            become_override: Some(false),
+            become_user: Some("cli-user".to_string()),
+            check_mode: true,
+            forks: 3,
+        };
+        assert_eq!(
+            effective_adhoc_options(&host, &explicit),
+            EffectiveAdHocOptions {
+                use_become: false,
+                become_user: "cli-user".to_string(),
+                check_mode: true,
+            }
+        );
+    }
+
+    #[test]
+    fn ad_hoc_rejects_invalid_forks_and_become_user_before_execution() {
+        let host = Host::new("unreachable.invalid");
+        let zero_forks = AdHocOptions {
+            forks: 0,
+            ..AdHocOptions::default()
+        };
+        assert!(run_adhoc_with_options(
+            std::slice::from_ref(&host),
+            "debug",
+            "msg=test",
+            &zero_forks
+        )
+        .unwrap_err()
+        .to_string()
+        .contains("greater than zero"));
+
+        let invalid_user = AdHocOptions {
+            become_user: Some("bad\nuser".to_string()),
+            ..AdHocOptions::default()
+        };
+        assert!(
+            run_adhoc_with_options(&[host], "debug", "msg=test", &invalid_user)
+                .unwrap_err()
+                .to_string()
+                .contains("--become-user")
+        );
+    }
+
+    #[test]
+    fn ad_hoc_check_mode_does_not_execute_command_or_shell() {
+        let temp = tempfile::tempdir().unwrap();
+        let command_marker = temp.path().join("command-marker");
+        let shell_marker = temp.path().join("shell-marker");
+        let host = Host::new("localhost");
+        let options = AdHocOptions {
+            check_mode: true,
+            forks: 1,
+            ..AdHocOptions::default()
+        };
+
+        run_adhoc_with_options(
+            std::slice::from_ref(&host),
+            "command",
+            &format!("touch {}", command_marker.display()),
+            &options,
+        )
+        .unwrap();
+        run_adhoc_with_options(
+            &[host],
+            "shell",
+            &format!("touch {}", shell_marker.display()),
+            &options,
+        )
+        .unwrap();
+        run_adhoc_with_options(
+            &[Host::new("unreachable.invalid")],
+            "command",
+            "true",
+            &options,
+        )
+        .unwrap();
+
+        assert!(!command_marker.exists());
+        assert!(!shell_marker.exists());
+    }
+
+    #[test]
+    fn ad_hoc_rc_uses_module_result_value_and_safe_fallbacks() {
+        let nonzero_rc = ModuleResult {
+            rc: Some(23),
+            ..ModuleResult::default()
+        };
+        assert_eq!(module_result_rc(&nonzero_rc), 23);
+        assert!(module_result_failed(&nonzero_rc));
+        assert_eq!(
+            module_result_rc(&ModuleResult {
+                failed: true,
+                ..ModuleResult::default()
+            }),
+            1
+        );
+        assert_eq!(module_result_rc(&ModuleResult::default()), 0);
+    }
+
+    #[test]
+    fn test_adhoc_failed_module_result_is_an_error() {
+        let host = Host::new("localhost");
+        let result = run_adhoc(&[host], "command", "false");
+        assert!(result.is_err());
     }
 }
