@@ -26,6 +26,8 @@ pub struct Play {
     pub fail_fast: bool,
     /// Play-level connection override (`local`, `ssh`, or `smart`).
     pub connection: Option<String>,
+    /// Ansible gathers facts by default; only an explicit false disables it.
+    pub gather_facts: bool,
     #[allow(dead_code)]
     pub tags: Vec<String>, // Keep this for future use
 }
@@ -85,8 +87,91 @@ impl Play {
         let mut failures = Vec::new();
         let mut notified_handlers: HashSet<(String, String)> = HashSet::new();
 
+        if self.gather_facts {
+            println!("\nTASK [Gathering Facts] {}", "*".repeat(56).dimmed());
+            let gather_task = Task {
+                name: "Gathering Facts".to_string(),
+                module: "setup".to_string(),
+                args: Mapping::new(),
+                become_override: None,
+                is_become: false,
+                become_user: "root".to_string(),
+                become_user_override: None,
+                connection: None,
+                check_mode: None,
+                register: None,
+                when: None,
+                notify: Vec::new(),
+                ignore_errors: false,
+                no_log: false,
+                vars: Mapping::new(),
+                tags: Vec::new(),
+                loop_items: None,
+                loop_var_name: None,
+                index_var_name: None,
+            };
+            let gathering_results = Self::execute_task_on_hosts(
+                self,
+                &gather_task,
+                hosts.iter().collect(),
+                &contexts,
+                check_mode,
+                forks,
+            );
+            for (host, _, gathering_result) in gathering_results {
+                let mut result = match gathering_result {
+                    Ok(result) => result,
+                    Err(error) => {
+                        let mut result = TaskResult::new(&host.name);
+                        result.failed = true;
+                        result.msg = format!("Fact gathering failed: {error}");
+                        crate::playbook::task::print_task_result(
+                            &host.name,
+                            "Gathering Facts",
+                            &result,
+                            "0.00s",
+                        );
+                        result
+                    }
+                };
+
+                if !result.failed {
+                    let merge_result = contexts
+                        .get_mut(&host.name)
+                        .context("Internal play state lost a fact context")
+                        .and_then(|context| Self::merge_facts(context, &result));
+                    if let Err(error) = merge_result {
+                        result.failed = true;
+                        result.msg = error.to_string();
+                    }
+                }
+
+                let host_stats = stats
+                    .get_mut(&host.name)
+                    .context("Internal play state lost fact-gathering statistics")?;
+                if result.failed {
+                    host_stats.failed += 1;
+                    active_hosts.remove(&host.name);
+                    failures.push(format!(
+                        "Task 'Gathering Facts' failed on host '{}': {}",
+                        host.name, result.msg
+                    ));
+                } else {
+                    host_stats.ok += 1;
+                }
+            }
+        }
+
         // Execute all tasks in order
         for (task_index, task) in self.tasks.iter().enumerate() {
+            if active_hosts.is_empty() {
+                debug!(
+                    "Stopping play '{}' before task {} because no active hosts remain",
+                    self.name,
+                    task_index + 1
+                );
+                break;
+            }
             debug!(
                 "Executing task {} of {}: {}",
                 task_index + 1,
@@ -448,6 +533,22 @@ impl Play {
         vars
     }
 
+    fn merge_facts(context: &mut HashMap<String, Value>, result: &TaskResult) -> Result<()> {
+        let facts = result
+            .values
+            .get("ansible_facts")
+            .and_then(Value::as_mapping)
+            .context("Fact gathering did not return ansible_facts")?;
+        context.insert("ansible_facts".to_string(), Value::Mapping(facts.clone()));
+        for (key, value) in facts {
+            let Value::String(key) = key else {
+                bail!("Fact names must be strings");
+            };
+            context.insert(format!("ansible_{key}"), value.clone());
+        }
+        Ok(())
+    }
+
     fn registered_value(result: &TaskResult) -> Value {
         let mut value = Mapping::new();
         value.insert(
@@ -498,6 +599,7 @@ mod tests {
             become_user_override: None,
             fail_fast: false,
             connection: None,
+            gather_facts: false,
             tags: Vec::new(),
         }
     }
@@ -740,5 +842,20 @@ mod tests {
 
         assert!(play.execute(&hosts).is_err());
         assert_eq!(fs::read_to_string(output).unwrap(), "second");
+    }
+
+    #[test]
+    fn play_stops_scheduling_when_every_host_has_failed() {
+        let directory = tempdir().unwrap();
+        let marker = directory.path().join("must-not-run");
+        let mut play = create_test_play();
+        play.tasks.push(create_command_task("Fail", "false"));
+        play.tasks.push(create_command_task(
+            "No active hosts",
+            &format!("touch {}", marker.display()),
+        ));
+
+        assert!(play.execute(&[create_local_host()]).is_err());
+        assert!(!marker.exists());
     }
 }

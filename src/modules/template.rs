@@ -231,6 +231,7 @@ pub fn execute(
         } else {
             format!("Template destination {} is already up to date", dest)
         },
+        values: Default::default(),
     })
 }
 
@@ -327,5 +328,54 @@ mod tests {
             std::fs::read_to_string(&destination).unwrap(),
             "hello world"
         );
+    }
+
+    #[test]
+    fn template_supports_file_sources_and_dynamic_variables() {
+        let directory = tempfile::tempdir().unwrap();
+        let source = directory.path().join("source.j2");
+        let destination = directory.path().join("rendered");
+        std::fs::write(&source, "{{ greeting }} {{ name }}").unwrap();
+        let args = serde_yaml::from_str(&format!(
+            "src: {}\ndest: {}\nvars:\n  name: world\n  greeting: '{{{{ name }}}}'",
+            source.display(),
+            destination.display()
+        ))
+        .unwrap();
+
+        let result = execute(&local_connection(), &args, false, "root", false).unwrap();
+        assert!(result.changed);
+        assert_eq!(std::fs::read_to_string(destination).unwrap(), "world world");
+    }
+
+    #[test]
+    fn template_rejects_ambiguous_and_invalid_inputs() {
+        let directory = tempfile::tempdir().unwrap();
+        let destination = directory.path().join("rendered");
+        let cases = [
+            format!("content: x\nsrc: y\ndest: {}", destination.display()),
+            format!("content: 3\ndest: {}", destination.display()),
+            format!("src: 3\ndest: {}", destination.display()),
+            format!("src: /definitely/missing\ndest: {}", destination.display()),
+            format!("dest: {}", destination.display()),
+            format!("content: '{{{{ broken'\ndest: {}", destination.display()),
+            format!("content: x\ndest: {}\nvars: wrong", destination.display()),
+            "content: x\ndest: ''".to_string(),
+        ];
+        for input in cases {
+            let args = serde_yaml::from_str(&input).unwrap();
+            assert!(
+                execute(&local_connection(), &args, false, "root", false).is_err(),
+                "accepted invalid template arguments: {input}"
+            );
+        }
+        assert!(execute(
+            &local_connection(),
+            &Value::String("not a mapping".to_string()),
+            false,
+            "root",
+            false,
+        )
+        .is_err());
     }
 }

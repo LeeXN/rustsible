@@ -385,6 +385,7 @@ pub fn execute(
                 packages.join(", ")
             )
         },
+        values: Default::default(),
     })
 }
 
@@ -469,5 +470,149 @@ mod tests {
 
         let result = execute(&connection, &args, true, "root", true).unwrap();
         assert!(result.changed);
+    }
+
+    #[test]
+    fn package_argument_and_command_matrix_is_complete() {
+        assert_eq!(
+            PackageState::from_str("PRESENT").unwrap(),
+            PackageState::Present
+        );
+        assert_eq!(
+            PackageState::from_str("absent").unwrap(),
+            PackageState::Absent
+        );
+        assert_eq!(
+            PackageState::from_str("latest").unwrap(),
+            PackageState::Latest
+        );
+        assert!(PackageState::from_str("newest-ish").is_err());
+
+        assert_eq!(
+            package_names(&serde_yaml::from_str("name: [curl, jq]").unwrap()).unwrap(),
+            ["curl", "jq"]
+        );
+        for invalid in ["{}", "name: []", "name: [curl, 1]", "name: --bad"] {
+            assert!(package_names(&serde_yaml::from_str(invalid).unwrap()).is_err());
+        }
+
+        let managers = [
+            PackageManager::Apt,
+            PackageManager::Yum,
+            PackageManager::Dnf,
+            PackageManager::Zypper,
+            PackageManager::Pacman,
+        ];
+        for manager in managers {
+            assert!(!manager.executable().is_empty());
+            assert!(!cache_update_command(manager).is_empty());
+            assert!(!installed_query(manager, "curl").unwrap().is_empty());
+            for state in [PackageState::Present, PackageState::Absent] {
+                assert!(!change_command(manager, "curl", state).unwrap().is_empty());
+            }
+        }
+        assert_eq!(
+            change_command(PackageManager::Yum, "curl", PackageState::Latest).unwrap(),
+            "yum -y install -- 'curl'"
+        );
+        assert_eq!(
+            change_command(PackageManager::Pacman, "curl", PackageState::Latest).unwrap(),
+            "pacman -S --noconfirm -- 'curl'"
+        );
+    }
+
+    #[test]
+    fn package_manager_detection_handles_fallback_and_errors() {
+        let mut pacman = MockSshConnection::new();
+        pacman
+            .expect_execute_command()
+            .times(5)
+            .returning(|command| {
+                Ok((
+                    if command.contains("pacman") { 0 } else { 1 },
+                    String::new(),
+                    String::new(),
+                ))
+            });
+        assert_eq!(
+            detect_package_manager(&pacman).unwrap(),
+            PackageManager::Pacman
+        );
+
+        let mut none = MockSshConnection::new();
+        none.expect_execute_command()
+            .times(5)
+            .returning(|_| Ok((127, String::new(), String::new())));
+        assert!(detect_package_manager(&none).is_err());
+
+        let mut broken = MockSshConnection::new();
+        broken
+            .expect_execute_command()
+            .once()
+            .returning(|_| Ok((9, String::new(), "probe failed".to_string())));
+        assert!(detect_package_manager(&broken)
+            .unwrap_err()
+            .to_string()
+            .contains("probe failed"));
+    }
+
+    #[test]
+    fn package_state_queries_interpret_manager_exit_codes() {
+        for (manager, code, expected) in [
+            (PackageManager::Apt, 0, true),
+            (PackageManager::Apt, 1, false),
+            (PackageManager::Dnf, 0, true),
+            (PackageManager::Dnf, 100, false),
+            (PackageManager::Yum, 100, false),
+            (PackageManager::Pacman, 0, false),
+            (PackageManager::Pacman, 1, true),
+        ] {
+            let mut connection = MockSshConnection::new();
+            connection
+                .expect_execute_command()
+                .once()
+                .returning(move |_| Ok((code, String::new(), String::new())));
+            assert_eq!(is_latest(&connection, manager, "curl").unwrap(), expected);
+        }
+        assert!(is_latest(&MockSshConnection::new(), PackageManager::Zypper, "curl").is_err());
+
+        for (code, expected) in [(0, true), (1, false)] {
+            let mut connection = MockSshConnection::new();
+            connection
+                .expect_execute_command()
+                .once()
+                .returning(move |_| Ok((code, String::new(), String::new())));
+            assert_eq!(
+                is_installed(&connection, PackageManager::Apt, "curl").unwrap(),
+                expected
+            );
+        }
+    }
+
+    #[test]
+    fn package_execute_refreshes_cache_and_installs_pending_packages() {
+        let mut connection = MockSshConnection::new();
+        connection
+            .expect_execute_command()
+            .times(2)
+            .returning(|command| {
+                if command.contains("command -v") {
+                    Ok((0, String::new(), String::new()))
+                } else {
+                    Ok((1, String::new(), String::new()))
+                }
+            });
+        connection
+            .expect_execute_sudo_command()
+            .times(2)
+            .withf(|command, user| {
+                user == "root"
+                    && matches!(command, "apt-get update" | "apt-get -y install -- 'curl'")
+            })
+            .returning(|_, _| Ok((0, String::new(), String::new())));
+        let args = serde_yaml::from_str("name: curl\nstate: present\nupdate_cache: true").unwrap();
+        let result = execute(&connection, &args, true, "root", false).unwrap();
+        assert!(result.changed);
+        assert!(result.msg.contains("cache refresh requested"));
     }
 }

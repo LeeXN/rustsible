@@ -101,6 +101,7 @@ const SUPPORTED_PLAY_KEYWORDS: &[&str] = &[
     "become_user",
     "connection",
     "fail_fast",
+    "gather_facts",
 ];
 
 const UNSUPPORTED_PLAY_KEYWORDS: &[&str] = &[
@@ -115,7 +116,6 @@ const UNSUPPORTED_PLAY_KEYWORDS: &[&str] = &[
     "environment",
     "fact_path",
     "force_handlers",
-    "gather_facts",
     "gather_subset",
     "gather_timeout",
     "ignore_errors",
@@ -244,6 +244,7 @@ fn parse_play(play_map: Mapping, ordinal: usize) -> Result<Play> {
         .unwrap_or_else(|| "root".to_string());
     let connection = parse_optional_nonempty_string(&play_map, "connection", "Play")?;
     let fail_fast = parse_optional_bool(&play_map, "fail_fast", "Play")?.unwrap_or(false);
+    let gather_facts = parse_optional_bool(&play_map, "gather_facts", "Play")?.unwrap_or(true);
 
     debug!(
         "Finished parsing play '{}' with {} tasks and {} handlers",
@@ -264,6 +265,7 @@ fn parse_play(play_map: Mapping, ordinal: usize) -> Result<Play> {
         become_user_override,
         fail_fast,
         connection,
+        gather_facts,
         tags: Vec::new(),
     })
 }
@@ -450,9 +452,14 @@ fn parse_module_args(module: &str, value: &Value) -> Result<(String, Mapping)> {
             | "debug"
             | "copy"
             | "file"
+            | "get_url"
             | "template"
             | "package"
             | "service"
+            | "setup"
+            | "stat"
+            | "systemd"
+            | "systemd_service"
             | "lineinfile"
             | "user"
     ) {
@@ -1096,5 +1103,58 @@ tasks:
         let playbook = parse_playbook(temp_file.path().to_str().unwrap()).unwrap();
         assert!(playbook.plays[0].fail_fast);
         assert!(!playbook.plays[1].fail_fast);
+    }
+
+    #[test]
+    fn parses_agent_update_compatibility_surface_and_gather_facts_default() {
+        let content = r#"
+---
+- name: Update agent
+  hosts: all
+  gather_facts: true
+  vars:
+    architecture: "{{ 'aarch64' if ansible_architecture in ['aarch64', 'arm64'] else 'x86_64' }}"
+  tasks:
+    - ansible.builtin.copy:
+        dest: /tmp/config
+        content: config
+        force: false
+    - ansible.builtin.stat:
+        path: /tmp/agent
+        checksum_algorithm: sha1
+      register: installed
+    - ansible.builtin.get_url:
+        url: http://example.invalid/agent
+        dest: /tmp/agent.download
+        force: true
+        checksum: "{{ checksum | default(omit) }}"
+      register: downloaded
+    - ansible.builtin.systemd:
+        name: agent.service
+        state: started
+        enabled: true
+        daemon_reload: true
+"#;
+        let temp_file = create_temp_playbook(content);
+        let playbook = parse_playbook(temp_file.path().to_str().unwrap()).unwrap();
+
+        assert!(playbook.plays[0].gather_facts);
+        assert_eq!(playbook.plays[0].tasks.len(), 4);
+
+        let defaulted = create_temp_playbook("---\n- hosts: all\n  tasks: []\n");
+        assert!(
+            parse_playbook(defaulted.path().to_str().unwrap())
+                .unwrap()
+                .plays[0]
+                .gather_facts
+        );
+        let disabled =
+            create_temp_playbook("---\n- hosts: all\n  gather_facts: false\n  tasks: []\n");
+        assert!(
+            !parse_playbook(disabled.path().to_str().unwrap())
+                .unwrap()
+                .plays[0]
+                .gather_facts
+        );
     }
 }

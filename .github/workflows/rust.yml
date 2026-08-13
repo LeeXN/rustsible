@@ -33,7 +33,7 @@ jobs:
       - name: Install cargo-llvm-cov
         uses: taiki-e/install-action@cargo-llvm-cov
       - name: Enforce line coverage baseline
-        run: cargo llvm-cov --all-targets --all-features --locked --fail-under-lines 70
+        run: cargo llvm-cov --all-targets --all-features --locked --fail-under-lines 80
       - name: Build release binary
         run: cargo build --release --all-features --locked
 

@@ -295,6 +295,7 @@ pub fn execute(
         } else {
             format!("File {} is already in the requested state", path)
         },
+        values: Default::default(),
     })
 }
 

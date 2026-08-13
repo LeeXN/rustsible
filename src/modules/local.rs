@@ -50,4 +50,23 @@ mod tests {
         assert_eq!(out.trim(), "hello");
         assert!(err.is_empty());
     }
+
+    #[test]
+    fn shared_command_entrypoints_execute_locally() {
+        let host = Host::new("localhost");
+        let connection = LocalConnection::new(&host).unwrap();
+        let args = serde_yaml::Value::String("printf local".to_string());
+        assert_eq!(
+            execute(&connection, &args, false, "root", false)
+                .unwrap()
+                .stdout,
+            "local"
+        );
+        assert_eq!(
+            execute_adhoc(&host, &args, false, "root", false)
+                .unwrap()
+                .stdout,
+            "local"
+        );
+    }
 }

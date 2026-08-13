@@ -15,13 +15,22 @@ Rustsible currently provides:
 - playbook tasks, variables, loops, conditions, registered results, handlers, and `become` support;
 - ad-hoc module execution;
 - local command execution and remote execution through SSH;
-- the `command`, `shell`, `debug`, `copy`, `file`, `template`, `lineinfile`, `user`, `service`, and `package` modules;
+- playbook support for `command`, `shell`, `debug`, `copy`, `file`, `template`, `lineinfile`, `user`, `service`, `systemd`, `stat`, `get_url`, and `package`;
 - short module names and the `ansible.builtin.*` / `ansible.legacy.*` name prefixes;
 - playbook `--limit`, `--check`, and `--forks` options.
 
 Tasks retain playbook order, while hosts within a task run concurrently with a bounded worker count (`--forks`, default 5). Most state-management modules and remote commands assume a POSIX shell, and the `package`, `service`, and `user` modules target Linux-style system tools. Linux is the primary supported and tested platform; Windows support is not claimed.
 
 Module names and common parameters resemble Ansible, but their complete argument schemas, facts, plugin system, transports, strategy engine, Vault support, and all Ansible edge cases are not implemented. Idempotency and check-mode prediction can also differ from Ansible.
+
+Playbook fact gathering follows the ansible-core 2.21 default: facts are gathered
+unless a play sets `gather_facts: false`. Fact gathering, `stat`, and `get_url`
+require Python 3 on managed hosts.
+The compatibility surface currently includes Linux architecture facts,
+`stat.path/checksum_algorithm`, `get_url.url/dest/owner/group/mode/force/checksum`
+(inline `<algorithm>:<digest>` checksums),
+`systemd.name/enabled/state/daemon_reload`, `copy.force`, and `default(omit)`.
+The systemd module rejects non-systemd hosts explicitly.
 
 ## Build
 
@@ -69,11 +78,18 @@ Run an ad-hoc module:
 rustsible ad-hoc webservers -i inventory.ini -m command -a "uname -a"
 rustsible ad-hoc all -i inventory.ini -m file -a "path=/tmp/example state=touch mode=0644"
 rustsible ad-hoc all -i inventory.ini -m package -a "name=curl state=present" --become --check
+rustsible ad-hoc all -i inventory.ini -m ansible.builtin.setup
+rustsible ad-hoc all -i inventory.ini -m stat -a '{"path":"/usr/local/bin/rs-cmdb-client","checksum_algorithm":"sha1"}'
 ```
 
 Ad-hoc runs inherit `ansible_become` and `ansible_become_user` per host. Use
 `--become`, `--become-user`, `--check`, and `--forks` to override execution
-controls from the command line.
+controls from the command line. Module arguments accept Ansible-style
+`key=value` input or a JSON object. `command` and `shell` additionally accept a
+JSON string or `{"cmd":"..."}`. Structured module data such as `ansible_facts`,
+`stat`, and `checksum_src` is printed as JSON. As in Ansible, ad-hoc fact
+gathering uses the `setup` module rather than the play-only `gather_facts`
+keyword.
 
 Inspect the parsed inventory without running tasks:
 
@@ -168,7 +184,7 @@ The default SSH connection timeout is 10 seconds and the default remote-command 
 
 ## Supported modules
 
-The following built-in modules are registered:
+The following built-in modules are registered for playbooks:
 
 | Module | Purpose |
 | --- | --- |
@@ -181,6 +197,10 @@ The following built-in modules are registered:
 | `lineinfile` | Add, replace, or remove matching lines |
 | `user` | Manage local user accounts |
 | `service` | Manage service state and enablement |
+| `systemd` / `systemd_service` | Manage systemd units and daemon reloads |
+| `setup` | Gather the supported Linux facts |
+| `stat` | Return path existence and checksums |
+| `get_url` | Download HTTP/HTTPS resources on the managed host |
 | `package` | Manage packages through detected system tools |
 
 Only the subset exercised by this repository's tests should be considered supported. Consult the module source and examples before relying on Ansible-specific parameters.
@@ -193,7 +213,7 @@ The CI-equivalent local checks are:
 cargo fmt --all -- --check
 cargo clippy --all-targets --all-features --locked -- -D warnings
 cargo test --all-targets --all-features --locked
-cargo llvm-cov --all-targets --all-features --locked --fail-under-lines 70
+cargo llvm-cov --all-targets --all-features --locked --fail-under-lines 80
 cargo build --release --all-features --locked
 ```
 
@@ -207,7 +227,10 @@ For a staged hands-on acceptance run covering local execution, SSH, check mode,
 idempotency, privilege escalation, failure handling, concurrency, and log
 redaction, follow [`MANUAL_TEST_PLAN.md`](MANUAL_TEST_PLAN.md).
 
-Dependency advisories are checked in CI against `Cargo.lock`. CI also enforces a 70% line-coverage floor; the current all-target result is 73.01%. This is a regression baseline, not a claim that every remote SSH path is exercised end to end.
+Dependency advisories are checked in CI against `Cargo.lock`. CI also enforces
+an 80% line-coverage floor; the current all-target result is 81.12%. This is a
+regression baseline, not a claim that every remote SSH path is exercised end to
+end.
 
 ## License
 

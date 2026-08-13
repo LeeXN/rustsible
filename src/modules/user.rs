@@ -497,6 +497,7 @@ pub fn execute(
             } else {
                 format!("User {} is already absent", name)
             },
+            values: Default::default(),
         });
     }
 
@@ -603,6 +604,7 @@ pub fn execute(
         } else {
             format!("User {} is already in the requested state", name)
         },
+        values: Default::default(),
     })
 }
 
@@ -743,5 +745,238 @@ mod tests {
             .unwrap_err()
             .to_string()
             .contains("sheel"));
+    }
+
+    #[test]
+    fn group_and_account_database_inputs_are_strictly_validated() {
+        assert_eq!(
+            parse_groups(&serde_yaml::from_str("groups: adm,wheel").unwrap()).unwrap(),
+            Some(vec!["adm".to_string(), "wheel".to_string()])
+        );
+        assert_eq!(
+            parse_groups(&serde_yaml::from_str("groups: ''").unwrap()).unwrap(),
+            Some(vec![])
+        );
+        assert_eq!(
+            parse_groups(&serde_yaml::from_str("groups: [adm, wheel]").unwrap()).unwrap(),
+            Some(vec!["adm".to_string(), "wheel".to_string()])
+        );
+        for invalid in [
+            "groups: 1",
+            "groups: [adm, 2]",
+            "groups: [--bad]",
+            "groups: ['bad,name']",
+        ] {
+            assert!(parse_groups(&serde_yaml::from_str(invalid).unwrap()).is_err());
+        }
+
+        for invalid in [
+            "bob:x:1:2:Bob:/home/bob",
+            "mallory:x:1:2:M:/home/m:/bin/sh",
+            "bob:x:nope:2:Bob:/home/bob:/bin/sh",
+            "bob:x:1:nope:Bob:/home/bob:/bin/sh",
+        ] {
+            assert!(parse_passwd_line(invalid, "bob").is_err());
+        }
+    }
+
+    #[test]
+    fn user_command_builders_cover_all_supported_attributes() {
+        let desired_config = DesiredAccount {
+            uid: Some(2000),
+            gid: None,
+            primary_group: Some("operators".to_string()),
+            groups: Some(vec!["adm".to_string(), "wheel".to_string()]),
+            append: true,
+            home: Some("/srv/alice".to_string()),
+            shell: Some("/bin/bash".to_string()),
+            comment: Some("Alice Admin".to_string()),
+            password: Some("$6$hash".to_string()),
+            create_home: false,
+            system: true,
+        };
+        let create = create_command("alice", &desired_config, Some("operators")).unwrap();
+        for fragment in [
+            "--uid '2000'",
+            "--gid 'operators'",
+            "--home-dir '/srv/alice'",
+            "--shell '/bin/bash'",
+            "--comment 'Alice Admin'",
+            "--no-create-home",
+            "--system",
+            "-- 'alice'",
+        ] {
+            assert!(create.contains(fragment), "missing {fragment}: {create}");
+        }
+        assert_eq!(
+            groups_command("alice", desired_config.groups.as_deref().unwrap(), true).unwrap(),
+            "usermod --append --groups 'adm,wheel' -- 'alice'"
+        );
+
+        let mut changed = desired_config.clone();
+        changed.gid = Some(3000);
+        changed.primary_group = None;
+        let arguments = attribute_changes(&current(), &changed, Some(3000), Some("3000")).unwrap();
+        for flag in ["--uid", "--gid", "--home", "--shell", "--comment"] {
+            assert!(arguments.contains(&flag.to_string()));
+        }
+
+        changed.uid = Some(-1);
+        assert!(attribute_changes(&current(), &changed, Some(3000), Some("3000")).is_err());
+        assert!(create_command("alice", &changed, None).is_err());
+        let mut negative_gid = desired();
+        negative_gid.gid = Some(-1);
+        assert!(attribute_changes(&current(), &negative_gid, Some(-1), Some("-1")).is_err());
+    }
+
+    #[test]
+    fn account_group_and_shadow_queries_interpret_remote_results() {
+        let mut connection = MockSshConnection::new();
+        connection.expect_execute_command().returning(|command| {
+            if command.starts_with("getent passwd") {
+                Ok((2, String::new(), String::new()))
+            } else if command == "getent group 'operators'" {
+                Ok((0, "operators:x:2000:\n".to_string(), String::new()))
+            } else if command == "getent group '1000'" {
+                Ok((0, "users:x:1000:\n".to_string(), String::new()))
+            } else if command.starts_with("id -nG") {
+                Ok((0, "users adm wheel\n".to_string(), String::new()))
+            } else if command.starts_with("getent shadow") {
+                Ok((
+                    0,
+                    "alice:$6$hash:1:2:3:4:5:6:7\n".to_string(),
+                    String::new(),
+                ))
+            } else {
+                panic!("unexpected command: {command}")
+            }
+        });
+        assert!(account_state(&connection, "alice", false, "root")
+            .unwrap()
+            .is_none());
+        assert_eq!(
+            resolve_group_gid(&connection, "operators", false, "root").unwrap(),
+            2000
+        );
+        assert_eq!(
+            supplementary_groups(&connection, "alice", 1000, false, "root").unwrap(),
+            ["adm".to_string(), "wheel".to_string()]
+                .into_iter()
+                .collect()
+        );
+        assert_eq!(
+            shadow_hash(&connection, "alice", false, "root").unwrap(),
+            "$6$hash"
+        );
+        assert!(resolve_group_gid(&connection, "--bad", false, "root").is_err());
+    }
+
+    #[test]
+    fn user_execute_creates_account_groups_and_password() {
+        let mut connection = MockSshConnection::new();
+        connection
+            .expect_execute_sudo_command()
+            .times(3)
+            .returning(|command, user| {
+                assert_eq!(user, "root");
+                if command.starts_with("getent passwd") {
+                    Ok((2, String::new(), String::new()))
+                } else {
+                    assert!(command.starts_with("useradd") || command.starts_with("usermod"));
+                    Ok((0, String::new(), String::new()))
+                }
+            });
+        connection
+            .expect_execute_sudo_command_with_input()
+            .withf(|command, user, input| {
+                command == "chpasswd -e" && user == "root" && input == b"alice:$6$salt$hash\n"
+            })
+            .once()
+            .returning(|_, _, _| Ok((0, String::new(), String::new())));
+        let args = serde_yaml::from_str(
+            "name: alice\ngroups: [adm]\nappend: true\npassword: '$6$salt$hash'\nshell: /bin/bash\nsystem: true",
+        )
+        .unwrap();
+
+        let result = execute(&connection, &args, true, "root", false).unwrap();
+        assert!(result.changed);
+        assert!(result.msg.contains("changed"));
+    }
+
+    #[test]
+    fn user_execute_modifies_and_removes_existing_accounts() {
+        let passwd = "alice:x:1000:1000:Alice:/home/alice:/bin/sh\n";
+        let mut modify = MockSshConnection::new();
+        modify.expect_execute_command().returning(move |command| {
+            if command.starts_with("getent passwd") {
+                Ok((0, passwd.to_string(), String::new()))
+            } else if command.starts_with("id -nG") {
+                Ok((0, "users wheel\n".to_string(), String::new()))
+            } else if command == "getent group '1000'" {
+                Ok((0, "users:x:1000:\n".to_string(), String::new()))
+            } else if command.starts_with("getent shadow") {
+                Ok((0, "alice:$6$old:::::::\n".to_string(), String::new()))
+            } else if command.starts_with("usermod") {
+                Ok((0, String::new(), String::new()))
+            } else {
+                panic!("unexpected command: {command}")
+            }
+        });
+        modify
+            .expect_execute_command_with_input()
+            .once()
+            .returning(|command, input| {
+                assert_eq!(command, "chpasswd -e");
+                assert_eq!(input, b"alice:$6$new\n");
+                Ok((0, String::new(), String::new()))
+            });
+        let args = serde_yaml::from_str(
+            "name: alice\nshell: /bin/bash\ngroups: [adm]\npassword: '$6$new'",
+        )
+        .unwrap();
+        assert!(
+            execute(&modify, &args, false, "root", false)
+                .unwrap()
+                .changed
+        );
+
+        let mut remove = MockSshConnection::new();
+        remove
+            .expect_execute_command()
+            .times(2)
+            .returning(move |command| {
+                if command.starts_with("getent passwd") {
+                    Ok((0, passwd.to_string(), String::new()))
+                } else {
+                    assert_eq!(command, "userdel --remove -- 'alice'");
+                    Ok((0, String::new(), String::new()))
+                }
+            });
+        let absent = serde_yaml::from_str("name: alice\nstate: absent\nremove: true").unwrap();
+        assert!(
+            execute(&remove, &absent, false, "root", false)
+                .unwrap()
+                .changed
+        );
+    }
+
+    #[test]
+    fn user_execute_rejects_invalid_requests_before_mutation() {
+        for input in [
+            "name: ''",
+            "name: --root",
+            "name: alice\nstate: latest",
+            "name: alice\ngid: 1\ngroup: users",
+            "name: alice\ngroups: [--bad]",
+        ] {
+            assert!(execute(
+                &MockSshConnection::new(),
+                &serde_yaml::from_str(input).unwrap(),
+                false,
+                "root",
+                false,
+            )
+            .is_err());
+        }
     }
 }

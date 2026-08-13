@@ -44,6 +44,7 @@ impl ModuleExecutor for CommandModule {
                 msg:
                     "Check mode: command was not executed because it has no safe change prediction"
                         .to_string(),
+                values: Default::default(),
             });
         }
 
@@ -94,6 +95,7 @@ pub fn execute_adhoc(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ssh::connection::MockSshConnection;
     use serde_yaml::{Mapping, Value};
 
     #[test]
@@ -134,5 +136,60 @@ mod tests {
 
         assert_eq!(quoted, "'printf' '%s' 'hello; touch /tmp/not-created'");
         assert!(tokenize_args("'unterminated").is_err());
+    }
+
+    #[test]
+    fn command_executes_reports_failures_and_honors_check_mode() {
+        let mut success = MockSshConnection::new();
+        success
+            .expect_execute_command()
+            .withf(|command| command == "'printf' '%s' 'hello world'")
+            .once()
+            .returning(|_| Ok((0, "hello world".to_string(), String::new())));
+        let result = execute(
+            &success,
+            &Value::String("printf '%s' 'hello world'".to_string()),
+            false,
+            "root",
+            false,
+        )
+        .unwrap();
+        assert_eq!(result.stdout, "hello world");
+        assert!(result.changed);
+
+        let mut failure = MockSshConnection::new();
+        failure
+            .expect_execute_sudo_command()
+            .withf(|command, user| command == "'false'" && user == "operator")
+            .once()
+            .returning(|_, _| Ok((2, String::new(), "denied".to_string())));
+        let failed = execute(
+            &failure,
+            &Value::String("false".to_string()),
+            true,
+            "operator",
+            false,
+        )
+        .unwrap();
+        assert!(failed.failed);
+        assert!(failed.msg.contains("denied"));
+
+        let check = execute(
+            &MockSshConnection::new(),
+            &Value::String("true".to_string()),
+            false,
+            "root",
+            true,
+        )
+        .unwrap();
+        assert!(!check.changed);
+        assert!(execute(
+            &MockSshConnection::new(),
+            &Value::String("  ".to_string()),
+            false,
+            "root",
+            false
+        )
+        .is_err());
     }
 }

@@ -2,27 +2,32 @@ pub mod command;
 pub mod copy;
 pub mod debug;
 pub mod file;
+pub mod get_url;
 pub mod lineinfile;
 pub mod local;
 pub mod package;
 pub mod param;
+mod python;
 pub mod remote;
 pub mod service;
+pub mod setup;
 pub mod shell;
+pub mod stat;
 pub mod template;
 pub mod user;
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use colored::Colorize;
 use log::{debug, info};
 use serde_yaml::Value;
+use std::collections::HashMap;
 use std::time::Instant;
 
 use crate::inventory::Host;
 use crate::ssh::connection::{Connection, SshConnection};
 
 /// Result structure for unified handling of module returns
-#[derive(Default)]
+#[derive(Debug, Default)]
 pub struct ModuleResult {
     pub stdout: String,
     pub stderr: String,
@@ -30,6 +35,8 @@ pub struct ModuleResult {
     pub changed: bool,
     pub failed: bool,
     pub msg: String,
+    /// Module-specific return values exposed to `register`.
+    pub values: HashMap<String, Value>,
 }
 
 /// Controls an ad-hoc run. `become_override` is optional so an explicit
@@ -133,6 +140,7 @@ pub trait ModuleExecutor {
                     stderr.trim()
                 )
             },
+            values: Default::default(),
         };
 
         if exit_code != 0 {
@@ -261,17 +269,26 @@ pub fn run_adhoc_with_options(
         match &execution.result {
             Ok(module_result) if !module_result_failed(module_result) => {
                 success_count += 1;
-                println!(
-                    "{} | {} | rc={} >>>\n{}",
-                    host.name.green(),
-                    "SUCCESS".green(),
-                    module_result_rc(module_result),
-                    if !module_result.stdout.trim().is_empty() {
-                        module_result.stdout.trim()
-                    } else {
-                        module_result.msg.as_str()
-                    }
-                );
+                if let Some(payload) = structured_module_output(module_result)? {
+                    println!(
+                        "{} | {} => {}",
+                        host.name.green(),
+                        "SUCCESS".green(),
+                        payload
+                    );
+                } else {
+                    println!(
+                        "{} | {} | rc={} >>>\n{}",
+                        host.name.green(),
+                        "SUCCESS".green(),
+                        module_result_rc(module_result),
+                        if !module_result.stdout.trim().is_empty() {
+                            module_result.stdout.trim()
+                        } else {
+                            module_result.msg.as_str()
+                        }
+                    );
+                }
             }
             Ok(module_result) => {
                 let detail = if !module_result.stderr.trim().is_empty() {
@@ -282,13 +299,17 @@ pub fn run_adhoc_with_options(
                     format!("Module failed with rc={}", module_result_rc(module_result))
                 };
                 failed_details.push(format!("{}: {}", host.name, detail));
-                println!(
-                    "{} | {} | rc={} >>>\n{}",
-                    host.name.red(),
-                    "FAILED".red(),
-                    module_result_rc(module_result),
-                    &detail
-                );
+                if let Some(payload) = structured_module_output(module_result)? {
+                    println!("{} | {} => {}", host.name.red(), "FAILED".red(), payload);
+                } else {
+                    println!(
+                        "{} | {} | rc={} >>>\n{}",
+                        host.name.red(),
+                        "FAILED".red(),
+                        module_result_rc(module_result),
+                        detail
+                    );
+                }
             }
             Err(e) => {
                 failed_details.push(format!("{}: {}", host.name, e));
@@ -347,12 +368,38 @@ struct HostExecution {
 
 fn prepare_adhoc_args(module_name: &str, args: &str) -> Result<Value> {
     match module_name {
-        "command" | "shell" => Ok(Value::String(args.to_string())),
-        "copy" | "file" | "template" | "service" | "package" | "debug" | "lineinfile" | "user" => {
-            Ok(Value::Mapping(parse_args(args)?))
+        "command" | "shell" => parse_command_adhoc_args(args),
+        "setup" => parse_mapping_adhoc_args(args, true),
+        "copy" | "file" | "template" | "service" | "systemd" | "systemd_service" | "package"
+        | "debug" | "lineinfile" | "user" | "stat" | "get_url" => {
+            parse_mapping_adhoc_args(args, false)
         }
         _ => Err(anyhow::anyhow!("Unsupported module: {}", module_name)),
     }
+}
+
+fn parse_command_adhoc_args(args: &str) -> Result<Value> {
+    let trimmed = args.trim();
+    if trimmed.starts_with('{') || trimmed.starts_with('"') {
+        return serde_json::from_str(trimmed).context("Invalid JSON module arguments");
+    }
+    Ok(Value::String(args.to_string()))
+}
+
+fn parse_mapping_adhoc_args(args: &str, allow_empty: bool) -> Result<Value> {
+    let trimmed = args.trim();
+    if trimmed.is_empty() && allow_empty {
+        return Ok(Value::Mapping(Default::default()));
+    }
+    if trimmed.starts_with('{') {
+        let value: Value =
+            serde_json::from_str(trimmed).context("Invalid JSON module arguments")?;
+        if value.is_mapping() {
+            return Ok(value);
+        }
+        return Err(anyhow::anyhow!("JSON module arguments must be an object"));
+    }
+    Ok(Value::Mapping(parse_args(args)?))
 }
 
 fn effective_adhoc_options(host: &Host, options: &AdHocOptions) -> EffectiveAdHocOptions {
@@ -380,6 +427,39 @@ fn module_result_rc(result: &ModuleResult) -> i32 {
 
 fn module_result_failed(result: &ModuleResult) -> bool {
     result.failed || result.rc.is_some_and(|rc| rc != 0)
+}
+
+fn structured_module_output(result: &ModuleResult) -> Result<Option<String>> {
+    if result.values.is_empty() {
+        return Ok(None);
+    }
+
+    let mut payload = serde_json::Map::new();
+    for (key, value) in &result.values {
+        payload.insert(
+            key.clone(),
+            serde_json::to_value(value)
+                .with_context(|| format!("Failed to serialize module result field '{key}'"))?,
+        );
+    }
+    payload.insert("changed".to_string(), result.changed.into());
+    payload.insert("failed".to_string(), module_result_failed(result).into());
+    if let Some(rc) = result.rc {
+        payload.insert("rc".to_string(), rc.into());
+    }
+    if !result.stdout.is_empty() {
+        payload.insert("stdout".to_string(), result.stdout.clone().into());
+    }
+    if !result.stderr.is_empty() {
+        payload.insert("stderr".to_string(), result.stderr.clone().into());
+    }
+    if !result.msg.is_empty() {
+        payload.insert("msg".to_string(), result.msg.clone().into());
+    }
+
+    serde_json::to_string_pretty(&payload)
+        .context("Failed to encode structured module result")
+        .map(Some)
 }
 
 fn execute_adhoc_module(
@@ -424,6 +504,7 @@ fn execute_adhoc_module(
                 "Check mode: {} was not executed because it has no safe change prediction",
                 module_name
             ),
+            values: Default::default(),
         });
     }
 
@@ -470,6 +551,13 @@ fn execute_adhoc_module(
             &options.become_user,
             options.check_mode,
         ),
+        "systemd" | "systemd_service" => service::execute_systemd_adhoc(
+            host,
+            args,
+            options.use_become,
+            &options.become_user,
+            options.check_mode,
+        ),
         "package" => package::execute_adhoc(
             host,
             args,
@@ -492,6 +580,27 @@ fn execute_adhoc_module(
             options.check_mode,
         ),
         "user" => user::execute_adhoc(
+            host,
+            args,
+            options.use_become,
+            &options.become_user,
+            options.check_mode,
+        ),
+        "setup" => setup::execute_adhoc(
+            host,
+            args,
+            options.use_become,
+            &options.become_user,
+            options.check_mode,
+        ),
+        "stat" => stat::execute_adhoc(
+            host,
+            args,
+            options.use_become,
+            &options.become_user,
+            options.check_mode,
+        ),
+        "get_url" => get_url::execute_adhoc(
             host,
             args,
             options.use_become,
@@ -748,6 +857,156 @@ mod tests {
             assert!(
                 parse_args(invalid).is_err(),
                 "accepted invalid argument list"
+            );
+        }
+    }
+
+    #[test]
+    fn ad_hoc_accepts_json_and_setup_without_arguments() {
+        let args = prepare_adhoc_args(
+            "get_url",
+            r#"{"url":"https://example.invalid/a","dest":"/tmp/a","force":true}"#,
+        )
+        .unwrap();
+        let mapping = args.as_mapping().unwrap();
+        assert_eq!(
+            mapping.get(Value::String("force".to_string())),
+            Some(&Value::Bool(true))
+        );
+
+        assert_eq!(
+            prepare_adhoc_args("command", r#"{"cmd":"printf ok"}"#).unwrap(),
+            serde_yaml::from_str::<Value>("cmd: printf ok").unwrap()
+        );
+        assert_eq!(
+            prepare_adhoc_args("command", r#""printf ok""#).unwrap(),
+            Value::String("printf ok".to_string())
+        );
+        assert_eq!(
+            prepare_adhoc_args("setup", "").unwrap(),
+            Value::Mapping(Default::default())
+        );
+    }
+
+    #[test]
+    fn ad_hoc_json_rejects_invalid_or_non_object_mapped_arguments() {
+        for (module, args) in [
+            ("stat", "{broken"),
+            ("stat", r#"["not", "an", "object"]"#),
+            ("command", "{broken"),
+        ] {
+            assert!(
+                prepare_adhoc_args(module, args).is_err(),
+                "accepted invalid JSON for {module}"
+            );
+        }
+    }
+
+    #[test]
+    fn all_supported_structured_ad_hoc_modules_reach_argument_validation() {
+        for module in [
+            "copy",
+            "file",
+            "template",
+            "service",
+            "systemd",
+            "systemd_service",
+            "package",
+            "debug",
+            "lineinfile",
+            "user",
+            "stat",
+            "get_url",
+        ] {
+            assert!(
+                prepare_adhoc_args(module, "key=value").is_ok(),
+                "{module} was not accepted"
+            );
+        }
+    }
+
+    #[test]
+    fn structured_ad_hoc_output_contains_common_and_module_fields() {
+        let result = ModuleResult {
+            stdout: "payload".to_string(),
+            stderr: "warning".to_string(),
+            rc: Some(7),
+            changed: true,
+            failed: false,
+            msg: "download failed".to_string(),
+            values: HashMap::from([(
+                "stat".to_string(),
+                serde_yaml::from_str("{exists: true}").unwrap(),
+            )]),
+        };
+        let output = structured_module_output(&result).unwrap().unwrap();
+        let payload: serde_json::Value = serde_json::from_str(&output).unwrap();
+
+        assert_eq!(payload["changed"], true);
+        assert_eq!(payload["failed"], true);
+        assert_eq!(payload["rc"], 7);
+        assert_eq!(payload["stdout"], "payload");
+        assert_eq!(payload["stderr"], "warning");
+        assert_eq!(payload["msg"], "download failed");
+        assert_eq!(payload["stat"]["exists"], true);
+        assert!(structured_module_output(&ModuleResult::default())
+            .unwrap()
+            .is_none());
+    }
+
+    #[test]
+    fn setup_and_stat_execute_through_ad_hoc_dispatch() {
+        let mut host = Host::new("localhost");
+        host.set_variable("ansible_connection", "local");
+        let options = EffectiveAdHocOptions {
+            use_become: false,
+            become_user: "root".to_string(),
+            check_mode: false,
+        };
+
+        let facts = execute_adhoc_module(
+            &host,
+            "setup",
+            &Value::Mapping(Default::default()),
+            &options,
+        )
+        .unwrap();
+        assert!(facts.values.contains_key("ansible_facts"));
+
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("missing");
+        let args = serde_yaml::from_str(&format!("path: {}", path.display())).unwrap();
+        let stat = execute_adhoc_module(&host, "stat", &args, &options).unwrap();
+        assert_eq!(
+            stat.values["stat"]
+                .as_mapping()
+                .unwrap()
+                .get(Value::String("exists".to_string())),
+            Some(&Value::Bool(false))
+        );
+    }
+
+    #[test]
+    fn new_ad_hoc_dispatch_routes_validate_module_specific_arguments() {
+        let mut host = Host::new("localhost");
+        host.set_variable("ansible_connection", "local");
+        let options = EffectiveAdHocOptions {
+            use_become: false,
+            become_user: "root".to_string(),
+            check_mode: true,
+        };
+        let empty = Value::Mapping(Default::default());
+
+        let stat_error = execute_adhoc_module(&host, "stat", &empty, &options).unwrap_err();
+        assert!(stat_error.to_string().contains("path"));
+        let get_url_error = execute_adhoc_module(&host, "get_url", &empty, &options).unwrap_err();
+        assert!(get_url_error.to_string().contains("url"));
+        for module in ["systemd", "systemd_service"] {
+            let error = execute_adhoc_module(&host, module, &empty, &options).unwrap_err();
+            let message = error.to_string();
+            assert!(
+                message.contains("systemd") || message.contains("name"),
+                "unexpected {module} error: {message}"
             );
         }
     }
