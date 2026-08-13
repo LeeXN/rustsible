@@ -152,12 +152,7 @@ fn get_nested_value<'a>(key: &str, vars: &'a HashMap<String, Value>) -> Option<&
         match current_value {
             Value::Mapping(map) => {
                 // Try looking up the part as a string key
-                if let Some(next_value) = map.get(Value::String(part.to_string())) {
-                    current_value = next_value;
-                } else {
-                    // Handle potential non-string keys if necessary, though less common
-                    return None; // Key part not found in map
-                }
+                current_value = map.get(Value::String(part.to_string()))?;
             }
             _ => {
                 return None; // Cannot access sub-key on a non-mapping value

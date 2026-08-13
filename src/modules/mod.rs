@@ -307,7 +307,7 @@ pub fn run_adhoc_with_options(
                         host.name.red(),
                         "FAILED".red(),
                         module_result_rc(module_result),
-                        &detail
+                        detail
                     );
                 }
             }
