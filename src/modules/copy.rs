@@ -22,7 +22,7 @@ impl ModuleExecutor for CopyModule {
     ) -> Result<ModuleResult> {
         validate_params(
             copy_args,
-            &["src", "content", "dest", "mode", "owner", "group"],
+            &["src", "content", "dest", "mode", "owner", "group", "force"],
         )?;
         let dest = get_param::<String>(copy_args, "dest")?;
         if dest.is_empty() {
@@ -33,6 +33,7 @@ impl ModuleExecutor for CopyModule {
         let mode = get_optional_param::<String>(copy_args, "mode")?;
         let owner = get_optional_param::<String>(copy_args, "owner")?;
         let group = get_optional_param::<String>(copy_args, "group")?;
+        let force = get_optional_param::<bool>(copy_args, "force")?.unwrap_or(true);
 
         // Determine content source
         let content: Vec<u8> = if let Value::Mapping(args_map) = copy_args {
@@ -84,7 +85,9 @@ impl ModuleExecutor for CopyModule {
         } else {
             connection.read_file_bytes(&dest)?
         };
-        let content_changed = existing_content.as_deref() != Some(content.as_slice());
+        let content_changed = existing_content
+            .as_deref()
+            .is_none_or(|existing| force && existing != content.as_slice());
         let metadata_changes = plan_metadata_changes(
             &current,
             mode.as_deref(),
@@ -148,6 +151,7 @@ impl ModuleExecutor for CopyModule {
             } else {
                 format!("Destination {} is already up to date", dest)
             },
+            values: Default::default(),
         })
     }
 }
@@ -255,5 +259,22 @@ mod tests {
         let checked = execute(&connection, &args, false, "", true).unwrap();
         assert!(checked.changed);
         assert_eq!(std::fs::read(&destination).unwrap(), original);
+    }
+
+    #[test]
+    fn force_false_preserves_existing_content() {
+        let directory = tempfile::tempdir().unwrap();
+        let source = directory.path().join("source");
+        let destination = directory.path().join("destination");
+        std::fs::write(&source, b"new").unwrap();
+        std::fs::write(&destination, b"existing").unwrap();
+        let mut args = copy_args(source.to_str().unwrap(), destination.to_str().unwrap());
+        args.as_mapping_mut()
+            .unwrap()
+            .insert(Value::String("force".to_string()), Value::Bool(false));
+
+        let result = execute(&local_connection(), &args, false, "", false).unwrap();
+        assert!(!result.changed);
+        assert_eq!(std::fs::read(destination).unwrap(), b"existing");
     }
 }

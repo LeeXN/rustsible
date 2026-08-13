@@ -62,7 +62,7 @@ fn main() -> Result<()> {
             let result = playbook::execute_with_options(playbook_file, &inventory, &options);
 
             if let Err(e) = result {
-                eprintln!("Error executing playbook: {}", e);
+                eprintln!("Error executing playbook: {e:#}");
                 std::process::exit(1);
             }
         }
@@ -101,7 +101,7 @@ fn main() -> Result<()> {
             };
             let result = modules::run_adhoc_with_options(&hosts, module, args, &options);
             if let Err(e) = result {
-                eprintln!("Error executing ad-hoc command: {}", e);
+                eprintln!("Error executing ad-hoc command: {e:#}");
                 std::process::exit(1);
             }
         }

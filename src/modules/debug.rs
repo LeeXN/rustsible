@@ -39,6 +39,7 @@ pub fn execute_without_connection(args: &Value) -> Result<ModuleResult> {
                         changed: false,
                         failed: false,
                         msg: msg.clone(),
+                        values: Default::default(),
                     });
                 } else {
                     let msg_str = format_value(value);
@@ -49,6 +50,7 @@ pub fn execute_without_connection(args: &Value) -> Result<ModuleResult> {
                         changed: false,
                         failed: false,
                         msg: msg_str.clone(),
+                        values: Default::default(),
                     });
                 }
             } else {
@@ -73,6 +75,7 @@ pub fn execute_without_connection(args: &Value) -> Result<ModuleResult> {
                         changed: false,
                         failed: false,
                         msg: format!("{} = {}", var_name, value_str),
+                        values: Default::default(),
                     })
                 // Subcase 2b: '_var_value' is NOT present, check if 'var' holds a rendered string
                 } else if let Value::String(rendered_string) = var_param_value {
@@ -84,6 +87,7 @@ pub fn execute_without_connection(args: &Value) -> Result<ModuleResult> {
                         changed: false,
                         failed: false,
                         msg: rendered_string.clone(),
+                        values: Default::default(),
                     })
                 // Subcase 2c: 'var' exists but is not a string, and '_var_value' is missing
                 } else {
@@ -96,6 +100,7 @@ pub fn execute_without_connection(args: &Value) -> Result<ModuleResult> {
                         changed: false,
                         failed: false,
                         msg: var_content_str.clone(),
+                        values: Default::default(),
                     })
                 }
             }
@@ -231,5 +236,86 @@ fn format_complex_value(value: &Value, indent_level: usize) -> String {
         }
         Value::Tagged(tagged) => format_complex_value(&tagged.value, indent_level),
         _ => format!("{:?}", value),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::ssh::connection::MockSshConnection;
+
+    fn yaml(input: &str) -> Value {
+        serde_yaml::from_str(input).unwrap()
+    }
+
+    #[test]
+    fn debug_formats_messages_and_resolved_variables() {
+        for (input, stdout, message) in [
+            ("msg: hello", "hello", "hello"),
+            ("msg: 42", "42", "42"),
+            ("var: rendered", "rendered", "rendered"),
+            ("var: 7", "Number(7)", "Number(7)"),
+            (
+                "var: inventory_hostname\n_var_value: [web, 2, true]",
+                "\n  - \"web\"\n  - 2\n  - true\n",
+                "inventory_hostname = \n  - \"web\"\n  - 2\n  - true\n",
+            ),
+            ("var: 9\n_var_value: false", "false", "<unknown> = false"),
+        ] {
+            let result = execute_without_connection(&yaml(input)).unwrap();
+            assert_eq!(result.stdout, stdout);
+            assert_eq!(result.msg, message);
+            assert!(!result.changed);
+        }
+    }
+
+    #[test]
+    fn debug_formats_nested_yaml_values() {
+        let value = yaml(
+            "root:\n  text: hello\n  number: 3\n  enabled: true\n  nothing: null\n  nested:\n    - child\n    - [1, false]\nempty_map: {}\nempty_list: []",
+        );
+        let formatted = format_value(&value);
+        for fragment in [
+            "root:",
+            "text: \"hello\"",
+            "number: 3",
+            "enabled: true",
+            "nothing: null",
+            "nested:",
+            "empty_map:",
+            "empty_list:",
+        ] {
+            assert!(
+                formatted.contains(fragment),
+                "missing {fragment}: {formatted}"
+            );
+        }
+        assert_eq!(format_value(&Value::Sequence(vec![])), "[]");
+        assert_eq!(format_value(&Value::Mapping(Default::default())), "{}");
+        assert_eq!(format_value(&Value::Null), "null");
+    }
+
+    #[test]
+    fn debug_validates_arguments_and_never_needs_a_connection() {
+        assert!(execute_without_connection(&yaml("{}"))
+            .unwrap_err()
+            .to_string()
+            .contains("requires a 'msg' or 'var'"));
+        assert!(execute_without_connection(&Value::String("no map".to_string())).is_err());
+        assert!(execute_without_connection(&yaml("msg: ok\nunknown: true")).is_err());
+
+        let mut connection = MockSshConnection::new();
+        connection.expect_execute_command().never();
+        let direct = execute(&connection, &yaml("msg: direct"), true, "root", true).unwrap();
+        assert_eq!(direct.stdout, "direct");
+        let adhoc = execute_adhoc(
+            &Host::new("unreachable.invalid"),
+            &yaml("msg: adhoc"),
+            false,
+            "root",
+            false,
+        )
+        .unwrap();
+        assert_eq!(adhoc.stdout, "adhoc");
     }
 }

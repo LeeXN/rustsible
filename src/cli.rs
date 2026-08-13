@@ -73,7 +73,7 @@ pub fn build_cli() -> Command {
                         .short('a')
                         .long("args")
                         .help("Module arguments")
-                        .required(true)
+                        .default_value("")
                         .value_name("ARGS"),
                 )
                 .arg(
@@ -178,5 +178,17 @@ mod tests {
         );
         assert!(ad_hoc.get_flag("check"));
         assert_eq!(ad_hoc.get_one::<usize>("forks"), Some(&7));
+    }
+
+    #[test]
+    fn setup_ad_hoc_does_not_require_an_args_flag() {
+        let matches = build_cli()
+            .try_get_matches_from(["rustsible", "ad-hoc", "all", "--module", "setup"])
+            .unwrap();
+        let (_, ad_hoc) = matches.subcommand().unwrap();
+        assert_eq!(
+            ad_hoc.get_one::<String>("args").map(String::as_str),
+            Some("")
+        );
     }
 }

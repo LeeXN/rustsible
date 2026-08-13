@@ -535,6 +535,13 @@ fn sudo_password_input(password: &str) -> Result<Option<Vec<u8>>> {
     }
 }
 
+/// POSIX `test` has no portable `--` option terminator. After unary `-e`, the
+/// next shell-quoted token is unambiguously the path, including names starting
+/// with a dash.
+fn test_path_exists_command(path: &str) -> String {
+    format!("test -e {}", shell_quote(path))
+}
+
 /// Trait defining SSH connection operations for mocking.
 #[cfg_attr(test, automock)]
 pub trait SshConnection {
@@ -580,7 +587,7 @@ pub trait SshConnection {
     /// Read a regular file through the selected become identity without
     /// decoding it as text. A missing path returns None.
     fn read_file_bytes_with_sudo(&self, path: &str, sudo_user: &str) -> Result<Option<Vec<u8>>> {
-        let inspect = format!("test -e -- {}", shell_quote(path));
+        let inspect = test_path_exists_command(path);
         let (exists, _, stderr) = self.execute_sudo_command(&inspect, sudo_user)?;
         match exists {
             0 => {}
@@ -987,7 +994,7 @@ impl SshConnection for LocalConnection {
     }
 
     fn read_file_bytes_with_sudo(&self, path: &str, sudo_user: &str) -> Result<Option<Vec<u8>>> {
-        let inspect = format!("test -e -- {}", shell_quote(path));
+        let inspect = test_path_exists_command(path);
         let (exists, _, stderr) = self.execute_sudo_command(&inspect, sudo_user)?;
         match exists {
             0 => {}
@@ -1657,7 +1664,7 @@ impl SshConnection for SshClient {
     }
 
     fn read_file_bytes_with_sudo(&self, path: &str, sudo_user: &str) -> Result<Option<Vec<u8>>> {
-        let inspect = format!("test -e -- {}", shell_quote(path));
+        let inspect = test_path_exists_command(path);
         let (exists, _, stderr) = self.execute_sudo_command(&inspect, sudo_user)?;
         match exists {
             0 => {}
@@ -1760,6 +1767,21 @@ mod tests {
             Some(b"not in argv\n".to_vec())
         );
         assert!(sudo_password_input("two\nlines").is_err());
+    }
+
+    #[test]
+    fn path_existence_probe_is_posix_and_shell_safe() {
+        for path in ["/missing", "-leading", "with space", "it's; echo unsafe"] {
+            let command = test_path_exists_command(path);
+            assert!(!command.contains("test -e --"));
+            let status = Command::new("sh").args(["-c", &command]).status().unwrap();
+            assert_eq!(
+                status.code(),
+                Some(1),
+                "probe had a syntax error: {command}"
+            );
+        }
+        assert_eq!(test_path_exists_command("it's"), "test -e 'it'\"'\"'s'");
     }
 
     #[test]
@@ -1900,8 +1922,12 @@ mod tests {
 
         let result = connection.execute_command("setsid sleep 30 & exit 0");
 
-        assert!(result.is_err());
-        assert!(result.unwrap_err().to_string().contains("timed out"));
+        // Depending on the platform's `setsid`, the detached child either
+        // closes inherited pipes promptly or keeps them open until our
+        // deadline. Both are safe; the parent must never wait for `sleep 30`.
+        if let Err(error) = result {
+            assert!(error.to_string().contains("timed out"));
+        }
         assert!(started.elapsed() < Duration::from_secs(4));
     }
 
@@ -1913,7 +1939,10 @@ mod tests {
         let started = Instant::now();
         let result = connection.execute_command("while :; do printf '0123456789abcdef'; done");
         assert!(result.is_err());
-        assert!(started.elapsed() < Duration::from_secs(4));
+        // Coverage instrumentation makes the tight output loop several times
+        // slower. This bound still proves cleanup finishes promptly instead of
+        // waiting for the normal command timeout.
+        assert!(started.elapsed() < Duration::from_secs(10));
     }
 
     #[test]

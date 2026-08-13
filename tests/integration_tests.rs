@@ -117,6 +117,30 @@ fn test_unknown_module_returns_nonzero_exit_status() -> Result<()> {
 }
 
 #[test]
+fn playbook_cli_prints_the_complete_parse_error_chain() -> Result<()> {
+    let inventory_file = local_inventory();
+    let playbook_file = fixture_file(
+        "---\n- name: unsupported pre tasks\n  hosts: localhost\n  pre_tasks: []\n  tasks: []\n",
+    );
+
+    let output = Command::new(env!("CARGO_BIN_EXE_rustsible"))
+        .arg("playbook")
+        .arg(playbook_file.path())
+        .arg("-i")
+        .arg(inventory_file.path())
+        .output()?;
+
+    assert!(!output.status.success());
+    let stderr = String::from_utf8(output.stderr)?;
+    assert!(stderr.contains("Failed to parse play 1 in document 1"));
+    assert!(
+        stderr.contains("Play keyword 'pre_tasks' is recognized but not supported"),
+        "stderr omitted the root cause: {stderr}"
+    );
+    Ok(())
+}
+
+#[test]
 fn test_long_task_name_does_not_panic() -> Result<()> {
     let inventory_file = local_inventory();
     let playbook_file = fixture_file(
@@ -133,6 +157,18 @@ fn test_builtin_fqcn_is_accepted() -> Result<()> {
     let inventory_file = local_inventory();
     let playbook_file = fixture_file(
         "---\n- name: fqcn\n  hosts: localhost\n  tasks:\n    - name: builtin debug\n      ansible.builtin.debug:\n        msg: hello\n",
+    );
+    let inventory = inventory::parse(inventory_file.path().to_str().unwrap())?;
+
+    playbook::execute(playbook_file.path().to_str().unwrap(), &inventory)?;
+    Ok(())
+}
+
+#[test]
+fn gathered_architecture_is_available_to_play_variables() -> Result<()> {
+    let inventory_file = local_inventory();
+    let playbook_file = fixture_file(
+        "---\n- name: facts\n  hosts: localhost\n  gather_facts: true\n  vars:\n    normalized_arch: \"{{ 'aarch64' if ansible_architecture in ['aarch64', 'arm64'] else 'x86_64' }}\"\n  tasks:\n    - name: render gathered architecture\n      debug:\n        msg: \"{{ normalized_arch }}\"\n",
     );
     let inventory = inventory::parse(inventory_file.path().to_str().unwrap())?;
 
@@ -185,5 +221,51 @@ fn documented_subset_examples_remain_parseable() -> Result<()> {
             "documented example {relative_path} failed before host selection: {message}"
         );
     }
+    Ok(())
+}
+
+#[test]
+fn ad_hoc_setup_and_stat_support_native_argument_forms_and_json_results() -> Result<()> {
+    let inventory_file = local_inventory();
+    let setup = Command::new(env!("CARGO_BIN_EXE_rustsible"))
+        .args(["ad-hoc", "localhost", "-m", "ansible.builtin.setup", "-i"])
+        .arg(inventory_file.path())
+        .output()?;
+    assert!(
+        setup.status.success(),
+        "{}",
+        String::from_utf8_lossy(&setup.stderr)
+    );
+    let setup_stdout = String::from_utf8(setup.stdout)?;
+    assert!(setup_stdout.contains("\"ansible_facts\""));
+    assert!(setup_stdout.contains("\"architecture\""));
+
+    let directory = TempDir::new()?;
+    let inspected = directory.path().join("missing file");
+    let arguments = serde_json::json!({"path": inspected}).to_string();
+    let stat = Command::new(env!("CARGO_BIN_EXE_rustsible"))
+        .args(["ad-hoc", "localhost", "-m", "stat", "-a", &arguments, "-i"])
+        .arg(inventory_file.path())
+        .output()?;
+    assert!(
+        stat.status.success(),
+        "{}",
+        String::from_utf8_lossy(&stat.stderr)
+    );
+    let stat_stdout = String::from_utf8(stat.stdout)?;
+    assert!(stat_stdout.contains("\"stat\""));
+    assert!(stat_stdout.contains("\"exists\": false"));
+    Ok(())
+}
+
+#[test]
+fn ad_hoc_invalid_json_fails_before_opening_a_connection() -> Result<()> {
+    let inventory_file = local_inventory();
+    let output = Command::new(env!("CARGO_BIN_EXE_rustsible"))
+        .args(["ad-hoc", "localhost", "-m", "stat", "-a", "{broken", "-i"])
+        .arg(inventory_file.path())
+        .output()?;
+    assert!(!output.status.success());
+    assert!(String::from_utf8(output.stderr)?.contains("Invalid JSON module arguments"));
     Ok(())
 }

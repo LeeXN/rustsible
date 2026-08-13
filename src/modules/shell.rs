@@ -32,6 +32,7 @@ impl ModuleExecutor for ShellModule {
                 failed: false,
                 msg: "Check mode: shell was not executed because it has no safe change prediction"
                     .to_string(),
+                values: Default::default(),
             });
         }
 
@@ -79,6 +80,7 @@ pub fn execute_adhoc(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ssh::connection::MockSshConnection;
     use serde_yaml::{Mapping, Value};
 
     #[test]
@@ -105,5 +107,44 @@ mod tests {
         // 测试错误情况：无效参数类型
         let invalid_arg = Value::Sequence(vec![]);
         assert!(ShellModule::extract_command_arg(&invalid_arg).is_err());
+    }
+
+    #[test]
+    fn shell_executes_literal_payload_and_validates_unsafe_input() {
+        let mut connection = MockSshConnection::new();
+        connection
+            .expect_execute_command()
+            .withf(|command| command == "sh -c 'printf '\"'\"'ok'\"'\"''")
+            .once()
+            .returning(|_| Ok((0, "ok".to_string(), String::new())));
+        let result = execute(
+            &connection,
+            &Value::String("printf 'ok'".to_string()),
+            false,
+            "root",
+            false,
+        )
+        .unwrap();
+        assert_eq!(result.stdout, "ok");
+
+        let check = execute(
+            &MockSshConnection::new(),
+            &Value::String("echo check".to_string()),
+            false,
+            "root",
+            true,
+        )
+        .unwrap();
+        assert!(!check.changed);
+        for invalid in ["", "bad\0command"] {
+            assert!(execute(
+                &MockSshConnection::new(),
+                &Value::String(invalid.to_string()),
+                false,
+                "root",
+                false,
+            )
+            .is_err());
+        }
     }
 }

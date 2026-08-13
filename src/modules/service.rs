@@ -295,7 +295,69 @@ pub fn execute(
         } else {
             format!("Service {} is already in the requested state", name)
         },
+        values: Default::default(),
     })
+}
+
+pub fn execute_systemd(
+    connection: &dyn SshConnection,
+    args: &Value,
+    use_become: bool,
+    become_user: &str,
+    check_mode: bool,
+) -> Result<ModuleResult> {
+    validate_params(args, &["name", "state", "enabled", "daemon_reload"])?;
+    let daemon_reload = args
+        .as_mapping()
+        .and_then(|mapping| mapping.get(Value::String("daemon_reload".to_string())))
+        .map(|value| match value {
+            Value::Bool(value) => Ok(*value),
+            _ => bail!("Systemd 'daemon_reload' must be a boolean"),
+        })
+        .transpose()?
+        .unwrap_or(false);
+
+    match detect_init_system(connection) {
+        Ok(InitSystem::Systemd) => {}
+        Ok(_) => bail!("The systemd module requires a Linux host running systemd"),
+        Err(error) => bail!(
+            "The systemd module requires a Linux host running systemd: {}",
+            error
+        ),
+    }
+    if daemon_reload && !check_mode {
+        let (code, _, stderr) = run(
+            connection,
+            "systemctl daemon-reload",
+            use_become,
+            become_user,
+        )?;
+        if code != 0 {
+            bail!("Failed to reload the systemd manager: {}", stderr.trim());
+        }
+    }
+
+    let mut service_args = args
+        .as_mapping()
+        .cloned()
+        .context("Systemd module requires a mapping of arguments")?;
+    service_args.remove(Value::String("daemon_reload".to_string()));
+    let mut result = execute(
+        connection,
+        &Value::Mapping(service_args),
+        use_become,
+        become_user,
+        check_mode,
+    )?;
+    result.changed |= daemon_reload;
+    if daemon_reload && !result.msg.contains("daemon") {
+        result.msg.push_str(if check_mode {
+            "; systemd daemon would be reloaded"
+        } else {
+            "; systemd daemon reloaded"
+        });
+    }
+    Ok(result)
 }
 
 pub fn execute_adhoc(
@@ -308,6 +370,24 @@ pub fn execute_adhoc(
     info!("Opening connection for host: {}", host.name);
     let connection = Connection::connect(host)?;
     execute(
+        connection.as_connection(),
+        args,
+        use_become,
+        become_user,
+        check_mode,
+    )
+}
+
+pub fn execute_systemd_adhoc(
+    host: &Host,
+    args: &Value,
+    use_become: bool,
+    become_user: &str,
+    check_mode: bool,
+) -> Result<ModuleResult> {
+    info!("Opening connection for host: {}", host.name);
+    let connection = Connection::connect(host)?;
+    execute_systemd(
         connection.as_connection(),
         args,
         use_become,
@@ -396,5 +476,54 @@ mod tests {
 
         let result = execute(&connection, &args, false, "", true).unwrap();
         assert!(result.changed);
+    }
+
+    #[test]
+    fn systemd_alias_reloads_manager_before_applying_service_state() {
+        let mut connection = MockSshConnection::new();
+        connection
+            .expect_execute_command()
+            .times(5)
+            .returning(|command| {
+                if command.contains("/run/systemd/system")
+                    || command == "systemctl daemon-reload"
+                    || command.contains("is-active")
+                {
+                    Ok((0, String::new(), String::new()))
+                } else if command.contains("is-enabled") {
+                    Ok((0, "enabled\n".to_string(), String::new()))
+                } else {
+                    panic!("unexpected systemd command: {command}")
+                }
+            });
+        let args: Value = serde_yaml::from_str(
+            "name: demo.service\nstate: started\nenabled: true\ndaemon_reload: true\n",
+        )
+        .unwrap();
+
+        let result = execute_systemd(&connection, &args, false, "root", false).unwrap();
+        assert!(result.changed);
+        assert!(result.msg.contains("daemon"));
+    }
+
+    #[test]
+    fn systemd_alias_rejects_non_systemd_hosts() {
+        let mut connection = MockSshConnection::new();
+        connection
+            .expect_execute_command()
+            .times(3)
+            .returning(|command| {
+                if command.contains("service >/dev/null") {
+                    Ok((0, String::new(), String::new()))
+                } else {
+                    Ok((1, String::new(), String::new()))
+                }
+            });
+        let args: Value = serde_yaml::from_str("name: demo\nstate: started\n").unwrap();
+
+        let error = execute_systemd(&connection, &args, false, "root", false).unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("requires a Linux host running systemd"));
     }
 }

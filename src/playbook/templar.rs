@@ -7,6 +7,7 @@ use tera::{Context as TeraContext, Tera};
 use uuid::Uuid;
 
 const MAX_TEMPLATE_RECURSION: usize = 10;
+pub(crate) const OMIT_SENTINEL: &str = "__rustsible_internal_omit_4f5e7d9b__";
 
 /// Render a string value using Tera templating, handling recursion.
 ///
@@ -271,6 +272,9 @@ pub fn create_tera_context(vars: &HashMap<String, Value>) -> Result<TeraContext>
         })?;
         context.insert(key.clone(), &json_val);
     }
+    // `omit` is an Ansible magic value, not ordinary user data. The task
+    // argument boundary removes this sentinel before module validation.
+    context.insert("omit", OMIT_SENTINEL);
     Ok(context)
 }
 
@@ -324,8 +328,66 @@ fn evaluate_truthiness(value: &Value) -> bool {
 /// Convert Ansible filter syntax to Tera syntax
 /// Converts {{ var | filter('arg') }} to {{ var | filter(arg='arg') }}
 fn convert_ansible_to_tera_syntax(input: &str) -> String {
-    let converted = convert_filter_calls(input, "password_hash", &["hash_type", "salt"]);
-    convert_filter_calls(&converted, "selectattr", &["key", "test", "value"])
+    let converted = convert_inline_conditional(input).unwrap_or_else(|| input.to_string());
+    let converted = convert_filter_calls(&converted, "password_hash", &["hash_type", "salt"]);
+    let converted = convert_filter_calls(&converted, "selectattr", &["key", "test", "value"]);
+    convert_filter_calls(&converted, "default", &["value"])
+}
+
+/// Translate Ansible/Jinja's `value if condition else fallback` expression to
+/// a Tera block. Only a complete interpolation is rewritten, so ordinary text
+/// containing those words cannot be changed accidentally.
+fn convert_inline_conditional(input: &str) -> Option<String> {
+    let trimmed = input.trim();
+    let expression = trimmed.strip_prefix("{{")?.strip_suffix("}}")?.trim();
+    let if_index = find_top_level_token(expression, " if ", 0)?;
+    let else_index = find_top_level_token(expression, " else ", if_index + 4)?;
+    let truthy = expression[..if_index].trim();
+    let condition = expression[if_index + 4..else_index].trim();
+    let fallback = expression[else_index + 6..].trim();
+    if truthy.is_empty() || condition.is_empty() || fallback.is_empty() {
+        return None;
+    }
+    Some(format!(
+        "{{% if {condition} %}}{{{{ {truthy} }}}}{{% else %}}{{{{ {fallback} }}}}{{% endif %}}"
+    ))
+}
+
+fn find_top_level_token(input: &str, token: &str, start: usize) -> Option<usize> {
+    let mut quote = None;
+    let mut escaped = false;
+    let mut nesting = 0usize;
+    for (index, character) in input.char_indices() {
+        if index < start {
+            continue;
+        }
+        if escaped {
+            escaped = false;
+            continue;
+        }
+        if quote.is_some() && character == '\\' {
+            escaped = true;
+            continue;
+        }
+        if matches!(character, '\'' | '"') {
+            if quote == Some(character) {
+                quote = None;
+            } else if quote.is_none() {
+                quote = Some(character);
+            }
+            continue;
+        }
+        if quote.is_some() {
+            continue;
+        }
+        match character {
+            '(' | '[' | '{' => nesting += 1,
+            ')' | ']' | '}' => nesting = nesting.saturating_sub(1),
+            _ if nesting == 0 && input[index..].starts_with(token) => return Some(index),
+            _ => {}
+        }
+    }
+    None
 }
 
 /// Tera requires named filter arguments while Ansible commonly uses positional
@@ -752,6 +814,31 @@ mod tests {
         .unwrap();
 
         assert_eq!(result, Value::String("fallback".to_string()));
+    }
+
+    #[test]
+    fn ansible_default_omit_and_inline_conditionals_render() {
+        let mut tera = create_test_tera();
+        let vars = HashMap::from([(
+            "ansible_architecture".to_string(),
+            Value::String("arm64".to_string()),
+        )]);
+        let context = create_test_context_from_map(&vars);
+
+        assert_eq!(
+            render_value("{{ missing | default(omit) }}", &mut tera, &context, false,).unwrap(),
+            Value::String(OMIT_SENTINEL.to_string())
+        );
+        assert_eq!(
+            render_value(
+                "{{ 'aarch64' if ansible_architecture in ['aarch64', 'arm64'] else 'x86_64' }}",
+                &mut tera,
+                &context,
+                false,
+            )
+            .unwrap(),
+            Value::String("aarch64".to_string())
+        );
     }
 
     #[test]

@@ -266,6 +266,7 @@ pub fn execute(
         } else {
             format!("File {} is already in the requested state", path)
         },
+        values: Default::default(),
     })
 }
 
@@ -495,5 +496,109 @@ mod tests {
         assert!(result.changed);
         assert_eq!(fs::read_to_string(temporary.path()).unwrap(), "before\n");
         assert!(!std::path::Path::new(&backup).exists());
+    }
+
+    #[test]
+    fn insertion_positions_and_absence_validation_match_ansible_edges() {
+        for (after, before, expected) in [
+            (Some("EOF"), None, "a\nb\nnew\n"),
+            (Some("^a$"), None, "a\nnew\nb\n"),
+            (Some("missing"), None, "a\nb\nnew\n"),
+            (None, Some("BOF"), "new\na\nb\n"),
+            (None, Some("^b$"), "a\nnew\nb\n"),
+            (None, Some("missing"), "a\nb\nnew\n"),
+        ] {
+            let mut content = "a\nb\n".to_string();
+            assert!(process_line_modifications(
+                &mut content,
+                Some("new".to_string()),
+                None,
+                "present",
+                after.map(str::to_string),
+                before.map(str::to_string),
+            )
+            .unwrap());
+            assert_eq!(content, expected);
+        }
+
+        for (state, line, regexp) in [
+            ("present", None, None),
+            ("absent", None, None),
+            ("invalid", Some("x".to_string()), None),
+            ("present", Some("x".to_string()), Some("[".to_string())),
+        ] {
+            assert!(process_line_modifications(
+                &mut String::new(),
+                line,
+                regexp,
+                state,
+                None,
+                None,
+            )
+            .is_err());
+        }
+        assert!(insert_line(&mut vec![], "x", Some("["), None).is_err());
+        assert!(insert_line(&mut vec![], "x", None, Some("[")).is_err());
+    }
+
+    #[test]
+    fn lineinfile_creates_updates_backs_up_and_removes_lines_locally() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("config");
+        let connection = Connection::connect(&Host::new("localhost")).unwrap();
+        let create = serde_yaml::from_str(&format!(
+            "path: {}\nline: first\ncreate: true\nmode: '0600'",
+            path.display()
+        ))
+        .unwrap();
+        assert!(
+            execute(connection.as_connection(), &create, false, "root", false)
+                .unwrap()
+                .changed
+        );
+        assert_eq!(fs::read_to_string(&path).unwrap(), "first\n");
+
+        let replace = serde_yaml::from_str(&format!(
+            "path: {}\nline: second\nregexp: '^first$'\nbackup: true",
+            path.display()
+        ))
+        .unwrap();
+        assert!(
+            execute(connection.as_connection(), &replace, false, "root", false)
+                .unwrap()
+                .changed
+        );
+        assert_eq!(fs::read_to_string(&path).unwrap(), "second\n");
+        assert_eq!(
+            fs::read_to_string(format!("{}.backup", path.display())).unwrap(),
+            "first\n"
+        );
+
+        let absent = serde_yaml::from_str(&format!(
+            "path: {}\nline: second\nstate: absent",
+            path.display()
+        ))
+        .unwrap();
+        assert!(
+            execute(connection.as_connection(), &absent, false, "root", false)
+                .unwrap()
+                .changed
+        );
+        assert_eq!(fs::read_to_string(path).unwrap(), "");
+    }
+
+    #[test]
+    fn lineinfile_rejects_conflicting_and_invalid_file_requests() {
+        let connection = Connection::connect(&Host::new("localhost")).unwrap();
+        for input in [
+            "path: /tmp/a\nline: x\ninsertafter: EOF\ninsertbefore: BOF",
+            "path: /tmp/a\nline: x\nstate: invalid",
+            "path: /definitely/missing\nline: x",
+            "path: /tmp/a\nline: x\nmode: '0999'",
+            "path: /tmp/a\nline: x\nowner: ''",
+        ] {
+            let args = serde_yaml::from_str(input).unwrap();
+            assert!(execute(connection.as_connection(), &args, false, "root", false).is_err());
+        }
     }
 }

@@ -45,7 +45,7 @@ impl TaskResult {
     }
 
     pub fn from_module_result(host: &str, module_result: ModuleResult) -> Self {
-        let mut values = HashMap::new();
+        let mut values = module_result.values;
         insert_output_values(
             &mut values,
             module_result.stdout,
@@ -592,6 +592,13 @@ impl Task {
                     check_mode,
                 )?
             }
+            "get_url" => crate::modules::get_url::execute(
+                connection,
+                &Value::Mapping(resolved_args),
+                self.is_become,
+                &become_user,
+                check_mode,
+            )?,
             "template" => {
                 debug!("Executing template module");
 
@@ -646,6 +653,21 @@ impl Task {
                     check_mode,
                 )?
             }
+            "setup" => crate::modules::setup::execute(connection, self.is_become, &become_user)?,
+            "stat" => crate::modules::stat::execute(
+                connection,
+                &Value::Mapping(resolved_args),
+                self.is_become,
+                &become_user,
+                check_mode,
+            )?,
+            "systemd" | "systemd_service" => crate::modules::service::execute_systemd(
+                connection,
+                &Value::Mapping(resolved_args),
+                self.is_become,
+                &become_user,
+                check_mode,
+            )?,
             "lineinfile" => crate::modules::lineinfile::execute(
                 connection,
                 &Value::Mapping(resolved_args),
@@ -681,9 +703,14 @@ impl Task {
                 | "debug"
                 | "copy"
                 | "file"
+                | "get_url"
                 | "template"
                 | "package"
                 | "service"
+                | "setup"
+                | "stat"
+                | "systemd"
+                | "systemd_service"
                 | "lineinfile"
                 | "user"
         )
@@ -834,6 +861,13 @@ impl Task {
                         error
                     )
                 })?;
+
+            if matches!(
+                &rendered_value,
+                Value::String(value) if value == crate::playbook::templar::OMIT_SENTINEL
+            ) {
+                continue;
+            }
 
             resolved.insert(Value::String(key.clone()), rendered_value.clone());
 
@@ -1710,6 +1744,26 @@ mod tests {
             resolved.get(Value::String("_var_value".to_string())),
             Some(&Value::Number(42.into()))
         );
+    }
+
+    #[test]
+    fn resolve_args_removes_default_omit_parameters() {
+        let vars = HashMap::new();
+        let context = crate::playbook::templar::create_tera_context(&vars).unwrap();
+        let mut tera = Tera::default();
+        let mut task = create_test_task();
+        task.module = "get_url".to_string();
+        task.args = mapping(&[
+            ("url", Value::String("http://example.invalid/file".into())),
+            ("dest", Value::String("/tmp/file".into())),
+            (
+                "checksum",
+                Value::String("{{ missing_checksum | default(omit) }}".into()),
+            ),
+        ]);
+
+        let resolved = task.resolve_args(&mut tera, &context, &vars).unwrap();
+        assert!(!resolved.contains_key(Value::String("checksum".to_string())));
     }
 
     #[test]
