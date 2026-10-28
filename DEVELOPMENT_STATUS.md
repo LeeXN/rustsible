@@ -13,7 +13,7 @@
 | 16–19 常用模块与 CLI | 未实现 | 第三阶段 |
 | 20–22 Vault、扩展与发布验收 | 未实现 | 第四阶段 |
 
-当前验证包括 fmt、Clippy、全量测试、85.12% 行覆盖率、release 构建；真实 x86_64 SSH 的 deploy/root/app、check 前后业务状态一致、幂等、facts/register、权限/属主和清理；固定 ansible-core 2.21.0 的模板及条件对照。普通 Cargo 测试与参考环境分开。依赖审计保留既有 unsafe-libyaml 停止维护警告。
+当前验证包括 fmt、Clippy、全量测试、85.17% 行覆盖率、release 构建；真实 x86_64 SSH 的 deploy/root/app、check 前后业务状态一致、幂等、facts/register、权限/属主和清理；固定 ansible-core 2.21.0 的模板及条件对照。普通 Cargo 测试与参考环境分开。依赖审计保留既有 unsafe-libyaml 停止维护警告。
 
 尚无原生 worker 或离线发布包。setup/stat/get_url 仍依赖目标端 Python；未完成无 Python、musl、真实 systemd 或最终发布包验收。
 

@@ -36,6 +36,10 @@ docker exec "$container" sh -eu -c '
         done
     done
 '
+controller_arch=$(uname -m)
+target_arch=$(docker exec "$container" uname -m)
+case "$controller_arch" in x86_64|aarch64) ;; *) echo 'Unsupported acceptance architecture' >&2; exit 1;; esac
+[[ $target_arch == "$controller_arch" ]] || { echo 'SSH fixture must run on the native architecture' >&2; exit 1; }
 port=$(docker port "$container" 22/tcp)
 port=${port##*:}
 for _ in {1..100}; do
@@ -85,7 +89,7 @@ cat > "$fixture_dir/playbook.yml" <<'EOF'
     ansible_host: 127.0.0.1
   tasks:
     - copy:
-        content: '{{ identity.stdout | trim }}:{{ ansible_system }}'
+        content: '{{ identity.stdout | trim }}:{{ ansible_system }}:{{ ansible_architecture }}'
         dest: /srv/rustsible/{{ inventory_hostname }}/identity
 EOF
 snapshot() {
@@ -117,10 +121,11 @@ if "$binary" playbook "$fixture_dir/unsafe-parent.yml" -i "$fixture_dir/inventor
 fi
 grep -q 'Unsafe destination directory owner' "$fixture_dir/unsafe-parent.log"
 docker exec "$container" sh -eu -c '
+    expected_arch=$(uname -m)
     for pair in plain:deploy root:root app:app; do
         name=${pair%:*}; user=${pair#*:}; base=/srv/rustsible/$name
         [ "$(cat "$base/executable")" = replacement ]
-        [ "$(cat "$base/identity")" = "$user:Linux" ]
+        [ "$(cat "$base/identity")" = "$user:Linux:$expected_arch" ]
         [ "$(cat "$base/download")" = original ]
         grep -qx appended "$base/lines"
         for file in executable lines download; do
@@ -130,4 +135,4 @@ docker exec "$container" sh -eu -c '
     done
     [ -z "$(find /srv/rustsible -name ".rustsible-*")" ]
 '
-printf 'SSH acceptance passed: deploy, root become, app become; check, idempotency, facts/register, bytes/mode/owner, cleanup\n'
+printf 'SSH acceptance passed (%s -> %s): deploy, root become, app become; check, idempotency, facts/register, bytes/mode/owner, cleanup\n' "$controller_arch" "$target_arch"

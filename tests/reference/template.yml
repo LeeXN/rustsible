@@ -13,6 +13,9 @@
     - copy:
         content: '{{ true | string }}'
         dest: '@OUTPUT@/boolean-text'
+    - copy:
+        content: ' {{ number_string }} '
+        dest: '@OUTPUT@/spaced-text'
     - template:
         src: input.j2
         dest: '@OUTPUT@/template'

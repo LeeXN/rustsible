@@ -40,7 +40,7 @@ pub(crate) fn render_value(
     context: &TemplateContext,
     force_string: bool,
 ) -> Result<Value> {
-    let source = input.trim();
+    let source = input;
     if !force_string && source.starts_with("{{") && source.ends_with("}}") {
         // Use the engine's AST instead of guessing where quotes or braces end.
         // The standalone lexer in 3.0.4 panics on mixed templates. Pin the
@@ -269,6 +269,8 @@ mod tests {
             ("{{ literal }}", Value::String("{{ untrusted }}".into())),
             ("{{ true }}", Value::Bool(true)),
             ("{{ 12 }}", Value::Number(12.into())),
+            (" {{ 12 }} ", Value::String(" 12 ".into())),
+            ("{{ 12 }}\n", Value::String("12\n".into())),
             ("{{- 12 -}}", Value::Number(12.into())),
             (
                 "{{ [1, 2] }}",

@@ -96,7 +96,8 @@ original=$(snapshot)
         }
     }
     command.push_str(
-        r#"umask 077
+        r#"original_umask=$(umask)
+umask 077
 staging=$(mktemp -d ./.rustsible-write.XXXXXXXXXX)
 trap 'rm -rf -- "$staging"' EXIT
 trap 'exit 1' HUP INT TERM
@@ -109,7 +110,7 @@ cat > "$temporary"
         r#"if [ "$original" != absent ]; then
     cp --attributes-only --preserve=ownership --dereference -- "$target" "$temporary"
 else
-    chmod 0644 -- "$temporary"
+    chmod -- "$(printf '%o' "$((0666 & ~0$original_umask))")" "$temporary"
 fi
 "#,
     );
@@ -333,6 +334,23 @@ mod tests {
         )
         .unwrap();
         assert_eq!(std::fs::read(path).unwrap(), b"replacement");
+    }
+
+    #[test]
+    fn new_file_respects_execution_umask() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("artifact");
+        let command = install_command(path.to_str().unwrap(), FileMetadata::default(), 7).unwrap();
+        let connection = LocalConnection::new(&Host::new("localhost")).unwrap();
+        let (code, _, stderr) = connection
+            .execute_command_with_input(
+                &format!("umask 077; sh -c {}", shell_quote(&command)),
+                b"private",
+            )
+            .unwrap();
+        assert_eq!(code, 0, "{stderr}");
+        assert_eq!(std::fs::read(&path).unwrap(), b"private");
+        assert_eq!(std::fs::metadata(path).unwrap().mode() & 0o777, 0o600);
     }
 
     #[test]

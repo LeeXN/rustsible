@@ -74,6 +74,7 @@ if checksum is not None:
 # Pin relative filesystem operations to the selected directory. A renamed
 # ancestor must not redirect later metadata or temporary-file operations.
 display_dest = dest
+creation_umask = os.umask(0o077)
 directory = os.path.dirname(dest) or "."
 dest = os.path.basename(dest)
 if not dest or dest in (".", ".."):
@@ -148,7 +149,7 @@ with tempfile.TemporaryDirectory(prefix=".rustsible-get-url-", dir=directory) as
         if existing:
             for name in os.listxattr(dest):
                 os.setxattr(temporary, name, os.getxattr(dest, name))
-        os.chmod(temporary, mode if mode is not None else (stat.S_IMODE(original.st_mode) if existing else 0o644))
+        os.chmod(temporary, mode if mode is not None else (stat.S_IMODE(original.st_mode) if existing else (0o666 & ~creation_umask)))
         with open(temporary, "rb") as prepared:
             os.fsync(prepared.fileno())
         current = snapshot()
@@ -412,6 +413,30 @@ mod tests {
             .contains("Unsafe destination directory"));
         assert_eq!(std::fs::read(path).unwrap(), b"original");
         assert_eq!(std::fs::read_dir(directory.path()).unwrap().count(), 1);
+    }
+
+    #[test]
+    fn new_download_respects_execution_umask() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("artifact");
+        let (url, server) = http_response(b"hello", None);
+        let args = serde_yaml::to_value(serde_json::json!({"url": url, "dest": path})).unwrap();
+        let mut connection = MockSshConnection::new();
+        connection
+            .expect_execute_command_with_input()
+            .once()
+            .returning(|command, input| {
+                let local = LocalConnection::new(&Host::new("localhost"))?;
+                local.execute_command_with_input(&format!("umask 077; {command}"), input)
+            });
+        assert!(
+            execute(&connection, &args, false, "root", false)
+                .unwrap()
+                .changed
+        );
+        server.join().unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), b"hello");
+        assert_eq!(std::fs::metadata(path).unwrap().mode() & 0o777, 0o600);
     }
 
     #[test]
