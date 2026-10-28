@@ -34,11 +34,62 @@ pub struct Play {
 
 #[derive(Debug, Default)]
 struct HostStats {
+    unreachable: usize,
     ok: usize,
     changed: usize,
     failed: usize,
     skipped: usize,
     ignored: usize,
+}
+
+/// Only host runtime data survives plays. Scoped inventory/play/task overlays
+/// are rebuilt each time, so persisting a register never leaks play variables.
+#[derive(Debug, Default)]
+pub(crate) struct RunState {
+    variables: HashMap<String, HashMap<String, Value>>,
+    excluded: HashSet<String>,
+    stats: HashMap<String, HostStats>,
+}
+
+impl RunState {
+    pub(crate) fn print_recap(&self) {
+        println!("\n{}", "PLAY RECAP".bold());
+        let mut names: Vec<_> = self.stats.keys().collect();
+        names.sort();
+        for name in names {
+            let stats = &self.stats[name];
+            println!(
+                "{:<30} : ok={} changed={} unreachable={} failed={} skipped={} ignored={}",
+                name,
+                stats.ok,
+                stats.changed,
+                stats.unreachable,
+                stats.failed,
+                stats.skipped,
+                stats.ignored,
+            );
+        }
+    }
+
+    fn merge_result(
+        &mut self,
+        host: &str,
+        task: &Task,
+        result: &TaskResult,
+        context: &mut HashMap<String, Value>,
+    ) -> Result<()> {
+        let persistent = self.variables.entry(host.to_string()).or_default();
+        if !result.failed && !result.skipped && result.values.contains_key("ansible_facts") {
+            Play::merge_facts(persistent, result)?;
+            Play::merge_facts(context, result)?;
+        }
+        if let Some(register) = &task.register {
+            let value = Play::registered_value(result);
+            persistent.insert(register.clone(), value.clone());
+            context.insert(register.clone(), value);
+        }
+        Ok(())
+    }
 }
 
 impl Play {
@@ -51,6 +102,19 @@ impl Play {
         hosts: &[Host],
         check_mode: bool,
         forks: usize,
+    ) -> Result<()> {
+        let mut state = RunState::default();
+        let result = self.execute_in_run(hosts, check_mode, forks, &mut state);
+        state.print_recap();
+        result
+    }
+
+    pub(crate) fn execute_in_run(
+        &self,
+        hosts: &[Host],
+        check_mode: bool,
+        forks: usize,
+        state: &mut RunState,
     ) -> Result<()> {
         if forks == 0 {
             bail!(
@@ -76,13 +140,27 @@ impl Play {
 
         let mut contexts: HashMap<String, HashMap<String, Value>> = hosts
             .iter()
-            .map(|host| (host.name.clone(), self.initial_host_vars(host)))
+            .map(|host| {
+                let mut vars = self.initial_host_vars(host);
+                if let Some(persistent) = state.variables.get(&host.name) {
+                    vars.extend(persistent.clone());
+                }
+                (host.name.clone(), vars)
+            })
             .collect();
-        let mut active_hosts: HashSet<String> =
-            hosts.iter().map(|host| host.name.clone()).collect();
+        let mut active_hosts: HashSet<String> = hosts
+            .iter()
+            .filter(|host| !state.excluded.contains(&host.name))
+            .map(|host| host.name.clone())
+            .collect();
         let mut stats: HashMap<String, HostStats> = hosts
             .iter()
-            .map(|host| (host.name.clone(), HostStats::default()))
+            .map(|host| {
+                (
+                    host.name.clone(),
+                    state.stats.remove(&host.name).unwrap_or_default(),
+                )
+            })
             .collect();
         let mut failures = Vec::new();
         let mut notified_handlers: HashSet<(String, String)> = HashSet::new();
@@ -113,7 +191,10 @@ impl Play {
             let gathering_results = Self::execute_task_on_hosts(
                 self,
                 &gather_task,
-                hosts.iter().collect(),
+                hosts
+                    .iter()
+                    .filter(|host| active_hosts.contains(&host.name))
+                    .collect(),
                 &contexts,
                 check_mode,
                 forks,
@@ -139,7 +220,9 @@ impl Play {
                     let merge_result = contexts
                         .get_mut(&host.name)
                         .context("Internal play state lost a fact context")
-                        .and_then(|context| Self::merge_facts(context, &result));
+                        .and_then(|context| {
+                            state.merge_result(&host.name, &gather_task, &result, context)
+                        });
                     if let Err(error) = merge_result {
                         result.failed = true;
                         result.msg = error.to_string();
@@ -150,8 +233,13 @@ impl Play {
                     .get_mut(&host.name)
                     .context("Internal play state lost fact-gathering statistics")?;
                 if result.failed {
-                    host_stats.failed += 1;
+                    if result.unreachable {
+                        host_stats.unreachable += 1;
+                    } else {
+                        host_stats.failed += 1;
+                    }
                     active_hosts.remove(&host.name);
+                    state.excluded.insert(host.name.clone());
                     failures.push(format!(
                         "Task 'Gathering Facts' failed on host '{}': {}",
                         host.name, result.msg
@@ -227,17 +315,10 @@ impl Play {
                     }
                 };
 
-                if let Some(register_var) = &effective_task.register {
-                    let host_context = contexts
-                        .get_mut(&host.name)
-                        .with_context(|| {
-                            format!(
-                                "Internal play state error: variable context for host '{}' is missing while registering task '{}'",
-                                host.name, effective_task.name
-                            )
-                        })?;
-                    host_context.insert(register_var.clone(), Self::registered_value(&result));
-                }
+                let host_context = contexts
+                    .get_mut(&host.name)
+                    .context("Internal play state lost a task context")?;
+                state.merge_result(&host.name, &effective_task, &result, host_context)?;
 
                 if result.changed && !result.failed {
                     for handler_name in &effective_task.notify {
@@ -258,11 +339,16 @@ impl Play {
                         )
                     })?;
                 if result.failed {
-                    if effective_task.ignore_errors {
+                    if effective_task.ignore_errors && !result.unreachable {
                         host_stats.ignored += 1;
                     } else {
-                        host_stats.failed += 1;
+                        if result.unreachable {
+                            host_stats.unreachable += 1;
+                        } else {
+                            host_stats.failed += 1;
+                        }
                         active_hosts.remove(&host.name);
+                        state.excluded.insert(host.name.clone());
                         let failure_message = if effective_task.no_log {
                             "output censored because no_log is enabled"
                         } else {
@@ -329,8 +415,29 @@ impl Play {
                     debug!("Running handler '{}' on host '{}'", handler_name, host.name);
 
                     let failed_message = match handler_result {
-                        Ok(result) if result.failed => Some(result.msg),
+                        Ok(result) if result.failed => {
+                            if result.unreachable {
+                                stats
+                                    .get_mut(&host.name)
+                                    .context("Missing handler statistics")?
+                                    .unreachable += 1;
+                            } else {
+                                stats
+                                    .get_mut(&host.name)
+                                    .context("Missing handler statistics")?
+                                    .failed += 1;
+                            }
+                            Some(result.msg)
+                        }
                         Ok(result) => {
+                            state.merge_result(
+                                &host.name,
+                                &effective_handler,
+                                &result,
+                                contexts
+                                    .get_mut(&host.name)
+                                    .context("Missing handler context")?,
+                            )?;
                             let host_stats = stats
                                 .get_mut(&host.name)
                                 .with_context(|| {
@@ -349,7 +456,13 @@ impl Play {
                             }
                             None
                         }
-                        Err(error) => Some(error.to_string()),
+                        Err(error) => {
+                            stats
+                                .get_mut(&host.name)
+                                .context("Missing handler statistics")?
+                                .failed += 1;
+                            Some(error.to_string())
+                        }
                     };
 
                     if let Some(message) = failed_message {
@@ -364,16 +477,8 @@ impl Play {
                                 handler_name, host.name, message
                             );
                         }
-                        let host_stats = stats
-                            .get_mut(&host.name)
-                            .with_context(|| {
-                                format!(
-                                    "Internal play state error: statistics for host '{}' are missing after handler '{}' failed",
-                                    host.name, handler_name
-                                )
-                            })?;
-                        host_stats.failed += 1;
                         active_hosts.remove(&host.name);
+                        state.excluded.insert(host.name.clone());
                         let failure_message = if effective_handler.no_log {
                             "output censored because no_log is enabled"
                         } else {
@@ -393,33 +498,7 @@ impl Play {
 
         info!("Play '{}' completed in {}", self.name, execution_time);
 
-        println!("\n{}", "PLAY RECAP".bold());
-        println!("{}", "*".repeat(80).dimmed());
-
-        let average_seconds = if hosts.is_empty() {
-            0.0
-        } else {
-            elapsed.as_secs_f64() / hosts.len() as f64
-        };
-        for host in hosts {
-            let host_stats = stats.get(&host.name).with_context(|| {
-                format!(
-                    "Internal play state error: statistics for host '{}' are missing during recap",
-                    host.name
-                )
-            })?;
-            let host_attrs = [
-                format!("{}={}", "ok".green().bold(), host_stats.ok),
-                format!("{}={}", "changed".yellow().bold(), host_stats.changed),
-                format!("{}={}", "failed".red().bold(), host_stats.failed),
-                format!("{}={}", "skipped".yellow().bold(), host_stats.skipped),
-                format!("ignored={}", host_stats.ignored),
-                format!("{}={:.2}s", "time".cyan(), average_seconds),
-            ];
-
-            println!("{:<30} : {}", host.name.bold(), host_attrs.join("  "));
-        }
-
+        state.stats.extend(stats);
         println!("\nPlay execution completed in {}", execution_time);
 
         if failures.is_empty() {
@@ -518,10 +597,6 @@ impl Play {
             }
         }
         vars.insert(
-            "ansible_hostname".to_string(),
-            Value::String(host.hostname.clone()),
-        );
-        vars.insert(
             "inventory_hostname".to_string(),
             Value::String(host.name.clone()),
         );
@@ -539,7 +614,13 @@ impl Play {
             .get("ansible_facts")
             .and_then(Value::as_mapping)
             .context("Fact gathering did not return ansible_facts")?;
-        context.insert("ansible_facts".to_string(), Value::Mapping(facts.clone()));
+        let mut merged = context
+            .get("ansible_facts")
+            .and_then(Value::as_mapping)
+            .cloned()
+            .unwrap_or_default();
+        merged.extend(facts.clone());
+        context.insert("ansible_facts".to_string(), Value::Mapping(merged));
         for (key, value) in facts {
             let Value::String(key) = key else {
                 bail!("Fact names must be strings");
@@ -558,6 +639,10 @@ impl Play {
         value.insert(
             Value::String("failed".to_string()),
             Value::Bool(result.failed),
+        );
+        value.insert(
+            Value::String("unreachable".to_string()),
+            Value::Bool(result.unreachable),
         );
         value.insert(
             Value::String("skipped".to_string()),

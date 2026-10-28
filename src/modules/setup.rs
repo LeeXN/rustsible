@@ -8,6 +8,8 @@ use crate::modules::ModuleResult;
 use crate::ssh::connection::{Connection, SshConnection};
 
 const SETUP_SCRIPT: &str = r#"import json
+import datetime
+import time
 import platform
 import sys
 
@@ -21,10 +23,20 @@ architecture = {
     "arm64": "aarch64",
 }.get(machine, machine)
 
+now = datetime.datetime.now().astimezone()
 print(json.dumps({
     "ansible_facts": {
         "architecture": architecture,
         "system": "Linux",
+        "date_time": {
+            "date": now.strftime("%Y-%m-%d"), "time": now.strftime("%H:%M:%S"),
+            "year": now.strftime("%Y"), "month": now.strftime("%m"),
+            "day": now.strftime("%d"), "hour": now.strftime("%H"),
+            "minute": now.strftime("%M"), "second": now.strftime("%S"),
+            "weekday": now.strftime("%A"), "weekday_number": now.strftime("%w"),
+            "epoch": str(int(time.time())),
+            "iso8601": now.astimezone(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+        },
     }
 }))
 "#;
@@ -50,6 +62,13 @@ pub fn execute(
     })
 }
 
+pub(crate) fn validate_args(args: &Value) -> Result<()> {
+    if !args.as_mapping().is_some_and(|mapping| mapping.is_empty()) {
+        anyhow::bail!("Setup does not support arguments in this compatibility scope");
+    }
+    Ok(())
+}
+
 pub fn execute_adhoc(
     host: &Host,
     args: &Value,
@@ -57,9 +76,7 @@ pub fn execute_adhoc(
     become_user: &str,
     _check_mode: bool,
 ) -> Result<ModuleResult> {
-    if !args.as_mapping().is_some_and(|mapping| mapping.is_empty()) {
-        anyhow::bail!("Setup does not support arguments in this compatibility scope");
-    }
+    validate_args(args)?;
     let connection = Connection::connect(host)?;
     execute(connection.as_connection(), use_become, become_user)
 }

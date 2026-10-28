@@ -1,0 +1,18 @@
+---
+- name: Collect a reusable result
+  hosts: all
+  gather_facts: false
+  tasks:
+    - name: Gather facts explicitly
+      ansible.builtin.setup: {}
+    - name: Read the target hostname
+      ansible.builtin.command: hostname
+      register: target_name
+
+- name: Use runtime data from the previous play
+  hosts: all
+  gather_facts: false
+  tasks:
+    - name: Show the collected result and target architecture
+      ansible.builtin.debug:
+        msg: "{{ target_name.stdout }} runs {{ ansible_facts.architecture }}"
