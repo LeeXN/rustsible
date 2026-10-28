@@ -490,7 +490,22 @@ fn parse_port(value: &str) -> Result<u16> {
     Ok(port)
 }
 
-fn validate_connection_variable(key: &str, value: &str, line_number: usize) -> Result<()> {
+pub(crate) fn validate_connection_variable(
+    key: &str,
+    value: &str,
+    line_number: usize,
+) -> Result<()> {
+    if value.contains("{{") || value.contains("{%") {
+        return Ok(());
+    }
+    validate_resolved_connection_variable(key, value, line_number)
+}
+
+pub(crate) fn validate_resolved_connection_variable(
+    key: &str,
+    value: &str,
+    line_number: usize,
+) -> Result<()> {
     if matches!(key, "ansible_port" | "ansible_ssh_port") {
         parse_port(value).with_context(|| {
             if line_number == 0 {
@@ -553,7 +568,14 @@ fn validate_connection_variable(key: &str, value: &str, line_number: usize) -> R
     Ok(())
 }
 
-fn validate_yaml_connection_variable(key: &str, value: &Value) -> Result<()> {
+pub(crate) fn validate_yaml_connection_variable(key: &str, value: &Value) -> Result<()> {
+    if matches!(value, Value::String(value) if value.contains("{{") || value.contains("{%")) {
+        return Ok(());
+    }
+    validate_resolved_yaml_connection_variable(key, value)
+}
+
+pub(crate) fn validate_resolved_yaml_connection_variable(key: &str, value: &Value) -> Result<()> {
     let string_variables = [
         "ansible_host",
         "ansible_ssh_host",
@@ -742,18 +764,28 @@ ansible_ssh_pass='test password'
         assert_eq!(inventory.hosts.len(), 2);
         let test1 = inventory.hosts.get("test1.example.com").unwrap();
         assert_eq!(
-            test1.get_variable("greeting").map(String::as_str),
+            test1.get_variable("greeting").and_then(Value::as_str),
             Some("hello world")
         );
         assert_eq!(
-            test1.get_variable("escaped").map(String::as_str),
+            test1.get_variable("escaped").and_then(Value::as_str),
             Some("hello world")
         );
         assert_eq!(
-            test1.get_variable("ansible_ssh_pass").map(String::as_str),
+            test1
+                .get_variable("ansible_ssh_pass")
+                .and_then(Value::as_str),
             Some("test password")
         );
-        assert_eq!(inventory.hosts.get("test2.example.com").unwrap().port, 2222);
+        assert_eq!(
+            inventory
+                .hosts
+                .get("test2.example.com")
+                .unwrap()
+                .port()
+                .unwrap(),
+            2222
+        );
     }
 
     #[test]
@@ -814,26 +846,23 @@ all:
 
         let inventory = parse_inventory(file.path().to_str().unwrap()).unwrap();
         let web1 = inventory.hosts.get("web1").unwrap();
-        assert_eq!(web1.hostname, "gateway.example.com");
-        assert_eq!(web1.port, 2202);
+        assert_eq!(web1.hostname().unwrap(), "gateway.example.com");
+        assert_eq!(web1.port().unwrap(), 2202);
         assert_eq!(
-            web1.get_variable("ansible_user").map(String::as_str),
+            web1.get_variable("ansible_user").and_then(Value::as_str),
             Some("deploy")
         );
         assert_eq!(
-            web1.get_variable("environment").map(String::as_str),
+            web1.get_variable("environment").and_then(Value::as_str),
             Some("production")
         );
         assert_eq!(
-            web1.get_variable("greeting").map(String::as_str),
+            web1.get_variable("greeting").and_then(Value::as_str),
             Some("hello world")
         );
+        assert_eq!(web1.variables.get("enabled"), Some(&Value::Bool(true)));
         assert_eq!(
-            web1.typed_variables.get("enabled"),
-            Some(&Value::Bool(true))
-        );
-        assert_eq!(
-            web1.typed_variables.get("ports"),
+            web1.variables.get("ports"),
             Some(&Value::Sequence(vec![80.into(), 443.into()]))
         );
         assert_eq!(inventory.filter_hosts("production").len(), 2);
@@ -857,11 +886,11 @@ all:
                 "web2.example.com"
             ]
         );
-        assert_eq!(inventory.hosts["db1.example.com"].port, 2222);
+        assert_eq!(inventory.hosts["db1.example.com"].port().unwrap(), 2222);
         assert_eq!(
             inventory.hosts["localhost"]
                 .get_variable("ansible_connection")
-                .map(String::as_str),
+                .and_then(Value::as_str),
             Some("local")
         );
     }

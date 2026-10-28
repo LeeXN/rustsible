@@ -42,6 +42,15 @@ again as templates. Conditions must return booleans; the string `'false'` is
 rejected. Use Jinja positional defaults such as `default([])` rather than the
 former Tera spelling `default(value=[])`. Relative `copy.src` and `template.src`
 paths are anchored to the task's source file, independent of the launch directory.
+
+Inventory host/group variables each use a single typed table. The effective
+order is inventory groups → host → facts → play vars → task vars → registered
+results → loop variables. Connection variables are resolved from that same
+context and override play/task keyword defaults; aliases are normalized within
+each layer. Invalid connection types or port values, unresolved references,
+and variable cycles fail before connecting or modifying a target. Only sudo is
+implemented for become; custom become executables and flags are rejected.
+Ad-hoc CLI become overrides retain their documented Rustsible precedence.
 The compatibility surface currently includes Linux architecture facts,
 `stat.path/checksum_algorithm`, `get_url.url/dest/owner/group/mode/force/checksum`
 (inline `<algorithm>:<digest>` checksums),
@@ -57,7 +66,10 @@ Ownership is applied before mode/ACL/xattr so `chown` cannot silently clear
 set-id bits or extended metadata in the prepared file. Destinations must be
 regular files or absent: symbolic links are rejected. This transitional file
 installer requires GNU coreutils (`cp`, `stat`, `mktemp`, `sync`, `mv`) on targets;
-it fails if protection metadata cannot be preserved.
+it fails if protection metadata cannot be preserved. The transitional installer
+also requires a parent owned by root or the execution identity, and sticky-bit
+protection when a group or other users can write there. Unsafe parents fail
+explicitly; use the directory's owner as the execution identity.
 `get_url` also installs downloads atomically. With `force: false`, an existing
 file is retained without a request unless a supplied checksum differs. Invalid
 mode, identity, and checksum values fail before downloading or replacing files.
@@ -237,6 +249,9 @@ Only the subset exercised by this repository's tests should be considered suppor
 
 ## Development and testing
 
+See [DEVELOPMENT_STATUS.md](DEVELOPMENT_STATUS.md) for the staged plan's
+implemented items, validation evidence, and outstanding work.
+
 The CI-equivalent local checks are:
 
 ```bash
@@ -262,9 +277,9 @@ with strict host-key verification. It checks deploy/root/app execution identitie
 check-mode business-state equality, idempotency, cross-play facts/registers,
 file bytes and metadata, and temporary-file cleanup. The fixture installs Python
 for the current setup/get_url implementation; it is not a no-Python acceptance.
-The proposed native x86_64/aarch64 CI job is in
-[`tests/ssh/ci-workflow.patch`](tests/ssh/ci-workflow.patch). It has not been
-activated: the current GitHub credential lacks permission to change workflows.
+CI runs the quality gates and real SSH fixture on native x86_64 and aarch64
+Linux runners. Results come from the individual CI jobs; configuring a runner
+is not itself evidence that an architecture passed.
 
 `bash tests/reference/run.sh target/debug/rustsible` compares template and
 condition results with **ansible-core 2.21.0**. It uses `uv` to isolate the
@@ -273,8 +288,7 @@ tests. The comparison checks target file bytes, including literal runtime
 output, defaults/omit, loop values, string types, and rejected string conditions.
 
 Dependency advisories are checked in CI against `Cargo.lock`. CI also enforces
-an 80% line-coverage floor; the current all-target result is 81.12%. This is a
-regression baseline, not a claim that every remote SSH path is exercised end to
+an 80% line-coverage floor. This is a regression baseline, not a claim that every remote SSH path is exercised end to
 end.
 
 ## License

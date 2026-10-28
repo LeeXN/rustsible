@@ -12,6 +12,7 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
+use super::config::ConnectionConfig;
 use crate::inventory::Host;
 
 const DEFAULT_SSH_TIMEOUT_SECS: u64 = 10;
@@ -50,6 +51,10 @@ pub enum ConnectionKind {
 /// choice. Bare localhost aliases remain convenient and use the local backend,
 /// while `ansible_connection=ssh` always means SSH (including for localhost).
 pub fn connection_kind(host: &Host) -> Result<ConnectionKind> {
+    connection_kind_config(&ConnectionConfig::from_host(host)?)
+}
+
+fn connection_kind_config(host: &ConnectionConfig) -> Result<ConnectionKind> {
     if let Some(connection) = host
         .get_variable("ansible_connection")
         .or_else(|| host.get_variable("ansible_connection_type"))
@@ -95,21 +100,21 @@ fn parse_inventory_bool(name: &str, value: &str) -> Result<bool> {
     }
 }
 
-fn host_key_checking_enabled(host: &Host) -> Result<bool> {
+fn host_key_checking_enabled(host: &ConnectionConfig) -> Result<bool> {
     for name in [
         "rustsible_host_key_checking",
         "ansible_host_key_checking",
         "ansible_ssh_host_key_checking",
     ] {
         if let Some(value) = host.get_variable(name) {
-            return parse_inventory_bool(name, value);
+            return parse_inventory_bool(name, &value);
         }
     }
 
     Ok(true)
 }
 
-fn ssh_timeout(host: &Host) -> Result<Duration> {
+fn ssh_timeout(host: &ConnectionConfig) -> Result<Duration> {
     let timeout_value = host
         .get_variable("ansible_ssh_timeout")
         .or_else(|| host.get_variable("ansible_timeout"));
@@ -136,7 +141,7 @@ fn ssh_timeout(host: &Host) -> Result<Duration> {
     Ok(Duration::from_millis(millis))
 }
 
-fn command_timeout(host: &Host) -> Result<Duration> {
+fn command_timeout(host: &ConnectionConfig) -> Result<Duration> {
     let timeout_value = host
         .get_variable("rustsible_command_timeout")
         .or_else(|| host.get_variable("ansible_command_timeout"));
@@ -153,7 +158,7 @@ fn command_timeout(host: &Host) -> Result<Duration> {
     Ok(Duration::from_secs(seconds))
 }
 
-fn known_hosts_paths(host: &Host) -> Result<(Vec<PathBuf>, bool)> {
+fn known_hosts_paths(host: &ConnectionConfig) -> Result<(Vec<PathBuf>, bool)> {
     if let Some(path) = host
         .get_variable("rustsible_known_hosts_file")
         .or_else(|| host.get_variable("ansible_ssh_known_hosts_file"))
@@ -161,7 +166,7 @@ fn known_hosts_paths(host: &Host) -> Result<(Vec<PathBuf>, bool)> {
         if path.trim().is_empty() {
             bail!("The configured known_hosts file path cannot be empty");
         }
-        return Ok((vec![PathBuf::from(path)], true));
+        return Ok((vec![PathBuf::from(path.as_ref())], true));
     }
 
     let mut paths = vec![PathBuf::from("/etc/ssh/ssh_known_hosts")];
@@ -183,7 +188,7 @@ fn fingerprint(session: &Session) -> String {
         .unwrap_or_else(|| "unavailable".to_string())
 }
 
-fn verify_host_key(session: &Session, host: &Host) -> Result<()> {
+fn verify_host_key(session: &Session, host: &ConnectionConfig) -> Result<()> {
     if !host_key_checking_enabled(host)? {
         warn!(
             "SSH host key checking is explicitly disabled for {}; this connection is vulnerable to interception",
@@ -619,9 +624,13 @@ pub enum Connection {
 
 impl Connection {
     pub fn connect(host: &Host) -> Result<Self> {
-        match connection_kind(host)? {
-            ConnectionKind::Local => Ok(Self::Local(LocalConnection::new(host)?)),
-            ConnectionKind::Ssh => Ok(Self::Ssh(SshClient::connect(host)?)),
+        Self::from_config(&ConnectionConfig::from_host(host)?)
+    }
+
+    pub(crate) fn from_config(config: &ConnectionConfig) -> Result<Self> {
+        match connection_kind_config(config)? {
+            ConnectionKind::Local => Ok(Self::Local(LocalConnection::from_config(config)?)),
+            ConnectionKind::Ssh => Ok(Self::Ssh(SshClient::from_config(config)?)),
         }
     }
 
@@ -641,16 +650,16 @@ pub struct LocalConnection {
 
 impl LocalConnection {
     pub fn new(host: &Host) -> Result<Self> {
-        if connection_kind(host)? != ConnectionKind::Local {
+        Self::from_config(&ConnectionConfig::from_host(host)?)
+    }
+
+    fn from_config(host: &ConnectionConfig) -> Result<Self> {
+        if connection_kind_config(host)? != ConnectionKind::Local {
             bail!("Host '{}' is not configured for local execution", host.name);
         }
         Ok(Self {
             host: host.name.clone(),
-            sudo_password: host
-                .get_ssh_sudo_password()
-                .map(String::as_str)
-                .unwrap_or("")
-                .to_string(),
+            sudo_password: host.get_ssh_sudo_password().unwrap_or("").to_string(),
             command_timeout: command_timeout(host)?,
         })
     }
@@ -1199,14 +1208,13 @@ impl SshClient {
     }
 
     pub fn connect(host: &Host) -> Result<Self> {
+        Self::from_config(&ConnectionConfig::from_host(host)?)
+    }
+
+    fn from_config(host: &ConnectionConfig) -> Result<Self> {
         info!(
             "Connecting to host: {} ({}:{})",
             host.name, host.hostname, host.port
-        );
-        debug!(
-            "Host has {} direct and {} inherited inventory variable(s); values are not logged",
-            host.variables.len(),
-            host.inherited_variables.len()
         );
 
         if let Some(user) = host.get_ssh_user() {
@@ -1244,11 +1252,8 @@ impl SshClient {
         // Authenticate only after the server identity has been established.
         verify_host_key(&session, host)?;
 
-        let username = host.get_ssh_user().map(String::as_str).unwrap_or("root");
-        let sudo_password = host
-            .get_ssh_sudo_password()
-            .map(String::as_str)
-            .unwrap_or("");
+        let username = host.get_ssh_user().unwrap_or("root");
+        let sudo_password = host.get_ssh_sudo_password().unwrap_or("");
 
         debug!("Using SSH username: {}", username);
         let mut auth_succeeded = false;
@@ -1565,40 +1570,62 @@ mod tests {
     #[test]
     fn host_key_checking_is_strict_by_default_and_explicitly_configurable() {
         let mut host = Host::new("example.com");
-        assert!(host_key_checking_enabled(&host).unwrap());
+        assert!(ConnectionConfig::from_host(&host)
+            .and_then(|config| host_key_checking_enabled(&config))
+            .unwrap());
 
         host.set_variable("ansible_host_key_checking", "false");
-        assert!(!host_key_checking_enabled(&host).unwrap());
+        assert!(!ConnectionConfig::from_host(&host)
+            .and_then(|config| host_key_checking_enabled(&config))
+            .unwrap());
 
         host.set_variable("ansible_host_key_checking", "maybe");
-        assert!(host_key_checking_enabled(&host).is_err());
+        assert!(ConnectionConfig::from_host(&host)
+            .and_then(|config| host_key_checking_enabled(&config))
+            .is_err());
     }
 
     #[test]
     fn ssh_timeout_is_bounded_and_positive() {
         let mut host = Host::new("example.com");
         assert_eq!(
-            ssh_timeout(&host).unwrap(),
+            ConnectionConfig::from_host(&host)
+                .and_then(|config| ssh_timeout(&config))
+                .unwrap(),
             Duration::from_secs(DEFAULT_SSH_TIMEOUT_SECS)
         );
 
         host.set_variable("ansible_ssh_timeout", "3");
-        assert_eq!(ssh_timeout(&host).unwrap(), Duration::from_secs(3));
+        assert_eq!(
+            ConnectionConfig::from_host(&host)
+                .and_then(|config| ssh_timeout(&config))
+                .unwrap(),
+            Duration::from_secs(3)
+        );
 
         host.set_variable("ansible_ssh_timeout", "0");
-        assert!(ssh_timeout(&host).is_err());
+        assert!(ConnectionConfig::from_host(&host)
+            .and_then(|config| ssh_timeout(&config))
+            .is_err());
     }
 
     #[test]
     fn command_timeout_has_a_separate_safe_default() {
         let mut host = Host::new("example.com");
         assert_eq!(
-            command_timeout(&host).unwrap(),
+            ConnectionConfig::from_host(&host)
+                .and_then(|config| command_timeout(&config))
+                .unwrap(),
             Duration::from_secs(DEFAULT_COMMAND_TIMEOUT_SECS)
         );
 
         host.set_variable("ansible_command_timeout", "45");
-        assert_eq!(command_timeout(&host).unwrap(), Duration::from_secs(45));
+        assert_eq!(
+            ConnectionConfig::from_host(&host)
+                .and_then(|config| command_timeout(&config))
+                .unwrap(),
+            Duration::from_secs(45)
+        );
     }
 
     #[test]

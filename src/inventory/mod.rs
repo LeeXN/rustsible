@@ -1,5 +1,5 @@
 pub mod host;
-mod parser;
+pub(crate) mod parser;
 
 use anyhow::{bail, Result};
 pub use host::{Host, HostGroup};
@@ -111,10 +111,8 @@ impl Inventory {
         if log::log_enabled!(log::Level::Debug) {
             for host in &hosts {
                 debug!(
-                    "Matched host: {} ({}:{}) with {} direct and {} inherited variable(s)",
+                    "Matched host: {} with {} direct and {} inherited variable(s)",
                     host.name,
-                    host.hostname,
-                    host.port,
                     host.variables.len(),
                     host.inherited_variables.len()
                 );
@@ -244,15 +242,10 @@ impl Inventory {
         }
 
         if let Some(all_group) = self.groups.get("all") {
-            let mut variables: Vec<_> = all_group.variables.iter().collect();
-            variables.sort_by_key(|(key, _)| *key);
-            let mut typed_variables: Vec<_> = all_group.typed_variables.iter().collect();
-            typed_variables.sort_by_key(|(key, _)| *key);
+            let mut variables = HashMap::new();
+            host::merge_variable_layer(&mut variables, &all_group.variables);
             for host in self.hosts.values_mut() {
                 for (key, value) in &variables {
-                    host.add_inherited_variable(key, value);
-                }
-                for (key, value) in &typed_variables {
                     host.add_typed_inherited_variable(key, value);
                 }
             }
@@ -278,18 +271,13 @@ impl Inventory {
             let Some(group) = self.groups.get(&group_name) else {
                 continue;
             };
-            let mut variables: Vec<_> = group.variables.iter().collect();
-            variables.sort_by_key(|(key, _)| *key);
-            let mut typed_variables: Vec<_> = group.typed_variables.iter().collect();
-            typed_variables.sort_by_key(|(key, _)| *key);
+            let mut variables = HashMap::new();
+            host::merge_variable_layer(&mut variables, &group.variables);
             let mut members: Vec<String> = members.into_iter().collect();
             members.sort();
             for host_name in members {
                 if let Some(host) = self.hosts.get_mut(&host_name) {
                     for (key, value) in &variables {
-                        host.add_inherited_variable(key, value);
-                    }
-                    for (key, value) in &typed_variables {
                         host.add_typed_inherited_variable(key, value);
                     }
                 }
@@ -466,8 +454,12 @@ mod tests {
 
         inventory.apply_group_vars();
         let host = inventory.hosts.get("node").unwrap();
-        assert_eq!(host.get_variable("tier").map(String::as_str), Some("child"));
-        assert_eq!(host.hostname, "parent.example");
-        assert_eq!(host.port, 2222);
+        assert_eq!(
+            host.get_variable("tier")
+                .and_then(serde_yaml::Value::as_str),
+            Some("child")
+        );
+        assert_eq!(host.hostname().unwrap(), "parent.example");
+        assert_eq!(host.port().unwrap(), 2222);
     }
 }

@@ -23,6 +23,9 @@ pub(crate) fn install_command(
     if path.is_empty() || path.contains('\0') {
         bail!("File destination must be a non-empty path without NUL bytes");
     }
+    if path.ends_with('/') || path.ends_with("/.") || path.ends_with("/..") {
+        bail!("File destination must identify a regular filename");
+    }
     let path = Path::new(path);
     let name = path
         .file_name()
@@ -49,10 +52,23 @@ pub(crate) fn install_command(
         }) {
             bail!("File {kind} must be a non-empty name or numeric ID without colons or control characters");
         }
+        if let Some(value) = value.filter(|value| value.bytes().all(|byte| byte.is_ascii_digit())) {
+            if value.parse::<u32>().map_or(true, |id| id == u32::MAX) {
+                bail!("Numeric file {kind} must be between 0 and 4294967294");
+            }
+        }
     }
     let mut command = format!(
         r#"set -eu
 cd -- {parent}
+directory_uid=$(stat -c %u .)
+directory_mode=$(stat -c %a .)
+if [ "$directory_uid" != 0 ] && [ "$directory_uid" != "$(id -u)" ]; then
+    echo 'Unsafe destination directory owner; execute as its owner' >&2; exit 1
+fi
+if [ $((0$directory_mode & 0022)) != 0 ] && [ $((0$directory_mode & 01000)) = 0 ]; then
+    echo 'Unsafe destination directory: writable staging entries need the sticky bit' >&2; exit 1
+fi
 target={target}
 snapshot() {{
     if [ -L "$target" ]; then echo 'Refusing to replace a symbolic link' >&2; return 1; fi
@@ -70,7 +86,7 @@ original=$(snapshot)
     );
     for (variable, value, lookup) in [
         ("uid", metadata.owner, "id -u --"),
-        ("gid", metadata.group, "getent group"),
+        ("gid", metadata.group, "getent -- group"),
     ] {
         if let Some(value) = value {
             if value.bytes().all(|byte| byte.is_ascii_digit()) {
@@ -83,7 +99,8 @@ original=$(snapshot)
         }
     }
     command.push_str(
-        r#"umask 077
+        r#"original_umask=$(umask)
+umask 077
 staging=$(mktemp -d ./.rustsible-write.XXXXXXXXXX)
 trap 'rm -rf -- "$staging"' EXIT
 trap 'exit 1' HUP INT TERM
@@ -96,7 +113,7 @@ cat > "$temporary"
         r#"if [ "$original" != absent ]; then
     cp --attributes-only --preserve=ownership --dereference -- "$target" "$temporary"
 else
-    chmod 0644 -- "$temporary"
+    chmod -- "$(printf '%o' "$((0666 & ~0$original_umask))")" "$temporary"
 fi
 "#,
     );
@@ -154,6 +171,16 @@ mod tests {
     use crate::inventory::Host;
     use crate::ssh::connection::{LocalConnection, MockSshConnection};
     use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
+    #[test]
+    fn directory_syntax_is_not_normalized_into_a_file_destination() {
+        for path in ["/tmp/new/", "/tmp/new/.", "/tmp/new/..", ".", ".."] {
+            assert!(
+                install_command(path, FileMetadata::default(), 0).is_err(),
+                "{path}"
+            );
+        }
+    }
 
     #[test]
     fn replacement_preserves_protections_and_cleans_staging() {
@@ -216,7 +243,7 @@ mod tests {
         // The OS enforces the write limit on the child; no test hook can
         // accidentally bypass the real streaming/write failure path.
         let outcome = connection.execute_command_with_input(
-            &format!("ulimit -f 1; sh -c {}", shell_quote(&command)),
+            &format!("ulimit -c 0; ulimit -f 1; sh -c {}", shell_quote(&command)),
             &[42; 128 * 1024],
         );
         match outcome {
@@ -292,6 +319,54 @@ mod tests {
     }
 
     #[test]
+    fn writable_parent_requires_protected_staging_entries() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("artifact");
+        std::fs::write(&path, b"original").unwrap();
+        std::fs::set_permissions(directory.path(), std::fs::Permissions::from_mode(0o777)).unwrap();
+        let connection = LocalConnection::new(&Host::new("localhost")).unwrap();
+        let error = install(
+            &connection,
+            path.to_str().unwrap(),
+            b"replacement",
+            None,
+            FileMetadata::default(),
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("Unsafe destination directory"));
+        assert_eq!(std::fs::read(&path).unwrap(), b"original");
+        assert_eq!(std::fs::read_dir(directory.path()).unwrap().count(), 1);
+        std::fs::set_permissions(directory.path(), std::fs::Permissions::from_mode(0o1777))
+            .unwrap();
+        install(
+            &connection,
+            path.to_str().unwrap(),
+            b"replacement",
+            None,
+            FileMetadata::default(),
+        )
+        .unwrap();
+        assert_eq!(std::fs::read(path).unwrap(), b"replacement");
+    }
+
+    #[test]
+    fn new_file_respects_execution_umask() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("artifact");
+        let command = install_command(path.to_str().unwrap(), FileMetadata::default(), 7).unwrap();
+        let connection = LocalConnection::new(&Host::new("localhost")).unwrap();
+        let (code, _, stderr) = connection
+            .execute_command_with_input(
+                &format!("umask 077; sh -c {}", shell_quote(&command)),
+                b"private",
+            )
+            .unwrap();
+        assert_eq!(code, 0, "{stderr}");
+        assert_eq!(std::fs::read(&path).unwrap(), b"private");
+        assert_eq!(std::fs::metadata(path).unwrap().mode() & 0o777, 0o600);
+    }
+
+    #[test]
     fn invalid_metadata_and_symlinks_do_not_change_targets() {
         let connection = LocalConnection::new(&Host::new("localhost")).unwrap();
         let directory = tempfile::tempdir().unwrap();
@@ -308,6 +383,14 @@ mod tests {
             },
             FileMetadata {
                 group: Some("missing-rustsible-group-99999"),
+                ..FileMetadata::default()
+            },
+            FileMetadata {
+                owner: Some("4294967295"),
+                ..FileMetadata::default()
+            },
+            FileMetadata {
+                group: Some("9999999999999999999999"),
                 ..FileMetadata::default()
             },
             FileMetadata {

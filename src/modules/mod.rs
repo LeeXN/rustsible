@@ -235,12 +235,9 @@ pub fn run_adhoc_with_options(
                     scope.spawn(move || {
                         info!("Running module {} on host {}", module_name, host.name);
                         let start_time = Instant::now();
-                        let result = execute_adhoc_module(
-                            host,
-                            module_name,
-                            module_args,
-                            &effective_options,
-                        );
+                        let result = effective_options.and_then(|effective_options| {
+                            execute_adhoc_module(host, module_name, module_args, &effective_options)
+                        });
                         HostExecution {
                             result,
                             duration: start_time.elapsed(),
@@ -402,23 +399,22 @@ fn parse_mapping_adhoc_args(args: &str, allow_empty: bool) -> Result<Value> {
     Ok(Value::Mapping(parse_args(args)?))
 }
 
-fn effective_adhoc_options(host: &Host, options: &AdHocOptions) -> EffectiveAdHocOptions {
-    let use_become = options
-        .become_override
-        .unwrap_or_else(|| host.get_become().unwrap_or(false));
+fn effective_adhoc_options(host: &Host, options: &AdHocOptions) -> Result<EffectiveAdHocOptions> {
+    let config = crate::ssh::config::ConnectionConfig::from_host(host)?;
+    let use_become = options.become_override.unwrap_or(config.use_become);
     let become_user = options
         .become_user
         .as_deref()
-        .or_else(|| host.get_become_user().map(String::as_str))
+        .or(Some(config.become_user.as_str()))
         .filter(|user| !user.is_empty())
         .unwrap_or("root")
         .to_string();
 
-    EffectiveAdHocOptions {
+    Ok(EffectiveAdHocOptions {
         use_become,
         become_user,
         check_mode: options.check_mode,
-    }
+    })
 }
 
 fn module_result_rc(result: &ModuleResult) -> i32 {
@@ -1031,7 +1027,7 @@ mod tests {
         host.set_variable("ansible_become_user", "inventory-user");
 
         assert_eq!(
-            effective_adhoc_options(&host, &AdHocOptions::default()),
+            effective_adhoc_options(&host, &AdHocOptions::default()).unwrap(),
             EffectiveAdHocOptions {
                 use_become: true,
                 become_user: "inventory-user".to_string(),
@@ -1046,7 +1042,7 @@ mod tests {
             forks: 3,
         };
         assert_eq!(
-            effective_adhoc_options(&host, &explicit),
+            effective_adhoc_options(&host, &explicit).unwrap(),
             EffectiveAdHocOptions {
                 use_become: false,
                 become_user: "cli-user".to_string(),
@@ -1146,4 +1142,15 @@ mod tests {
         let result = run_adhoc(&[host], "command", "false");
         assert!(result.is_err());
     }
+}
+#[test]
+fn adhoc_uses_resolved_inventory_connection_variables() {
+    let directory = tempfile::tempdir().unwrap();
+    let destination = directory.path().join("resolved");
+    let mut host = Host::new("must-not-connect.invalid");
+    host.set_variable("transport", "local");
+    host.set_variable("ansible_connection", "{{ transport }}");
+    let args = serde_json::json!({"content": "resolved", "dest": destination}).to_string();
+    run_adhoc_with_options(&[host], "copy", &args, &AdHocOptions::default()).unwrap();
+    assert_eq!(std::fs::read(destination).unwrap(), b"resolved");
 }

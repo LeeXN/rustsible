@@ -12,8 +12,9 @@ cleanup() {
             [[ ! -f $log ]] || cat "$log" >&2
         done
     fi
-    if [[ -n $container ]]; then docker rm -f "$container" >/dev/null; fi
+    if [[ -n $container ]] && ! docker rm -f "$container" >/dev/null; then result=1; fi
     rm -rf -- "$fixture_dir"
+    exit "$result"
 }
 trap cleanup EXIT
 trap 'exit 1' HUP INT TERM
@@ -35,6 +36,10 @@ docker exec "$container" sh -eu -c '
         done
     done
 '
+controller_arch=$(uname -m)
+target_arch=$(docker exec "$container" uname -m)
+case "$controller_arch" in x86_64|aarch64) ;; *) echo 'Unsupported acceptance architecture' >&2; exit 1;; esac
+[[ $target_arch == "$controller_arch" ]] || { echo 'SSH fixture must run on the native architecture' >&2; exit 1; }
 port=$(docker port "$container" 22/tcp)
 port=${port##*:}
 for _ in {1..100}; do
@@ -51,15 +56,20 @@ plain ansible_become=false
 root ansible_become=true ansible_become_user=root
 app ansible_become=true ansible_become_user=app
 [all:vars]
-ansible_host=127.0.0.1
+ansible_host=unreachable.invalid
 ansible_connection=ssh
-ansible_port=$port
+fixture_port=$port
+ansible_port="{{ fixture_port }}"
 ansible_user=deploy
 ansible_ssh_private_key_file=$fixture_dir/key
 rustsible_known_hosts_file=$fixture_dir/known_hosts
 EOF
 cat > "$fixture_dir/playbook.yml" <<'EOF'
 - hosts: all
+  become: false
+  become_user: unused-keyword-user
+  vars:
+    ansible_host: 127.0.0.1
   tasks:
     - command: id -un
       register: identity
@@ -75,9 +85,11 @@ cat > "$fixture_dir/playbook.yml" <<'EOF'
         force: false
 - hosts: all
   gather_facts: false
+  vars:
+    ansible_host: 127.0.0.1
   tasks:
     - copy:
-        content: '{{ identity.stdout | trim }}:{{ ansible_system }}'
+        content: '{{ identity.stdout | trim }}:{{ ansible_system }}:{{ ansible_architecture }}'
         dest: /srv/rustsible/{{ inventory_hostname }}/identity
 EOF
 snapshot() {
@@ -94,11 +106,26 @@ diff -u "$fixture_dir/before" "$fixture_dir/after"
 "$binary" playbook "$fixture_dir/playbook.yml" -i "$fixture_dir/inventory" > "$fixture_dir/second.log"
 # `id -un` is the sole command task and reports changed on each real execution.
 [[ $(grep -c 'ok=6 changed=1 unreachable=0 failed=0' "$fixture_dir/second.log") == 3 ]]
+cat > "$fixture_dir/unsafe-parent.yml" <<'EOF'
+- hosts: root
+  gather_facts: false
+  vars:
+    ansible_host: 127.0.0.1
+  tasks:
+    - copy:
+        content: must-not-change
+        dest: /srv/rustsible/app/executable
+EOF
+if "$binary" playbook "$fixture_dir/unsafe-parent.yml" -i "$fixture_dir/inventory" > "$fixture_dir/unsafe-parent.log" 2>&1; then
+    echo 'Unsafe cross-owner staging unexpectedly succeeded' >&2; exit 1
+fi
+grep -q 'Unsafe destination directory owner' "$fixture_dir/unsafe-parent.log"
 docker exec "$container" sh -eu -c '
+    expected_arch=$(uname -m)
     for pair in plain:deploy root:root app:app; do
         name=${pair%:*}; user=${pair#*:}; base=/srv/rustsible/$name
         [ "$(cat "$base/executable")" = replacement ]
-        [ "$(cat "$base/identity")" = "$user:Linux" ]
+        [ "$(cat "$base/identity")" = "$user:Linux:$expected_arch" ]
         [ "$(cat "$base/download")" = original ]
         grep -qx appended "$base/lines"
         for file in executable lines download; do
@@ -108,4 +135,4 @@ docker exec "$container" sh -eu -c '
     done
     [ -z "$(find /srv/rustsible -name ".rustsible-*")" ]
 '
-printf 'SSH acceptance passed: deploy, root become, app become; check, idempotency, facts/register, bytes/mode/owner, cleanup\n'
+printf 'SSH acceptance passed (%s -> %s): deploy, root become, app become; check, idempotency, facts/register, bytes/mode/owner, cleanup\n' "$controller_arch" "$target_arch"
