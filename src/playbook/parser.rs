@@ -86,6 +86,19 @@ pub fn parse_playbook(playbook_path: &str) -> Result<Playbook> {
         bail!("Playbook contains no plays");
     }
 
+    let source = path
+        .canonicalize()
+        .context("Cannot resolve playbook source path")?;
+    for play in &mut plays {
+        for task in play
+            .tasks
+            .iter_mut()
+            .chain(play.handlers.iter_mut().map(|handler| &mut handler.task))
+        {
+            task.source_file = Some(source.clone());
+        }
+    }
+
     debug!("Finished parsing playbook with {} plays", plays.len());
 
     Ok(Playbook { plays })
@@ -387,6 +400,7 @@ fn parse_task(task_map: Mapping, index: usize, kind: TaskKind) -> Result<Task> {
         name,
         module,
         args,
+        source_file: None,
         is_become,
         become_override,
         become_user,

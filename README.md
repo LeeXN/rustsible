@@ -33,6 +33,15 @@ managed host. With gathering disabled, Rustsible does not invent target facts.
 Failed and unreachable hosts remain excluded in subsequent plays, while healthy
 hosts continue. `ignore_errors` applies to module failures, not unreachable
 hosts. A single recap totals the complete run.
+
+Arguments, conditions, loops, and template files use MiniJinja's Jinja syntax.
+A single expression preserves its type (`{{ '0012' }}` stays a string); mixed
+text stays text. Only variable definitions resolve references recursively,
+with cycle detection. Runtime results and rendered output are never executed
+again as templates. Conditions must return booleans; the string `'false'` is
+rejected. Use Jinja positional defaults such as `default([])` rather than the
+former Tera spelling `default(value=[])`. Relative `copy.src` and `template.src`
+paths are anchored to the task's source file, independent of the launch directory.
 The compatibility surface currently includes Linux architecture facts,
 `stat.path/checksum_algorithm`, `get_url.url/dest/owner/group/mode/force/checksum`
 (inline `<algorithm>:<digest>` checksums),
@@ -211,7 +220,7 @@ The following built-in modules are registered for playbooks:
 | `debug` | Display a message or variable |
 | `copy` | Copy a controller file or literal content |
 | `file` | Manage files, directories, links, and permissions |
-| `template` | Render a Tera/Jinja-like template |
+| `template` | Render a MiniJinja/Jinja template |
 | `lineinfile` | Add, replace, or remove matching lines |
 | `user` | Manage local user accounts |
 | `service` | Manage service state and enablement |
@@ -253,6 +262,12 @@ for the current setup/get_url implementation; it is not a no-Python acceptance.
 The proposed native x86_64/aarch64 CI job is in
 [`tests/ssh/ci-workflow.patch`](tests/ssh/ci-workflow.patch). It has not been
 activated: the current GitHub credential lacks permission to change workflows.
+
+`bash tests/reference/run.sh target/debug/rustsible` compares template and
+condition results with **ansible-core 2.21.0**. It uses `uv` to isolate the
+Python reference tool; reference dependencies are not needed by normal Cargo
+tests. The comparison checks target file bytes, including literal runtime
+output, defaults/omit, loop values, string types, and rejected string conditions.
 
 Dependency advisories are checked in CI against `Cargo.lock`. CI also enforces
 an 80% line-coverage floor; the current all-target result is 81.12%. This is a

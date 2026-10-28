@@ -17,7 +17,7 @@
     - name: Add server configuration
       lineinfile:
         path: "{{ config_file }}"
-        line: "server_name={{ ansible_hostname | default(value='localhost') }}"
+        line: "server_name={{ ansible_hostname | default('localhost') }}"
         regexp: "^server_name="
         backup: "{{ backup_enabled }}"
     

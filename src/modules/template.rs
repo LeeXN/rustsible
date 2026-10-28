@@ -1,17 +1,16 @@
 use anyhow::{Context, Result};
-use log::{debug, error, info};
-use serde_json;
+use log::info;
+use minijinja::value::Serde;
 use serde_yaml::Value;
-use std::error::Error;
+use std::collections::HashMap;
 use std::fs;
 use std::path::Path;
-use tera::{Context as TeraContext, Tera};
 
 use crate::inventory::Host;
 use crate::modules::file::{inspect_path, plan_metadata_changes, PathKind};
 use crate::modules::param::{get_optional_param, get_param, validate_params};
 use crate::modules::ModuleResult;
-use crate::playbook::filters::register_ansible_filters;
+use crate::playbook::templar;
 use crate::ssh::atomic::{install, FileMetadata};
 use crate::ssh::connection::{Connection, SshConnection};
 
@@ -22,6 +21,24 @@ pub fn execute(
     use_become: bool,
     become_user: &str,
     check_mode: bool,
+) -> Result<ModuleResult> {
+    execute_with_context(
+        connection,
+        template_args,
+        use_become,
+        become_user,
+        check_mode,
+        &HashMap::new(),
+    )
+}
+
+pub(crate) fn execute_with_context(
+    connection: &dyn SshConnection,
+    template_args: &Value,
+    use_become: bool,
+    become_user: &str,
+    check_mode: bool,
+    data: &HashMap<String, Value>,
 ) -> Result<ModuleResult> {
     validate_params(
         template_args,
@@ -75,100 +92,26 @@ pub fn execute(
 
     info!("Rendering a template");
 
-    // 创建 Tera 上下文
-    let mut tera_context = TeraContext::new();
-
-    // Extract vars parameter if present and convert ALL variables to Tera context
-    if let Value::Mapping(args_map) = template_args {
-        if let Some(vars_value) = args_map.get(Value::String("vars".to_string())) {
-            debug!(
-                "Found 'vars' parameter with {} items",
-                if let Value::Mapping(m) = vars_value {
-                    m.len()
-                } else {
-                    0
-                }
-            );
-
-            if let Value::Mapping(vars_map) = vars_value {
-                // 首先创建一个临时的Tera上下文用于预渲染变量
-                let temp_tera = Tera::default();
-                let mut temp_context = TeraContext::new();
-
-                // 先添加所有简单变量到临时上下文
-                for (key, value) in vars_map {
-                    let Value::String(key_str) = key else {
-                        return Err(anyhow::anyhow!("Template variable names must be strings"));
-                    };
-                    let dynamic = matches!(
-                        value,
-                        Value::String(value) if value.contains("{{") || value.contains("{%")
-                    );
-                    if !dynamic {
-                        let json_value = serde_json::to_value(value).with_context(|| {
-                            format!("Failed to convert template variable '{}'", key_str)
-                        })?;
-                        temp_context.insert(key_str.clone(), &json_value);
-                        tera_context.insert(key_str.clone(), &json_value);
-                    }
-                }
-
-                // 第二遍：处理包含模板表达式的字符串变量
-                for (key, value) in vars_map {
-                    if let Value::String(key_str) = key {
-                        if let Value::String(s) = value {
-                            if s.contains("{{") || s.contains("{%") {
-                                debug!(
-                                    "Rendering template variable '{}' ({} bytes)",
-                                    key_str,
-                                    s.len()
-                                );
-
-                                // 尝试渲染包含模板表达式的字符串
-                                let rendered_value = temp_tera
-                                    .render_str(s, &temp_context, false)
-                                    .with_context(|| {
-                                        format!(
-                                            "Failed to pre-render template variable '{}'",
-                                            key_str
-                                        )
-                                    })?;
-                                tera_context.insert(key_str.clone(), &rendered_value);
-                                temp_context.insert(key_str.clone(), &rendered_value);
-                            }
-                        }
-                    }
-                }
-            } else {
-                return Err(anyhow::anyhow!(
-                    "Template 'vars' parameter must be a mapping"
-                ));
-            }
-        } else {
-            debug!("No 'vars' parameter found in template arguments");
+    let mut definitions = HashMap::new();
+    if let Some(vars) = template_args.get("vars") {
+        let vars = vars
+            .as_mapping()
+            .context("Template 'vars' parameter must be a mapping")?;
+        for (name, value) in vars {
+            let name = name
+                .as_str()
+                .context("Template variable names must be strings")?;
+            definitions.insert(name.to_string(), value.clone());
         }
     }
-
-    debug!("Final Tera context has been populated with variables");
-
-    // Render the template
-    let mut tera = Tera::default();
-    register_ansible_filters(&mut tera);
-
-    let rendered_content = tera
-        .render_str(&template_string, &tera_context, false)
-        .map_err(|e| {
-            error!("Template rendering failed");
-            debug!("Template rendering context variables were available");
-
-            // Try to provide more detailed error information
-            let error_msg = format!("Template rendering failed: {}", e);
-            if let Some(source) = e.source() {
-                anyhow::anyhow!("{}\nCaused by: {}", error_msg, source)
-            } else {
-                anyhow::anyhow!(error_msg)
-            }
-        })?;
+    let vars = templar::resolve_definitions(&definitions, data)?;
+    let context = templar::create_context(&vars)?;
+    let source_name = template_args
+        .get("src")
+        .and_then(Value::as_str)
+        .unwrap_or("<inline template>");
+    let rendered_content =
+        templar::environment().render_named_str(source_name, &template_string, Serde(&context))?;
 
     let current = inspect_path(connection, &dest, use_become, become_user)?;
     if !matches!(current.kind, PathKind::Absent | PathKind::File) {
