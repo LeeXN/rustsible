@@ -23,6 +23,9 @@ pub(crate) fn install_command(
     if path.is_empty() || path.contains('\0') {
         bail!("File destination must be a non-empty path without NUL bytes");
     }
+    if path.ends_with('/') || path.ends_with("/.") || path.ends_with("/..") {
+        bail!("File destination must identify a regular filename");
+    }
     let path = Path::new(path);
     let name = path
         .file_name()
@@ -168,6 +171,16 @@ mod tests {
     use crate::inventory::Host;
     use crate::ssh::connection::{LocalConnection, MockSshConnection};
     use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
+    #[test]
+    fn directory_syntax_is_not_normalized_into_a_file_destination() {
+        for path in ["/tmp/new/", "/tmp/new/.", "/tmp/new/..", ".", ".."] {
+            assert!(
+                install_command(path, FileMetadata::default(), 0).is_err(),
+                "{path}"
+            );
+        }
+    }
 
     #[test]
     fn replacement_preserves_protections_and_cleans_staging() {
