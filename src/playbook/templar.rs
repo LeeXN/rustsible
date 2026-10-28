@@ -4,6 +4,14 @@ use minijinja::{Environment, UndefinedBehavior};
 use serde_yaml::Value;
 use std::collections::HashMap;
 
+/// Runtime values retain provenance so facts can sit below play/task vars
+/// while registered results remain above them, without templating either.
+#[derive(Debug, Clone, Default)]
+pub(crate) struct RuntimeVariables {
+    pub facts: HashMap<String, Value>,
+    pub registered: HashMap<String, Value>,
+}
+
 pub(crate) type TemplateContext = HashMap<String, serde_json::Value>;
 pub(crate) const OMIT_SENTINEL: &str = "__rustsible_internal_omit_4f5e7d9b__";
 

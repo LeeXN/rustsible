@@ -42,6 +42,15 @@ again as templates. Conditions must return booleans; the string `'false'` is
 rejected. Use Jinja positional defaults such as `default([])` rather than the
 former Tera spelling `default(value=[])`. Relative `copy.src` and `template.src`
 paths are anchored to the task's source file, independent of the launch directory.
+
+Inventory host/group variables each use a single typed table. The effective
+order is inventory groups → host → facts → play vars → task vars → registered
+results → loop variables. Connection variables are resolved from that same
+context and override play/task keyword defaults; aliases are normalized within
+each layer. Invalid connection types or port values, unresolved references,
+and variable cycles fail before connecting or modifying a target. Only sudo is
+implemented for become; custom become executables and flags are rejected.
+Ad-hoc CLI become overrides retain their documented Rustsible precedence.
 The compatibility surface currently includes Linux architecture facts,
 `stat.path/checksum_algorithm`, `get_url.url/dest/owner/group/mode/force/checksum`
 (inline `<algorithm>:<digest>` checksums),

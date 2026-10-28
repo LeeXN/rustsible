@@ -6,6 +6,7 @@ use std::collections::{HashMap, HashSet};
 use std::time::Instant;
 
 use crate::inventory::Host;
+use crate::playbook::templar::RuntimeVariables;
 use crate::playbook::{Handler, Task, TaskResult};
 
 /// Play structure representing a set of tasks to run on hosts
@@ -46,7 +47,7 @@ struct HostStats {
 /// are rebuilt each time, so persisting a register never leaks play variables.
 #[derive(Debug, Default)]
 pub(crate) struct RunState {
-    variables: HashMap<String, HashMap<String, Value>>,
+    contexts: HashMap<String, RuntimeVariables>,
     excluded: HashSet<String>,
     stats: HashMap<String, HostStats>,
 }
@@ -71,22 +72,14 @@ impl RunState {
         }
     }
 
-    fn merge_result(
-        &mut self,
-        host: &str,
-        task: &Task,
-        result: &TaskResult,
-        context: &mut HashMap<String, Value>,
-    ) -> Result<()> {
-        let persistent = self.variables.entry(host.to_string()).or_default();
+    fn merge_result(&mut self, host: &str, task: &Task, result: &TaskResult) -> Result<()> {
+        let persistent = self.contexts.entry(host.to_string()).or_default();
         if !result.failed && !result.skipped && result.values.contains_key("ansible_facts") {
-            Play::merge_facts(persistent, result)?;
-            Play::merge_facts(context, result)?;
+            Play::merge_facts(&mut persistent.facts, result)?;
         }
         if let Some(register) = &task.register {
             let value = Play::registered_value(result);
-            persistent.insert(register.clone(), value.clone());
-            context.insert(register.clone(), value);
+            persistent.registered.insert(register.clone(), value);
         }
         Ok(())
     }
@@ -140,17 +133,11 @@ impl Play {
 
         let definitions: HashMap<String, HashMap<String, Value>> = hosts
             .iter()
-            .map(|host| (host.name.clone(), self.initial_host_vars(host)))
+            .map(|host| (host.name.clone(), host.all_variables()))
             .collect();
-        let mut contexts: HashMap<String, HashMap<String, Value>> = hosts
-            .iter()
-            .map(|host| {
-                (
-                    host.name.clone(),
-                    state.variables.get(&host.name).cloned().unwrap_or_default(),
-                )
-            })
-            .collect();
+        for host in hosts {
+            state.contexts.entry(host.name.clone()).or_default();
+        }
         let mut active_hosts: HashSet<String> = hosts
             .iter()
             .filter(|host| !state.excluded.contains(&host.name))
@@ -199,7 +186,7 @@ impl Play {
                     .iter()
                     .filter(|host| active_hosts.contains(&host.name))
                     .collect(),
-                &contexts,
+                &state.contexts,
                 &definitions,
                 check_mode,
                 forks,
@@ -222,12 +209,7 @@ impl Play {
                 };
 
                 if !result.failed {
-                    let merge_result = contexts
-                        .get_mut(&host.name)
-                        .context("Internal play state lost a fact context")
-                        .and_then(|context| {
-                            state.merge_result(&host.name, &gather_task, &result, context)
-                        });
+                    let merge_result = state.merge_result(&host.name, &gather_task, &result);
                     if let Err(error) = merge_result {
                         result.failed = true;
                         result.msg = error.to_string();
@@ -288,7 +270,7 @@ impl Play {
                 self,
                 task,
                 runnable_hosts,
-                &contexts,
+                &state.contexts,
                 &definitions,
                 check_mode,
                 forks,
@@ -321,10 +303,7 @@ impl Play {
                     }
                 };
 
-                let host_context = contexts
-                    .get_mut(&host.name)
-                    .context("Internal play state lost a task context")?;
-                state.merge_result(&host.name, &effective_task, &result, host_context)?;
+                state.merge_result(&host.name, &effective_task, &result)?;
 
                 if result.changed && !result.failed {
                     for handler_name in &effective_task.notify {
@@ -412,7 +391,7 @@ impl Play {
                     self,
                     &handler.task,
                     handler_hosts,
-                    &contexts,
+                    &state.contexts,
                     &definitions,
                     check_mode,
                     forks,
@@ -437,14 +416,7 @@ impl Play {
                             Some(result.msg)
                         }
                         Ok(result) => {
-                            state.merge_result(
-                                &host.name,
-                                &effective_handler,
-                                &result,
-                                contexts
-                                    .get_mut(&host.name)
-                                    .context("Missing handler context")?,
-                            )?;
+                            state.merge_result(&host.name, &effective_handler, &result)?;
                             let host_stats = stats
                                 .get_mut(&host.name)
                                 .with_context(|| {
@@ -522,7 +494,7 @@ impl Play {
         play: &Play,
         task: &Task,
         hosts: Vec<&'a Host>,
-        contexts: &HashMap<String, HashMap<String, Value>>,
+        contexts: &HashMap<String, RuntimeVariables>,
         definitions: &HashMap<String, HashMap<String, Value>>,
         check_mode: bool,
         forks: usize,
@@ -536,15 +508,19 @@ impl Play {
                     let host_definitions = definitions.get(&host.name);
                     let effective_task = play.apply_play_settings(task, host);
                     let worker_task = effective_task.clone();
-                    let worker =
-                        scope.spawn(move || match (host_vars, host_definitions) {
-                            (Some(vars), Some(definitions)) => worker_task
-                                .execute_with_definitions(host, vars, definitions, check_mode),
-                            _ => Err(anyhow::anyhow!(
-                                "Internal error: no variable context for host '{}'",
-                                host.name
-                            )),
-                        });
+                    let worker = scope.spawn(move || match (host_vars, host_definitions) {
+                        (Some(vars), Some(definitions)) => worker_task.execute_with_definitions(
+                            host,
+                            vars,
+                            definitions,
+                            &play.vars,
+                            check_mode,
+                        ),
+                        _ => Err(anyhow::anyhow!(
+                            "Internal error: no variable context for host '{}'",
+                            host.name
+                        )),
+                    });
                     workers.push((host, effective_task, worker));
                 }
 
@@ -589,45 +565,12 @@ impl Play {
             .become_user_override
             .clone()
             .or_else(|| self.become_user_override.clone())
-            .or_else(|| host.get_become_user().cloned())
+            .or_else(|| host.get_become_user().map(str::to_owned))
             .unwrap_or_else(|| "root".to_string());
         if effective_task.connection.is_none() {
             effective_task.connection = self.connection.clone();
         }
         effective_task
-    }
-
-    fn initial_host_vars(&self, host: &Host) -> HashMap<String, Value> {
-        let mut vars = HashMap::new();
-        for (key, value) in &host.inherited_variables {
-            vars.insert(key.clone(), Value::String(value.clone()));
-        }
-        for (key, value) in &host.typed_inherited_variables {
-            vars.insert(key.clone(), value.clone());
-        }
-        for (key, value) in &host.variables {
-            vars.insert(key.clone(), Value::String(value.clone()));
-        }
-        for (key, value) in &host.typed_variables {
-            vars.insert(key.clone(), value.clone());
-        }
-        // Play vars have higher precedence than inventory group/host vars;
-        // task vars are merged one level later by Task::merge_task_vars.
-        for (key, value) in &self.vars {
-            if let Value::String(key) = key {
-                vars.insert(key.clone(), value.clone());
-            }
-        }
-        vars.insert(
-            "inventory_hostname".to_string(),
-            Value::String(host.name.clone()),
-        );
-        vars.insert(
-            "ansible_host".to_string(),
-            Value::String(host.hostname.clone()),
-        );
-        vars.insert("ansible_port".to_string(), Value::Number(host.port.into()));
-        vars
     }
 
     fn merge_facts(context: &mut HashMap<String, Value>, result: &TaskResult) -> Result<()> {
@@ -756,8 +699,23 @@ mod tests {
             Value::String("play".to_string()),
         );
 
-        let vars = play.initial_host_vars(&host);
-        assert_eq!(vars.get("priority"), Some(&Value::String("play".into())));
+        let vars = host.all_variables();
+        let mut task = create_command_task("typed variables", "true");
+        task.module = "debug".into();
+        task.args = Mapping::from_iter([(
+            Value::String("msg".into()),
+            Value::String("{{ priority }}:{{ items | join(',') }}".into()),
+        )]);
+        let result = task
+            .execute_with_definitions(
+                &host,
+                &RuntimeVariables::default(),
+                &vars,
+                &play.vars,
+                false,
+            )
+            .unwrap();
+        assert_eq!(result.msg, "play:one");
         assert!(matches!(vars.get("items"), Some(Value::Sequence(_))));
     }
 

@@ -12,8 +12,9 @@ cleanup() {
             [[ ! -f $log ]] || cat "$log" >&2
         done
     fi
-    if [[ -n $container ]]; then docker rm -f "$container" >/dev/null; fi
+    if [[ -n $container ]] && ! docker rm -f "$container" >/dev/null; then result=1; fi
     rm -rf -- "$fixture_dir"
+    exit "$result"
 }
 trap cleanup EXIT
 trap 'exit 1' HUP INT TERM
@@ -51,15 +52,20 @@ plain ansible_become=false
 root ansible_become=true ansible_become_user=root
 app ansible_become=true ansible_become_user=app
 [all:vars]
-ansible_host=127.0.0.1
+ansible_host=unreachable.invalid
 ansible_connection=ssh
-ansible_port=$port
+fixture_port=$port
+ansible_port="{{ fixture_port }}"
 ansible_user=deploy
 ansible_ssh_private_key_file=$fixture_dir/key
 rustsible_known_hosts_file=$fixture_dir/known_hosts
 EOF
 cat > "$fixture_dir/playbook.yml" <<'EOF'
 - hosts: all
+  become: false
+  become_user: unused-keyword-user
+  vars:
+    ansible_host: 127.0.0.1
   tasks:
     - command: id -un
       register: identity
@@ -75,6 +81,8 @@ cat > "$fixture_dir/playbook.yml" <<'EOF'
         force: false
 - hosts: all
   gather_facts: false
+  vars:
+    ansible_host: 127.0.0.1
   tasks:
     - copy:
         content: '{{ identity.stdout | trim }}:{{ ansible_system }}'

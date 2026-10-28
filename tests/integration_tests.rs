@@ -87,6 +87,135 @@ fn sources_follow_playbook_directory_and_runtime_output_is_not_retemplated() -> 
 }
 
 #[test]
+fn play_and_task_connection_variables_control_the_actual_transport() -> Result<()> {
+    let directory = TempDir::new()?;
+    let inventory_file =
+        fixture_file("[all]\nnode ansible_host=unreachable.invalid ansible_connection=ssh\n");
+    let playbook = fixture_file(&format!(
+        r#"- hosts: node
+  gather_facts: false
+  vars:
+    transport: local
+    ansible_connection: '{{{{ transport }}}}'
+    ansible_host: 127.0.0.1
+  tasks:
+    - copy:
+        content: '{{{{ ansible_host }}}}'
+        dest: {0}/play
+    - copy:
+        content: '{{{{ ansible_host }}}}'
+        dest: {0}/task
+      vars:
+        ansible_ssh_host: localhost
+"#,
+        directory.path().display()
+    ));
+    let inventory = inventory::parse(inventory_file.path().to_str().unwrap())?;
+    playbook::execute(playbook.path().to_str().unwrap(), &inventory)?;
+    assert_eq!(
+        std::fs::read_to_string(directory.path().join("play"))?,
+        "127.0.0.1"
+    );
+    assert_eq!(
+        std::fs::read_to_string(directory.path().join("task"))?,
+        "localhost"
+    );
+    Ok(())
+}
+
+#[test]
+fn invalid_or_unresolved_connection_values_fail_before_writing() -> Result<()> {
+    let inventory_file = local_inventory();
+    let directory = TempDir::new()?;
+    let marker = directory.path().join("must-not-exist");
+    let inventory = inventory::parse(inventory_file.path().to_str().unwrap())?;
+    for setting in [
+        "ansible_connection: unsupported",
+        "ansible_port: true",
+        "ansible_user: 42",
+        "ansible_become: []",
+        "ansible_host: '{{ missing_address }}'",
+        "ansible_become_method: su",
+    ] {
+        let playbook = fixture_file(&format!(
+            "- hosts: localhost\n  gather_facts: false\n  tasks:\n    - copy:\n        content: unsafe\n        dest: {}\n      vars:\n        {setting}\n", marker.display()
+        ));
+        assert!(
+            playbook::execute(playbook.path().to_str().unwrap(), &inventory).is_err(),
+            "{setting}"
+        );
+        assert!(!marker.exists(), "{setting}");
+    }
+    Ok(())
+}
+
+#[test]
+fn facts_obey_variable_precedence_without_becoming_templates() -> Result<()> {
+    let directory = TempDir::new()?;
+    let inventory_file =
+        fixture_file("[all]\nlocalhost ansible_connection=local ansible_system=inventory\n");
+    let playbook = fixture_file(&format!(
+        r#"- hosts: localhost
+  vars:
+    ansible_system: play
+  tasks:
+    - copy:
+        content: '{{{{ ansible_system }}}}'
+        dest: {0}/play
+    - copy:
+        content: '{{{{ ansible_system }}}}'
+        dest: {0}/task
+      vars:
+        ansible_system: task
+- hosts: localhost
+  gather_facts: false
+  tasks:
+    - copy:
+        content: '{{{{ ansible_system }}}}'
+        dest: {0}/facts
+"#,
+        directory.path().display()
+    ));
+    let inventory = inventory::parse(inventory_file.path().to_str().unwrap())?;
+    playbook::execute(playbook.path().to_str().unwrap(), &inventory)?;
+    for (file, expected) in [("play", "play"), ("task", "task"), ("facts", "Linux")] {
+        assert_eq!(
+            std::fs::read_to_string(directory.path().join(file))?,
+            expected
+        );
+    }
+    Ok(())
+}
+
+#[test]
+fn loop_variables_resolve_task_paths_and_connection_settings_per_item() -> Result<()> {
+    let directory = TempDir::new()?;
+    let inventory_file = fixture_file("[all]\nnode ansible_connection=ssh\n");
+    let playbook = fixture_file(&format!(
+        r#"- hosts: node
+  gather_facts: false
+  tasks:
+    - copy:
+        content: '{{{{ item.name }}}}'
+        dest: '{{{{ destination }}}}'
+      vars:
+        destination: '{0}/{{{{ item.name }}}}'
+        ansible_connection: '{{{{ item.transport }}}}'
+      loop:
+        - {{name: first, transport: local}}
+        - {{name: second, transport: local}}
+"#,
+        directory.path().display()
+    ));
+    let inventory = inventory::parse(inventory_file.path().to_str().unwrap())?;
+    playbook::execute(playbook.path().to_str().unwrap(), &inventory)?;
+    for name in ["first", "second"] {
+        assert_eq!(std::fs::read_to_string(directory.path().join(name))?, name);
+    }
+    Ok(())
+}
+
+#[test]
 fn registered_results_survive_plays_but_play_and_task_vars_do_not() -> Result<()> {
     let inventory_file = local_inventory();
     let output_dir = TempDir::new()?;

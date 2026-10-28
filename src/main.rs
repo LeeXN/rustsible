@@ -128,7 +128,13 @@ fn main() -> Result<()> {
                     host_names.sort();
                     for host_name in host_names {
                         if let Some(host) = inventory.hosts.get(host_name) {
-                            println!("    - {} ({}:{})", host.name, host.hostname, host.port);
+                            let config = rustsible::ssh::config::ConnectionConfig::from_host(host)?;
+                            println!(
+                                "    - {} ({}:{})",
+                                host.name,
+                                config.hostname(),
+                                config.port()
+                            );
                         } else {
                             println!("    - {} (NOT FOUND IN INVENTORY)", host_name);
                         }
@@ -149,7 +155,8 @@ fn main() -> Result<()> {
             let mut hosts: Vec<_> = inventory.hosts.iter().collect();
             hosts.sort_by_key(|(name, _)| *name);
             for (name, host) in hosts {
-                println!("Host: {} ({}:{})", name, host.hostname, host.port);
+                let config = rustsible::ssh::config::ConnectionConfig::from_host(host)?;
+                println!("Host: {} ({}:{})", name, config.hostname(), config.port());
                 if !host.variables.is_empty() {
                     println!("  Variables:");
                     let mut variables: Vec<_> = host.variables.iter().collect();
@@ -187,7 +194,7 @@ fn required_cli_usize(value: Option<&usize>, description: &str) -> Result<usize>
     })
 }
 
-fn display_inventory_value(_key: &str, _value: &str) -> &'static str {
+fn display_inventory_value(_key: &str, _value: impl std::fmt::Debug) -> &'static str {
     // Inventory values are untrusted secret-bearing input. A deny-list can
     // never cover custom names such as `github_pat` or `session_id`, so the
     // diagnostic command deliberately shows keys but never raw values.

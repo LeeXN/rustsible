@@ -89,22 +89,22 @@ pub fn assert_yaml_eq(actual: &Value, expected: &Value) {
 
 /// Extract the host's SSH user variable, returns Option<String>
 pub fn get_host_ssh_user(host: &crate::inventory::Host) -> Option<String> {
-    host.get_ssh_user().cloned()
+    host.get_ssh_user().map(str::to_owned)
 }
 
 /// Extract the host's SSH password variable, returns Option<String>
 pub fn get_host_ssh_password(host: &crate::inventory::Host) -> Option<String> {
-    host.get_ssh_password().cloned()
+    host.get_ssh_password().map(str::to_owned)
 }
 
 /// Extract the host's SSH private key path variable, returns Option<String>
 pub fn get_host_ssh_private_key(host: &crate::inventory::Host) -> Option<String> {
-    host.get_ssh_private_key().cloned()
+    host.get_ssh_private_key().map(str::to_owned)
 }
 
 /// Extract the host's sudo password variable, returns Option<String>
 pub fn get_host_ssh_sudo_password(host: &crate::inventory::Host) -> Option<String> {
-    host.get_ssh_sudo_password().cloned()
+    host.get_ssh_sudo_password().map(str::to_owned)
 }
 
 #[cfg(test)]
@@ -116,8 +116,8 @@ mod tests {
         let host = create_test_host("test", "example.com", 22, Some("user"), Some("pass"));
 
         assert_eq!(host.name, "test");
-        assert_eq!(host.hostname, "example.com");
-        assert_eq!(host.port, 22);
+        assert_eq!(host.hostname().unwrap(), "example.com");
+        assert_eq!(host.port().unwrap(), 22);
         assert_eq!(get_host_ssh_user(&host), Some("user".to_string()));
         assert_eq!(get_host_ssh_password(&host), Some("pass".to_string()));
     }

@@ -1,4 +1,4 @@
-use crate::playbook::templar::TemplateContext;
+use crate::playbook::templar::{RuntimeVariables, TemplateContext};
 #[allow(unused_imports)]
 use anyhow::Result;
 use anyhow::{anyhow, Context};
@@ -10,6 +10,7 @@ use std::time::Instant;
 
 use crate::inventory::Host;
 use crate::modules::ModuleResult;
+use crate::ssh::config::ConnectionConfig;
 use crate::ssh::connection::Connection;
 
 const MAX_ARGUMENT_TEMPLATE_DEPTH: usize = 64;
@@ -158,24 +159,46 @@ impl Task {
         vars: &HashMap<String, Value>,
         check_mode: bool,
     ) -> Result<TaskResult> {
-        self.execute_with_definitions(host, &HashMap::new(), vars, check_mode)
+        let mut definitions = host.all_variables();
+        crate::inventory::host::merge_variable_layer(&mut definitions, vars);
+        self.execute_with_definitions(
+            host,
+            &RuntimeVariables::default(),
+            &definitions,
+            &Mapping::new(),
+            check_mode,
+        )
     }
 
     pub(crate) fn execute_with_definitions(
         &self,
         host: &Host,
-        data: &HashMap<String, Value>,
+        runtime: &RuntimeVariables,
         definitions: &HashMap<String, Value>,
+        play_vars: &Mapping,
         check_mode: bool,
     ) -> Result<TaskResult> {
         let mut definitions = definitions.clone();
-        for (name, value) in &self.vars {
-            let name = name
-                .as_str()
-                .context("Task variable names must be strings")?;
-            definitions.insert(name.to_owned(), value.clone());
+        let mut higher_definitions = HashMap::new();
+        for layer in [play_vars, &self.vars] {
+            let mut variables = HashMap::new();
+            for (name, value) in layer {
+                let name = name.as_str().context("Variable names must be strings")?;
+                variables.insert(name.to_owned(), value.clone());
+            }
+            crate::inventory::host::merge_variable_layer(&mut higher_definitions, &variables);
         }
-        let vars = crate::playbook::templar::resolve_definitions(&definitions, data)?;
+        let mut data = runtime.facts.clone();
+        for name in higher_definitions.keys() {
+            data.remove(name);
+        }
+        data.extend(runtime.registered.clone());
+        data.insert(
+            "inventory_hostname".into(),
+            Value::String(host.name.clone()),
+        );
+        definitions.extend(higher_definitions);
+        let vars = crate::playbook::templar::resolve_definitions(&definitions, &data)?;
         let start_time = Instant::now();
         info!("TASK [{}] on host {}", self.name, host.name);
 
@@ -214,7 +237,7 @@ impl Task {
             for (idx, item) in items_list.iter().enumerate() {
                 debug!("Loop iteration {} of {}", idx + 1, items_list.len());
 
-                let mut iter_vars = vars.clone();
+                let mut iter_vars = data.clone();
 
                 iter_vars.insert(loop_var.to_string(), item.clone());
 
@@ -222,6 +245,8 @@ impl Task {
                     iter_vars.insert(index_var.clone(), Value::Number(idx.into()));
                 }
 
+                let iter_vars =
+                    crate::playbook::templar::resolve_definitions(&definitions, &iter_vars)?;
                 let iter_context = crate::playbook::templar::create_context(&iter_vars)?;
 
                 if let Some(when) = &self.when {
@@ -253,6 +278,9 @@ impl Task {
                     }
                 }
 
+                if self.normalized_module_name() != "debug" {
+                    ConnectionConfig::require_resolved(&definitions, &iter_vars)?;
+                }
                 let mut iter_task = self.clone();
                 iter_task.loop_items = None;
 
@@ -313,6 +341,9 @@ impl Task {
                 }
             }
 
+            if self.normalized_module_name() != "debug" {
+                ConnectionConfig::require_resolved(&definitions, &vars)?;
+            }
             let mut result = self.execute_module(host, &mut engine, &context, &vars, check_mode)?;
             result.no_log = self.no_log;
             results.push(result);
@@ -407,21 +438,16 @@ impl Task {
         );
 
         let context = crate::playbook::templar::create_context(vars)?;
-        let become_user = if self.is_become {
-            let rendered =
-                crate::playbook::templar::render_value(&self.become_user, engine, &context, true)?;
-            let Value::String(rendered) = rendered else {
-                return Err(anyhow!("become_user must render to a string"));
-            };
-            if rendered.trim().is_empty() || rendered.chars().any(char::is_control) {
-                return Err(anyhow!(
-                    "become_user must render to a non-empty string without control characters"
-                ));
-            }
-            rendered
-        } else {
-            self.become_user.clone()
+        let Value::String(become_user) =
+            crate::playbook::templar::render_value(&self.become_user, engine, &context, true)?
+        else {
+            return Err(anyhow!("become_user must render to a string"));
         };
+        if become_user.trim().is_empty() || become_user.chars().any(char::is_control) {
+            return Err(anyhow!(
+                "become_user must render to a non-empty string without control characters"
+            ));
+        }
         let mut resolved_args = self.resolve_args(engine, &context, vars)?;
 
         let module_name = self.normalized_module_name();
@@ -468,11 +494,23 @@ impl Task {
         if module_name == "setup" {
             crate::modules::setup::validate_args(&Value::Mapping(resolved_args.clone()))?;
         }
-        let mut effective_host = host.clone();
-        if let Some(connection_type) = &self.connection {
-            effective_host.set_variable("ansible_connection", connection_type);
+        let mut connection_vars = vars.clone();
+        if let Some(connection) = &self.connection {
+            let value = crate::playbook::templar::render_value(connection, engine, &context, true)?;
+            connection_vars
+                .entry("ansible_connection".into())
+                .or_insert(value);
         }
-        let connection = match Connection::connect(&effective_host) {
+        connection_vars
+            .entry("ansible_become".into())
+            .or_insert(Value::Bool(self.is_become));
+        connection_vars
+            .entry("ansible_become_user".into())
+            .or_insert(Value::String(become_user));
+        let config = ConnectionConfig::from_context(&host.name, connection_vars)?;
+        let use_become = config.use_become;
+        let become_user = config.become_user.clone();
+        let connection = match Connection::from_config(&config) {
             Ok(connection) => connection,
             Err(e) => {
                 let mut result = TaskResult::new(&host.name);
@@ -495,7 +533,7 @@ impl Task {
                     crate::modules::command::execute(
                         connection,
                         &command_args,
-                        self.is_become,
+                        use_become,
                         &become_user,
                         check_mode,
                     )?
@@ -503,7 +541,7 @@ impl Task {
                     crate::modules::shell::execute(
                         connection,
                         &command_args,
-                        self.is_become,
+                        use_become,
                         &become_user,
                         check_mode,
                     )?
@@ -514,7 +552,7 @@ impl Task {
                 crate::modules::copy::execute(
                     connection,
                     &Value::Mapping(resolved_args),
-                    self.is_become,
+                    use_become,
                     &become_user,
                     check_mode,
                 )?
@@ -524,7 +562,7 @@ impl Task {
                 crate::modules::file::execute(
                     connection,
                     &Value::Mapping(resolved_args),
-                    self.is_become,
+                    use_become,
                     &become_user,
                     check_mode,
                 )?
@@ -532,14 +570,14 @@ impl Task {
             "get_url" => crate::modules::get_url::execute(
                 connection,
                 &Value::Mapping(resolved_args),
-                self.is_become,
+                use_become,
                 &become_user,
                 check_mode,
             )?,
             "template" => crate::modules::template::execute_with_context(
                 connection,
                 &Value::Mapping(resolved_args),
-                self.is_become,
+                use_become,
                 &become_user,
                 check_mode,
                 vars,
@@ -549,7 +587,7 @@ impl Task {
                 crate::modules::package::execute(
                     connection,
                     &Value::Mapping(resolved_args),
-                    self.is_become,
+                    use_become,
                     &become_user,
                     check_mode,
                 )?
@@ -559,37 +597,37 @@ impl Task {
                 crate::modules::service::execute(
                     connection,
                     &Value::Mapping(resolved_args),
-                    self.is_become,
+                    use_become,
                     &become_user,
                     check_mode,
                 )?
             }
-            "setup" => crate::modules::setup::execute(connection, self.is_become, &become_user)?,
+            "setup" => crate::modules::setup::execute(connection, use_become, &become_user)?,
             "stat" => crate::modules::stat::execute(
                 connection,
                 &Value::Mapping(resolved_args),
-                self.is_become,
+                use_become,
                 &become_user,
                 check_mode,
             )?,
             "systemd" | "systemd_service" => crate::modules::service::execute_systemd(
                 connection,
                 &Value::Mapping(resolved_args),
-                self.is_become,
+                use_become,
                 &become_user,
                 check_mode,
             )?,
             "lineinfile" => crate::modules::lineinfile::execute(
                 connection,
                 &Value::Mapping(resolved_args),
-                self.is_become,
+                use_become,
                 &become_user,
                 check_mode,
             )?,
             "user" => crate::modules::user::execute(
                 connection,
                 &Value::Mapping(resolved_args),
-                self.is_become,
+                use_become,
                 &become_user,
                 check_mode,
             )?,
