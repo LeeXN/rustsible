@@ -274,9 +274,9 @@ with strict host-key verification. It checks deploy/root/app execution identitie
 check-mode business-state equality, idempotency, cross-play facts/registers,
 file bytes and metadata, and temporary-file cleanup. The fixture installs Python
 for the current setup/get_url implementation; it is not a no-Python acceptance.
-The proposed native x86_64/aarch64 CI job is in
-[`tests/ssh/ci-workflow.patch`](tests/ssh/ci-workflow.patch). It has not been
-activated: the current GitHub credential lacks permission to change workflows.
+CI runs the quality gates and real SSH fixture on native x86_64 and aarch64
+Linux runners. Results come from the individual CI jobs; configuring a runner
+is not itself evidence that an architecture passed.
 
 `bash tests/reference/run.sh target/debug/rustsible` compares template and
 condition results with **ansible-core 2.21.0**. It uses `uv` to isolate the
