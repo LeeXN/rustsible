@@ -18,6 +18,186 @@ fn local_inventory() -> NamedTempFile {
 }
 
 #[test]
+fn registered_results_survive_plays_but_play_and_task_vars_do_not() -> Result<()> {
+    let inventory_file = local_inventory();
+    let output_dir = TempDir::new()?;
+    let marker = output_dir.path().join("result");
+    let playbook_file = fixture_file(&format!(
+        r#"- hosts: localhost
+  gather_facts: false
+  vars:
+    play_only: secret
+  tasks:
+    - command: printf carried
+      register: previous
+      vars:
+        task_only: secret
+- hosts: localhost
+  gather_facts: false
+  tasks:
+    - copy:
+        content: "{{{{ previous.stdout }}}}"
+        dest: {}
+      when: play_only is not defined and task_only is not defined
+"#,
+        marker.display()
+    ));
+    let inventory = inventory::parse(inventory_file.path().to_str().unwrap())?;
+    playbook::execute(playbook_file.path().to_str().unwrap(), &inventory)?;
+    assert_eq!(std::fs::read_to_string(marker)?, "carried");
+    Ok(())
+}
+
+#[test]
+fn failed_hosts_stay_excluded_in_later_plays_while_healthy_hosts_continue() -> Result<()> {
+    let inventory_file =
+        fixture_file("[local]\nbad ansible_connection=local\ngood ansible_connection=local\n");
+    let output_dir = TempDir::new()?;
+    let playbook_file = fixture_file(&format!(
+        r#"- hosts: bad
+  gather_facts: false
+  tasks:
+    - command: 'false'
+- hosts: all
+  gather_facts: false
+  tasks:
+    - copy:
+        content: executed
+        dest: {}/{{{{ inventory_hostname }}}}
+"#,
+        output_dir.path().display()
+    ));
+    let inventory = inventory::parse(inventory_file.path().to_str().unwrap())?;
+    assert!(playbook::execute(playbook_file.path().to_str().unwrap(), &inventory).is_err());
+    assert!(!output_dir.path().join("bad").exists());
+    assert_eq!(std::fs::read(output_dir.path().join("good"))?, b"executed");
+    Ok(())
+}
+
+#[test]
+fn explicit_setup_merges_target_facts_across_plays() -> Result<()> {
+    let inventory_file = local_inventory();
+    let output_dir = TempDir::new()?;
+    let marker = output_dir.path().join("facts");
+    let playbook_file = fixture_file(&format!(
+        r#"- hosts: localhost
+  gather_facts: false
+  tasks:
+    - setup: {{}}
+- hosts: localhost
+  gather_facts: false
+  tasks:
+    - copy:
+        content: "{{{{ ansible_system }}}}:{{{{ ansible_facts.architecture }}}}:{{{{ ansible_date_time.epoch }}}}"
+        dest: {}
+"#,
+        marker.display()
+    ));
+    let inventory = inventory::parse(inventory_file.path().to_str().unwrap())?;
+    playbook::execute(playbook_file.path().to_str().unwrap(), &inventory)?;
+    let contents = std::fs::read_to_string(marker)?;
+    let parts: Vec<_> = contents.split(':').collect();
+    assert_eq!(parts[0], "Linux");
+    assert!(!parts[1].is_empty());
+    assert!(parts[2].parse::<u64>()? > 0);
+    Ok(())
+}
+
+#[test]
+fn disabled_facts_do_not_invent_target_time() -> Result<()> {
+    let inventory_file = local_inventory();
+    let output_dir = TempDir::new()?;
+    let marker = output_dir.path().join("facts");
+    let playbook_file = fixture_file(&format!(
+        r#"- hosts: localhost
+  gather_facts: false
+  tasks:
+    - copy:
+        content: "{{{{ ansible_date_time | default('absent') }}}}"
+        dest: {}
+"#,
+        marker.display()
+    ));
+    let inventory = inventory::parse(inventory_file.path().to_str().unwrap())?;
+    playbook::execute(playbook_file.path().to_str().unwrap(), &inventory)?;
+    assert_eq!(std::fs::read_to_string(marker)?, "absent");
+    Ok(())
+}
+
+#[test]
+fn explicit_setup_rejects_arguments_before_later_modifications() -> Result<()> {
+    let inventory_file = local_inventory();
+    let output_dir = TempDir::new()?;
+    let marker = output_dir.path().join("must-not-exist");
+    let playbook_file = fixture_file(&format!(
+        "- hosts: localhost\n  gather_facts: false\n  tasks:\n    - setup:\n        unsupported: true\n    - command: touch {}\n",
+        marker.display()
+    ));
+    let inventory = inventory::parse(inventory_file.path().to_str().unwrap())?;
+    assert!(playbook::execute(playbook_file.path().to_str().unwrap(), &inventory).is_err());
+    assert!(!marker.exists());
+    Ok(())
+}
+
+#[test]
+fn unreachable_hosts_are_not_ignored_and_are_not_reconnected_in_later_plays() -> Result<()> {
+    // A local listener never speaks SSH. Keeping it open makes the handshake
+    // failure deterministic without an external host or a reused free port.
+    let listener = std::net::TcpListener::bind("127.0.0.1:0")?;
+    let port = listener.local_addr()?.port();
+    let inventory_file = fixture_file(&format!(
+        "[all]\nlost ansible_host=127.0.0.1 ansible_connection=ssh ansible_port={port} ansible_ssh_timeout=1\n"
+    ));
+    let playbook_file = fixture_file(
+        "- hosts: all\n  gather_facts: false\n  tasks:\n    - command: 'true'\n      ignore_errors: true\n- hosts: all\n  tasks:\n    - debug:\n        msg: must-not-run\n",
+    );
+    let output = Command::new(env!("CARGO_BIN_EXE_rustsible"))
+        .args([
+            "playbook",
+            playbook_file.path().to_str().unwrap(),
+            "-i",
+            inventory_file.path().to_str().unwrap(),
+        ])
+        .output()?;
+    assert!(!output.status.success());
+    let stdout = String::from_utf8(output.stdout)?;
+    assert!(stdout.contains("unreachable=1 failed=0"), "{stdout}");
+    assert_eq!(stdout.matches("PLAY RECAP").count(), 1);
+    assert!(!stdout.contains("must-not-run"));
+    listener.set_nonblocking(true)?;
+    let _connection = listener.accept()?;
+    assert_eq!(
+        listener.accept().unwrap_err().kind(),
+        std::io::ErrorKind::WouldBlock
+    );
+    Ok(())
+}
+
+#[test]
+fn playbook_error_and_recap_do_not_leak_no_log_payloads() -> Result<()> {
+    let inventory_file = local_inventory();
+    let playbook_file = fixture_file(
+        "- hosts: all\n  gather_facts: false\n  tasks:\n    - shell: echo private-payload >&2; exit 1\n      no_log: true\n- hosts: all\n  gather_facts: false\n  tasks:\n    - debug:\n        msg: must-not-run\n",
+    );
+    let output = Command::new(env!("CARGO_BIN_EXE_rustsible"))
+        .args([
+            "playbook",
+            playbook_file.path().to_str().unwrap(),
+            "-i",
+            inventory_file.path().to_str().unwrap(),
+        ])
+        .output()?;
+    assert!(!output.status.success());
+    let stdout = String::from_utf8(output.stdout)?;
+    let stderr = String::from_utf8(output.stderr)?;
+    assert!(!stdout.contains("private-payload"));
+    assert!(!stderr.contains("private-payload"));
+    assert!(!stdout.contains("must-not-run"));
+    assert!(stdout.contains("failed=1"));
+    Ok(())
+}
+
+#[test]
 fn test_integration_simple_playbook_local() -> Result<()> {
     let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     let inventory_path = manifest_dir.join("tests/fixtures/inventory/simple.ini");

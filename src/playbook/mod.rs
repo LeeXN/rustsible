@@ -67,6 +67,7 @@ pub fn execute_with_options(
     }
 
     let mut failures = Vec::new();
+    let mut state = play::RunState::default();
 
     for (index, play) in playbook.plays.iter().enumerate() {
         info!(
@@ -99,18 +100,20 @@ pub fn execute_with_options(
 
         debug!("Play '{}' matched {} hosts", play.name, hosts.len());
         let play_result =
-            play.execute_with_options(&hosts, options.check_mode, options.forks.max(1));
+            play.execute_in_run(&hosts, options.check_mode, options.forks, &mut state);
 
         if let Err(e) = play_result {
             error!("Play '{}' failed: {}", play.name, e);
             // Continue with next play unless fail_fast is enabled
             if play.fail_fast {
+                state.print_recap();
                 return Err(e);
             }
             failures.push(format!("Play '{}' failed: {}", play.name, e));
         }
     }
 
+    state.print_recap();
     if !failures.is_empty() {
         return Err(anyhow::anyhow!(failures.join("; ")));
     }

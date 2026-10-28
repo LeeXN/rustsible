@@ -20,6 +20,7 @@ const MAX_ARGUMENT_TEMPLATE_NODES: usize = 10_000;
 pub struct TaskResult {
     pub changed: bool,
     pub failed: bool,
+    pub unreachable: bool,
     pub skipped: bool,
     pub msg: String,
     #[allow(dead_code)]
@@ -36,6 +37,7 @@ impl TaskResult {
         TaskResult {
             changed: false,
             failed: false,
+            unreachable: false,
             skipped: false,
             msg: String::new(),
             host: host.to_string(),
@@ -56,6 +58,7 @@ impl TaskResult {
         TaskResult {
             changed: module_result.changed,
             failed: module_result.failed,
+            unreachable: false,
             skipped: false,
             msg: module_result.msg,
             host: host.to_string(),
@@ -327,6 +330,7 @@ impl Task {
         // a play-execution policy decision and must not erase the module result
         // (registered variables and recap still need to see `failed: true`).
         final_result.failed = failed;
+        final_result.unreachable = results.iter().any(|result| result.unreachable);
         final_result.skipped = skipped;
         final_result.no_log = self.no_log;
 
@@ -418,76 +422,10 @@ impl Task {
             self.module, self.name
         );
 
-        // Add ansible_date_time variable if it doesn't exist in vars
-        let mut vars_with_date = vars.clone();
-        if !vars_with_date.contains_key("ansible_date_time") {
-            let now = chrono::Local::now();
-            let mut date_time_mapping = Mapping::new();
-
-            date_time_mapping.insert(
-                Value::String("date".to_string()),
-                Value::String(now.format("%Y-%m-%d").to_string()),
-            );
-            date_time_mapping.insert(
-                Value::String("time".to_string()),
-                Value::String(now.format("%H:%M:%S").to_string()),
-            );
-            date_time_mapping.insert(
-                Value::String("year".to_string()),
-                Value::String(now.format("%Y").to_string()),
-            );
-            date_time_mapping.insert(
-                Value::String("month".to_string()),
-                Value::String(now.format("%m").to_string()),
-            );
-            date_time_mapping.insert(
-                Value::String("day".to_string()),
-                Value::String(now.format("%d").to_string()),
-            );
-            date_time_mapping.insert(
-                Value::String("hour".to_string()),
-                Value::String(now.format("%H").to_string()),
-            );
-            date_time_mapping.insert(
-                Value::String("minute".to_string()),
-                Value::String(now.format("%M").to_string()),
-            );
-            date_time_mapping.insert(
-                Value::String("second".to_string()),
-                Value::String(now.format("%S").to_string()),
-            );
-            date_time_mapping.insert(
-                Value::String("weekday".to_string()),
-                Value::String(now.format("%A").to_string()),
-            );
-            date_time_mapping.insert(
-                Value::String("weekday_short".to_string()),
-                Value::String(now.format("%a").to_string()),
-            );
-            date_time_mapping.insert(
-                Value::String("epoch".to_string()),
-                Value::String(now.timestamp().to_string()),
-            );
-            date_time_mapping.insert(
-                Value::String("iso8601".to_string()),
-                Value::String(now.to_rfc3339()),
-            );
-
-            vars_with_date.insert(
-                "ansible_date_time".to_string(),
-                Value::Mapping(date_time_mapping),
-            );
-        }
-
-        // Create a new context with the updated vars
-        let context_with_date = crate::playbook::templar::create_tera_context(&vars_with_date)?;
+        let context = crate::playbook::templar::create_tera_context(vars)?;
         let become_user = if self.is_become {
-            let rendered = crate::playbook::templar::render_value(
-                &self.become_user,
-                tera,
-                &context_with_date,
-                true,
-            )?;
+            let rendered =
+                crate::playbook::templar::render_value(&self.become_user, tera, &context, true)?;
             let Value::String(rendered) = rendered else {
                 return Err(anyhow!("become_user must render to a string"));
             };
@@ -500,7 +438,7 @@ impl Task {
         } else {
             self.become_user.clone()
         };
-        let resolved_args = self.resolve_args(tera, &context_with_date, &vars_with_date)?;
+        let resolved_args = self.resolve_args(tera, &context, vars)?;
 
         let module_name = self.normalized_module_name();
         if !Self::is_supported_module(module_name) {
@@ -527,6 +465,9 @@ impl Task {
             return Ok(TaskResult::from_module_result(&host.name, module_result));
         }
 
+        if module_name == "setup" {
+            crate::modules::setup::validate_args(&Value::Mapping(resolved_args.clone()))?;
+        }
         let mut effective_host = host.clone();
         if let Some(connection_type) = &self.connection {
             effective_host.set_variable("ansible_connection", connection_type);
@@ -536,6 +477,7 @@ impl Task {
             Err(e) => {
                 let mut result = TaskResult::new(&host.name);
                 result.failed = true;
+                result.unreachable = true;
                 result.msg = format!("Failed to connect to host: {}", e);
                 return Ok(result);
             }
@@ -609,7 +551,7 @@ impl Task {
                 }
 
                 // 将任务变量添加到 vars_mapping 中
-                for (key, value) in vars_with_date.iter() {
+                for (key, value) in vars.iter() {
                     vars_mapping.insert(Value::String(key.clone()), value.clone());
                 }
 
@@ -1034,6 +976,10 @@ fn loop_iteration_value(
         Value::Bool(result.failed),
     );
     value.insert(
+        Value::String("unreachable".to_string()),
+        Value::Bool(result.unreachable),
+    );
+    value.insert(
         Value::String("skipped".to_string()),
         Value::Bool(result.skipped),
     );
@@ -1053,7 +999,9 @@ pub(crate) fn print_task_result(
     result: &TaskResult,
     execution_time: &str,
 ) {
-    let status = if result.failed {
+    let status = if result.unreachable {
+        "unreachable"
+    } else if result.failed {
         "failed"
     } else if result.skipped {
         "skipped"

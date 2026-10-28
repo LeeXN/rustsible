@@ -26,6 +26,13 @@ Module names and common parameters resemble Ansible, but their complete argument
 Playbook fact gathering follows the ansible-core 2.21 default: facts are gathered
 unless a play sets `gather_facts: false`. Fact gathering, `stat`, and `get_url`
 require Python 3 on managed hosts.
+Registered results and gathered facts last for the complete playbook run;
+play and task variables remain scoped to their play or task. Explicit `setup: {}`
+merges facts just like automatic gathering, including time collected on the
+managed host. With gathering disabled, Rustsible does not invent target facts.
+Failed and unreachable hosts remain excluded in subsequent plays, while healthy
+hosts continue. `ignore_errors` applies to module failures, not unreachable
+hosts. A single recap totals the complete run.
 The compatibility surface currently includes Linux architecture facts,
 `stat.path/checksum_algorithm`, `get_url.url/dest/owner/group/mode/force/checksum`
 (inline `<algorithm>:<digest>` checksums),
