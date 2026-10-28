@@ -4,10 +4,11 @@ use serde_yaml::Value;
 use std::path::Path;
 
 use crate::inventory::Host;
-use crate::modules::file::{apply_metadata_changes, inspect_path, plan_metadata_changes, PathKind};
+use crate::modules::file::{inspect_path, plan_metadata_changes, PathKind};
 use crate::modules::param::{get_optional_param, get_param, validate_params};
 use crate::modules::ModuleExecutor;
 use crate::modules::ModuleResult;
+use crate::ssh::atomic::{install, FileMetadata};
 use crate::ssh::connection::SshConnection;
 
 pub struct CopyModule;
@@ -97,34 +98,24 @@ impl ModuleExecutor for CopyModule {
         let changed = content_changed || metadata_changes.is_changed();
 
         if changed && !check_mode {
-            if content_changed {
-                if use_become {
-                    // The privileged install path may replace the inode, so
-                    // pass all requested metadata rather than only differences
-                    // measured on the previous destination.
-                    connection.write_file_bytes_with_sudo(
-                        &content,
-                        &dest,
-                        become_user,
-                        mode.clone(),
-                        owner.clone(),
-                        group.clone(),
-                    )?;
-                } else {
-                    connection.write_file_bytes(&dest, &content)?;
-                }
-            }
-
-            if metadata_changes.is_changed() && (!use_become || !content_changed) {
-                apply_metadata_changes(
-                    connection,
-                    &dest,
-                    &metadata_changes,
-                    false,
-                    use_become,
-                    become_user,
-                )?;
-            }
+            let payload = if content_changed {
+                &content
+            } else {
+                existing_content
+                    .as_deref()
+                    .context("Destination disappeared before installation")?
+            };
+            install(
+                connection,
+                &dest,
+                payload,
+                use_become.then_some(become_user),
+                FileMetadata {
+                    mode: mode.as_deref(),
+                    owner: owner.as_deref(),
+                    group: group.as_deref(),
+                },
+            )?;
         }
 
         let source_info = if let Value::Mapping(args_map) = copy_args {

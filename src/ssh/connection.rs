@@ -1,9 +1,9 @@
+use super::atomic::{self, FileMetadata};
 use anyhow::{anyhow, bail, Context, Result};
 use log::{debug, info, warn};
 #[cfg(test)]
 use mockall::automock;
-use ssh2::{CheckResult, HashType, KnownHostFileKind, OpenFlags, OpenType, Session, Stream};
-use std::fs::File;
+use ssh2::{CheckResult, HashType, KnownHostFileKind, Session, Stream};
 use std::io::{self, Read, Write};
 use std::net::{TcpStream, ToSocketAddrs};
 use std::path::{Path, PathBuf};
@@ -11,7 +11,6 @@ use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
-use uuid::Uuid;
 
 use crate::inventory::Host;
 
@@ -861,37 +860,6 @@ impl LocalConnection {
             String::from_utf8_lossy(&stderr).into_owned(),
         ))
     }
-
-    fn apply_local_metadata(
-        &self,
-        path: &str,
-        sudo_user: &str,
-        mode: Option<String>,
-        owner: Option<String>,
-        group: Option<String>,
-    ) -> Result<()> {
-        if let Some(mode) = mode {
-            let command = format!("chmod -- {} {}", shell_quote(&mode), shell_quote(path));
-            let (code, _, stderr) = self.execute_sudo_command(&command, sudo_user)?;
-            if code != 0 {
-                bail!("Failed to set local file permissions: {}", stderr.trim());
-            }
-        }
-        if owner.is_some() || group.is_some() {
-            let ownership = match (owner.as_deref(), group.as_deref()) {
-                (Some(owner), Some(group)) => format!("{owner}:{group}"),
-                (Some(owner), None) => owner.to_string(),
-                (None, Some(group)) => format!(":{group}"),
-                (None, None) => return Ok(()),
-            };
-            let command = format!("chown -- {} {}", shell_quote(&ownership), shell_quote(path));
-            let (code, _, stderr) = self.execute_sudo_command(&command, sudo_user)?;
-            if code != 0 {
-                bail!("Failed to set local file ownership: {}", stderr.trim());
-            }
-        }
-        Ok(())
-    }
 }
 
 impl SshConnection for LocalConnection {
@@ -964,16 +932,17 @@ impl SshConnection for LocalConnection {
         owner: Option<String>,
         group: Option<String>,
     ) -> Result<()> {
-        // Feed bytes directly to a file opened by the selected become user.
-        // A controller-owned 0600 temporary file is not readable when
-        // `become_user` is a non-root account.
-        let install_command = format!("umask 077; tee -- {} >/dev/null", shell_quote(remote_path));
-        let (code, _, stderr) =
-            self.execute_sudo_command_with_input(&install_command, sudo_user, content)?;
-        if code != 0 {
-            bail!("Failed to install local privileged file: {}", stderr.trim());
-        }
-        self.apply_local_metadata(remote_path, sudo_user, mode, owner, group)
+        atomic::install(
+            self,
+            remote_path,
+            content,
+            Some(sudo_user),
+            FileMetadata {
+                mode: mode.as_deref(),
+                owner: owner.as_deref(),
+                group: group.as_deref(),
+            },
+        )
     }
 
     fn write_file_content(&self, remote_path: &str, content: &str) -> Result<()> {
@@ -981,8 +950,7 @@ impl SshConnection for LocalConnection {
     }
 
     fn write_file_bytes(&self, remote_path: &str, content: &[u8]) -> Result<()> {
-        std::fs::write(remote_path, content)
-            .with_context(|| format!("Failed to write local file: {remote_path}"))
+        atomic::install(self, remote_path, content, None, FileMetadata::default())
     }
 
     fn read_file_bytes(&self, path: &str) -> Result<Option<Vec<u8>>> {
@@ -1026,9 +994,7 @@ impl SshConnection for LocalConnection {
     }
 
     fn upload_file(&self, local_path: &str, remote_path: &str) -> Result<()> {
-        std::fs::copy(local_path, remote_path)
-            .with_context(|| format!("Failed to copy local file to {remote_path}"))?;
-        Ok(())
+        self.write_file_bytes(remote_path, &std::fs::read(local_path)?)
     }
 }
 
@@ -1210,55 +1176,6 @@ impl SshClient {
         ))
     }
 
-    fn write_remote_bytes(
-        &self,
-        remote_path: &str,
-        content: &[u8],
-        mode: i32,
-        exclusive: bool,
-    ) -> Result<()> {
-        let _operation = self
-            .operation_lock
-            .lock()
-            .map_err(|_| anyhow!("SSH operation lock was poisoned"))?;
-        let sftp = self
-            .session
-            .sftp()
-            .context("Failed to initialize SFTP subsystem")?;
-        let flags = if exclusive {
-            OpenFlags::WRITE | OpenFlags::CREATE | OpenFlags::EXCLUSIVE
-        } else {
-            OpenFlags::WRITE | OpenFlags::CREATE | OpenFlags::TRUNCATE
-        };
-        let mut remote_file = sftp
-            .open_mode(Path::new(remote_path), flags, mode, OpenType::File)
-            .context("Failed to open remote file through SFTP")?;
-
-        remote_file
-            .write_all(content)
-            .context("Failed to write remote file through SFTP")?;
-        remote_file
-            .flush()
-            .context("Failed to flush remote SFTP file")?;
-        remote_file
-            .close()
-            .context("Failed to close remote SFTP file")?;
-        Ok(())
-    }
-
-    fn cleanup_remote_temp(&self, remote_path: &str, sudo_user: &str) {
-        let cleanup = format!("rm -f -- {}", shell_quote(remote_path));
-        match self.execute_sudo_command(&cleanup, sudo_user) {
-            Ok((0, _, _)) => {}
-            Ok((exit_code, _, stderr)) => warn!(
-                "Failed to clean up remote temporary file (exit {}): {}",
-                exit_code,
-                stderr.trim()
-            ),
-            Err(error) => warn!("Failed to clean up remote temporary file: {error:#}"),
-        }
-    }
-
     fn write_file_with_sudo_bytes(
         &self,
         content: &[u8],
@@ -1268,130 +1185,17 @@ impl SshClient {
         owner: Option<String>,
         group: Option<String>,
     ) -> Result<()> {
-        let temp_filename = format!("/tmp/rustsible_temp_{}", Uuid::new_v4().simple());
-        debug!("Writing privileged remote file through a unique temporary file");
-
-        let result = (|| -> Result<()> {
-            let quoted_target = shell_quote(remote_path);
-            let check_cmd = format!("test -f {quoted_target}");
-            let (file_exists_code, _, check_stderr) =
-                self.execute_sudo_command(&check_cmd, sudo_user)?;
-            let file_exists = match file_exists_code {
-                0 => true,
-                1 => false,
-                code => bail!(
-                    "Failed to inspect target file (exit {}): {}",
-                    code,
-                    check_stderr.trim()
-                ),
-            };
-
-            let (original_mode, original_owner, original_group) = if file_exists {
-                let stat_cmd = format!("stat -c '%a %U %G' -- {quoted_target}");
-                let (stat_code, stat_output, stat_stderr) =
-                    self.execute_sudo_command(&stat_cmd, sudo_user)?;
-                if stat_code != 0 {
-                    bail!("Failed to inspect target file: {}", stat_stderr.trim());
-                }
-
-                let parts: Vec<&str> = stat_output.split_whitespace().collect();
-                if parts.len() != 3 {
-                    bail!("Failed to parse target file metadata");
-                }
-                (
-                    Some(parts[0].to_string()),
-                    Some(parts[1].to_string()),
-                    Some(parts[2].to_string()),
-                )
-            } else {
-                (None, None, None)
-            };
-
-            // Create and write as the requested become identity. This keeps
-            // arbitrary bytes intact and avoids a login-user-owned 0600 file
-            // that a non-root become user cannot read.
-            let create_command = format!("umask 077; set -C; : > {}", shell_quote(&temp_filename));
-            let (create_code, _, create_stderr) =
-                self.execute_sudo_command(&create_command, sudo_user)?;
-            if create_code != 0 {
-                bail!(
-                    "Failed to create privileged temporary file: {}",
-                    create_stderr.trim()
-                );
-            }
-            let write_command = format!("tee -- {} >/dev/null", shell_quote(&temp_filename));
-            let (write_code, _, write_stderr) =
-                self.execute_sudo_command_with_input(&write_command, sudo_user, content)?;
-            if write_code != 0 {
-                bail!(
-                    "Failed to write privileged temporary file: {}",
-                    write_stderr.trim()
-                );
-            }
-
-            let target_mode = mode.or(original_mode).unwrap_or_else(|| "644".to_string());
-            let chmod_cmd = format!(
-                "chmod -- {} {}",
-                shell_quote(&target_mode),
-                shell_quote(&temp_filename)
-            );
-            let (chmod_code, _, chmod_stderr) = self.execute_sudo_command(&chmod_cmd, sudo_user)?;
-            if chmod_code != 0 {
-                bail!(
-                    "Failed to set temporary file permissions: {}",
-                    chmod_stderr.trim()
-                );
-            }
-
-            let target_owner = owner.or(original_owner);
-            let target_group = group.or(original_group);
-            let ownership = if let Some(owner) = target_owner.as_deref() {
-                Some(match target_group.as_deref() {
-                    Some(group) => format!("{owner}:{group}"),
-                    None => owner.to_string(),
-                })
-            } else {
-                target_group.as_deref().map(|group| format!(":{group}"))
-            };
-            if let Some(ownership) = ownership {
-                let chown_cmd = format!(
-                    "chown -- {} {}",
-                    shell_quote(&ownership),
-                    shell_quote(&temp_filename)
-                );
-                let (chown_code, _, chown_stderr) =
-                    self.execute_sudo_command(&chown_cmd, sudo_user)?;
-                if chown_code != 0 {
-                    bail!(
-                        "Failed to set temporary file ownership: {}",
-                        chown_stderr.trim()
-                    );
-                }
-            }
-
-            let move_cmd = format!(
-                "mv -- {} {}",
-                shell_quote(&temp_filename),
-                shell_quote(remote_path)
-            );
-            let (move_code, _, move_stderr) = self.execute_sudo_command(&move_cmd, sudo_user)?;
-            if move_code != 0 {
-                bail!(
-                    "Failed to move file to target location: {}",
-                    move_stderr.trim()
-                );
-            }
-
-            Ok(())
-        })();
-
-        if result.is_err() {
-            self.cleanup_remote_temp(&temp_filename, sudo_user);
-        }
-        result?;
-
-        info!("Successfully wrote privileged remote file");
-        Ok(())
+        atomic::install(
+            self,
+            remote_path,
+            content,
+            Some(sudo_user),
+            FileMetadata {
+                mode: mode.as_deref(),
+                owner: owner.as_deref(),
+                group: group.as_deref(),
+            },
+        )
     }
 
     pub fn connect(host: &Host) -> Result<Self> {
@@ -1614,8 +1418,7 @@ impl SshConnection for SshClient {
     }
 
     fn write_file_bytes(&self, remote_path: &str, content: &[u8]) -> Result<()> {
-        debug!("Writing remote file content through SFTP");
-        self.write_remote_bytes(remote_path, content, 0o644, false)
+        atomic::install(self, remote_path, content, None, FileMetadata::default())
     }
 
     fn write_file_bytes_with_sudo(
@@ -1696,34 +1499,9 @@ impl SshConnection for SshClient {
     }
 
     fn upload_file(&self, local_path: &str, remote_path: &str) -> Result<()> {
-        let mut local_file = File::open(local_path)
-            .with_context(|| format!("Failed to open local file: {local_path}"))?;
-        let _operation = self
-            .operation_lock
-            .lock()
-            .map_err(|_| anyhow!("SSH operation lock was poisoned"))?;
-        let sftp = self
-            .session
-            .sftp()
-            .context("Failed to initialize SFTP subsystem")?;
-        let mut remote_file = sftp
-            .open_mode(
-                Path::new(remote_path),
-                OpenFlags::WRITE | OpenFlags::CREATE | OpenFlags::TRUNCATE,
-                0o644,
-                OpenType::File,
-            )
-            .context("Failed to open remote upload path through SFTP")?;
-
-        io::copy(&mut local_file, &mut remote_file)
-            .context("Failed to transfer file contents through SFTP")?;
-        remote_file
-            .flush()
-            .context("Failed to flush remote SFTP upload")?;
-        remote_file
-            .close()
-            .context("Failed to close remote SFTP upload")?;
-        Ok(())
+        let content = std::fs::read(local_path)
+            .with_context(|| format!("Failed to read upload source: {local_path}"))?;
+        self.write_file_bytes(remote_path, &content)
     }
 }
 

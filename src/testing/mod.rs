@@ -6,6 +6,42 @@
 use anyhow::Result;
 use serde_yaml::Value;
 
+/// Exercise the actual filesystem xattr API so a metadata-preservation test
+/// fails if its environment cannot preserve the protection being asserted.
+#[cfg(all(test, target_os = "linux"))]
+pub(crate) fn test_xattr(path: &std::path::Path, name: &str, value: Option<&[u8]>) -> Vec<u8> {
+    use std::os::fd::AsRawFd;
+    let file = std::fs::File::open(path).unwrap();
+    let name = std::ffi::CString::new(name).unwrap();
+    if let Some(value) = value {
+        // SAFETY: the file, terminated name and value slice remain alive
+        // throughout the call; the buffer length matches the slice length.
+        let result = unsafe {
+            libc::fsetxattr(
+                file.as_raw_fd(),
+                name.as_ptr(),
+                value.as_ptr().cast(),
+                value.len(),
+                0,
+            )
+        };
+        assert_eq!(result, 0, "{}", std::io::Error::last_os_error());
+    }
+    let mut output = vec![0u8; 256];
+    // SAFETY: output is writable for exactly the supplied number of bytes.
+    let length = unsafe {
+        libc::fgetxattr(
+            file.as_raw_fd(),
+            name.as_ptr(),
+            output.as_mut_ptr().cast(),
+            output.len(),
+        )
+    };
+    assert!(length >= 0, "{}", std::io::Error::last_os_error());
+    output.truncate(length as usize);
+    output
+}
+
 /// Common test result type for module tests
 pub type ModuleTestResult = Result<(bool, String)>;
 

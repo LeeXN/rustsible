@@ -4,11 +4,10 @@ use regex::Regex;
 use serde_yaml::Value;
 
 use crate::inventory::Host;
-use crate::modules::file::{
-    apply_metadata_changes, inspect_path, plan_metadata_changes, quote_posix_shell_arg, PathKind,
-};
+use crate::modules::file::{inspect_path, plan_metadata_changes, quote_posix_shell_arg, PathKind};
 use crate::modules::param::{get_optional_param, get_param, validate_params};
 use crate::modules::ModuleResult;
+use crate::ssh::atomic::{install, FileMetadata};
 use crate::ssh::connection::{Connection, SshConnection};
 
 fn run(
@@ -43,31 +42,6 @@ fn read_content(
             .with_context(|| format!("File {} disappeared while it was being inspected", path))?
     };
     String::from_utf8(bytes).with_context(|| format!("File {} is not valid UTF-8", path))
-}
-
-fn write_content(
-    connection: &dyn SshConnection,
-    path: &str,
-    content: &str,
-    use_become: bool,
-    become_user: &str,
-) -> Result<()> {
-    if use_become {
-        // Feed file data over stdin: content is never interpolated into a
-        // shell command, and the selected become user is preserved.
-        let command = format!("tee -- {} >/dev/null", quote_posix_shell_arg(path)?);
-        let (code, _, stderr) = connection.execute_sudo_command_with_input(
-            &command,
-            become_user,
-            content.as_bytes(),
-        )?;
-        if code != 0 {
-            bail!("Failed to write file {}: {}", path, stderr.trim());
-        }
-    } else {
-        connection.write_file_content(path, content)?;
-    }
-    Ok(())
 }
 
 fn validate_new_metadata(
@@ -205,45 +179,20 @@ pub fn execute(
                     bail!("Failed to create backup {}: {}", backup_path, stderr.trim());
                 }
             }
-            write_content(connection, &path, &content, use_become, become_user)?;
         }
 
-        if file_exists {
-            if let Some(changes) = existing_metadata_changes.as_ref() {
-                if changes.is_changed() {
-                    apply_metadata_changes(
-                        connection,
-                        &path,
-                        changes,
-                        false,
-                        use_become,
-                        become_user,
-                    )?;
-                }
-            }
-        } else if creates_file && (mode.is_some() || owner.is_some() || group.is_some()) {
-            // Inspect the actual defaults after creation, then apply only the
-            // requested differences.
-            let created = inspect_path(connection, &path, use_become, become_user)?;
-            if created.kind != PathKind::File {
-                bail!("Newly created path {} is not a regular file", path);
-            }
-            let changes = plan_metadata_changes(
-                &created,
-                mode.as_deref(),
-                owner.as_deref(),
-                group.as_deref(),
+        if changed {
+            install(
+                connection,
+                &path,
+                content.as_bytes(),
+                use_become.then_some(become_user),
+                FileMetadata {
+                    mode: mode.as_deref(),
+                    owner: owner.as_deref(),
+                    group: group.as_deref(),
+                },
             )?;
-            if changes.is_changed() {
-                apply_metadata_changes(
-                    connection,
-                    &path,
-                    &changes,
-                    false,
-                    use_become,
-                    become_user,
-                )?;
-            }
         }
     }
 
