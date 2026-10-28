@@ -8,10 +8,11 @@ use std::path::Path;
 use tera::{Context as TeraContext, Tera};
 
 use crate::inventory::Host;
-use crate::modules::file::{apply_metadata_changes, inspect_path, plan_metadata_changes, PathKind};
+use crate::modules::file::{inspect_path, plan_metadata_changes, PathKind};
 use crate::modules::param::{get_optional_param, get_param, validate_params};
 use crate::modules::ModuleResult;
 use crate::playbook::filters::register_ansible_filters;
+use crate::ssh::atomic::{install, FileMetadata};
 use crate::ssh::connection::{Connection, SshConnection};
 
 /// Execute the template module logic: render and upload a template, set permissions/ownership if needed.
@@ -192,31 +193,24 @@ pub fn execute(
     let changed = content_changed || metadata_changes.is_changed();
 
     if changed && !check_mode {
-        if content_changed {
-            if use_become {
-                connection.write_file_bytes_with_sudo(
-                    rendered_bytes,
-                    &dest,
-                    become_user,
-                    mode.clone(),
-                    owner.clone(),
-                    group.clone(),
-                )?;
-            } else {
-                connection.write_file_bytes(&dest, rendered_bytes)?;
-            }
-        }
-
-        if metadata_changes.is_changed() && (!use_become || !content_changed) {
-            apply_metadata_changes(
-                connection,
-                &dest,
-                &metadata_changes,
-                false,
-                use_become,
-                become_user,
-            )?;
-        }
+        let payload = if content_changed {
+            rendered_bytes
+        } else {
+            existing_content
+                .as_deref()
+                .context("Destination disappeared before installation")?
+        };
+        install(
+            connection,
+            &dest,
+            payload,
+            use_become.then_some(become_user),
+            FileMetadata {
+                mode: mode.as_deref(),
+                owner: owner.as_deref(),
+                group: group.as_deref(),
+            },
+        )?;
     }
 
     info!("Template rendering completed successfully");

@@ -39,6 +39,17 @@ The compatibility surface currently includes Linux architecture facts,
 `systemd.name/enabled/state/daemon_reload`, `copy.force`, and `default(omit)`.
 The systemd module rejects non-systemd hosts explicitly.
 
+`copy`, `template`, and `lineinfile` prepare replacements in a private directory
+on the destination filesystem before committing them. They preserve existing
+permissions, ownership, ACLs, and extended attributes unless explicitly changed;
+preparation failures leave the original inode intact. Destinations must be
+regular files or absent: symbolic links are rejected. This transitional file
+installer requires GNU coreutils (`cp`, `stat`, `mktemp`, `sync`, `mv`) on targets;
+it fails if protection metadata cannot be preserved.
+`get_url` also installs downloads atomically. With `force: false`, an existing
+file is retained without a request unless a supplied checksum differs. Invalid
+mode, identity, and checksum values fail before downloading or replacing files.
+
 ## Build
 
 Install a current stable Rust toolchain, then run:
@@ -233,6 +244,15 @@ cargo test modules::file
 For a staged hands-on acceptance run covering local execution, SSH, check mode,
 idempotency, privilege escalation, failure handling, concurrency, and log
 redaction, follow [`MANUAL_TEST_PLAN.md`](MANUAL_TEST_PLAN.md).
+
+`bash tests/ssh/run.sh target/debug/rustsible` runs an isolated Docker SSH target
+with strict host-key verification. It checks deploy/root/app execution identities,
+check-mode business-state equality, idempotency, cross-play facts/registers,
+file bytes and metadata, and temporary-file cleanup. The fixture installs Python
+for the current setup/get_url implementation; it is not a no-Python acceptance.
+The proposed native x86_64/aarch64 CI job is in
+[`tests/ssh/ci-workflow.patch`](tests/ssh/ci-workflow.patch). It has not been
+activated: the current GitHub credential lacks permission to change workflows.
 
 Dependency advisories are checked in CI against `Cargo.lock`. CI also enforces
 an 80% line-coverage floor; the current all-target result is 81.12%. This is a
