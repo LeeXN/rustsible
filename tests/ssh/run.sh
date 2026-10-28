@@ -102,6 +102,20 @@ diff -u "$fixture_dir/before" "$fixture_dir/after"
 "$binary" playbook "$fixture_dir/playbook.yml" -i "$fixture_dir/inventory" > "$fixture_dir/second.log"
 # `id -un` is the sole command task and reports changed on each real execution.
 [[ $(grep -c 'ok=6 changed=1 unreachable=0 failed=0' "$fixture_dir/second.log") == 3 ]]
+cat > "$fixture_dir/unsafe-parent.yml" <<'EOF'
+- hosts: root
+  gather_facts: false
+  vars:
+    ansible_host: 127.0.0.1
+  tasks:
+    - copy:
+        content: must-not-change
+        dest: /srv/rustsible/app/executable
+EOF
+if "$binary" playbook "$fixture_dir/unsafe-parent.yml" -i "$fixture_dir/inventory" > "$fixture_dir/unsafe-parent.log" 2>&1; then
+    echo 'Unsafe cross-owner staging unexpectedly succeeded' >&2; exit 1
+fi
+grep -q 'Unsafe destination directory owner' "$fixture_dir/unsafe-parent.log"
 docker exec "$container" sh -eu -c '
     for pair in plain:deploy root:root app:app; do
         name=${pair%:*}; user=${pair#*:}; base=/srv/rustsible/$name

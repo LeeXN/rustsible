@@ -66,7 +66,10 @@ Ownership is applied before mode/ACL/xattr so `chown` cannot silently clear
 set-id bits or extended metadata in the prepared file. Destinations must be
 regular files or absent: symbolic links are rejected. This transitional file
 installer requires GNU coreutils (`cp`, `stat`, `mktemp`, `sync`, `mv`) on targets;
-it fails if protection metadata cannot be preserved.
+it fails if protection metadata cannot be preserved. The transitional installer
+also requires a parent owned by root or the execution identity, and sticky-bit
+protection when a group or other users can write there. Unsafe parents fail
+explicitly; use the directory's owner as the execution identity.
 `get_url` also installs downloads atomically. With `force: false`, an existing
 file is retained without a request unless a supplied checksum differs. Invalid
 mode, identity, and checksum values fail before downloading or replacing files.

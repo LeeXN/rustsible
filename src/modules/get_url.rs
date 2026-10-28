@@ -37,7 +37,10 @@ def desired_identity(value, resolver):
         return None
     if not value or ":" in value or any(ord(c) < 32 for c in value):
         raise RuntimeError("invalid file owner or group")
-    return int(value) if value.isdigit() else resolver(value)
+    identity = int(value) if value.isascii() and value.isdigit() else resolver(value)
+    if identity < 0 or identity >= 4294967295:
+        raise RuntimeError("numeric file identity must be between 0 and 4294967294")
+    return identity
 
 def snapshot():
     try:
@@ -68,6 +71,15 @@ if checksum is not None:
         raise RuntimeError("checksum must use <algorithm>:<hex digest> format")
     checksum_value = checksum_value.lower()
 
+# Pin relative filesystem operations to the selected directory. A renamed
+# ancestor must not redirect later metadata or temporary-file operations.
+display_dest = dest
+directory = os.path.dirname(dest) or "."
+dest = os.path.basename(dest)
+if not dest or dest in (".", ".."):
+    raise RuntimeError("destination must identify a regular filename")
+os.chdir(directory)
+directory = "."
 original = snapshot()
 existing = original is not None
 skip_download = existing and not p["force"] and (
@@ -79,16 +91,20 @@ metadata_changed = existing and (
     (gid is not None and original.st_gid != gid)
 )
 if skip_download and not metadata_changed:
-    print(json.dumps({"changed": False, "checksum_src": digest_file(dest, "sha1"), "dest": dest}))
+    print(json.dumps({"changed": False, "checksum_src": digest_file(dest, "sha1"), "dest": display_dest}))
     raise SystemExit(0)
+directory_metadata = os.stat(".")
+if directory_metadata.st_uid not in (0, os.geteuid()):
+    raise RuntimeError("Unsafe destination directory owner; execute as its owner")
+if directory_metadata.st_mode & 0o022 and not directory_metadata.st_mode & stat.S_ISVTX:
+    raise RuntimeError("Unsafe destination directory: writable staging entries need the sticky bit")
 if p["check_mode"]:
     if not skip_download:
         with urllib.request.urlopen(urllib.request.Request(url, method="HEAD"), timeout=30):
             pass
-    print(json.dumps({"changed": True, "dest": dest}))
+    print(json.dumps({"changed": True, "dest": display_dest}))
     raise SystemExit(0)
 
-directory = os.path.dirname(dest) or "."
 # A private directory avoids exposing content when preserved permissions allow
 # other users to read the prepared inode before its final atomic installation.
 with tempfile.TemporaryDirectory(prefix=".rustsible-get-url-", dir=directory) as staging:
@@ -142,7 +158,7 @@ with tempfile.TemporaryDirectory(prefix=".rustsible-get-url-", dir=directory) as
             raise RuntimeError("destination changed during download")
         os.replace(temporary, dest)
 
-print(json.dumps({"changed": content_changed or metadata_changed, "checksum_src": source_sha1, "dest": dest}))
+print(json.dumps({"changed": content_changed or metadata_changed, "checksum_src": source_sha1, "dest": display_dest}))
 "#;
 
 pub fn execute(
@@ -350,6 +366,8 @@ mod tests {
         server.join().unwrap();
         for (key, value, error) in [
             ("mode", "888", "mode must"),
+            ("owner", "4294967295", "numeric file identity"),
+            ("dest", "/tmp/", "destination must"),
             ("owner", "missing-rustsible-account-99999", "getpwnam"),
             ("checksum", "sha1:not-a-digest", "checksum must"),
         ] {
@@ -374,6 +392,25 @@ mod tests {
                 original.gid()
             )
         );
+        assert_eq!(std::fs::read_dir(directory.path()).unwrap().count(), 1);
+    }
+
+    #[test]
+    fn unsafe_download_parent_is_rejected_before_contacting_server() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("artifact");
+        std::fs::write(&path, b"original").unwrap();
+        std::fs::set_permissions(directory.path(), std::fs::Permissions::from_mode(0o777)).unwrap();
+        let args = serde_yaml::to_value(serde_json::json!({
+            "url": "http://127.0.0.1:1/unreachable", "dest": path, "force": true,
+        }))
+        .unwrap();
+        let connection = LocalConnection::new(&Host::new("localhost")).unwrap();
+        assert!(execute(&connection, &args, false, "root", false)
+            .unwrap_err()
+            .to_string()
+            .contains("Unsafe destination directory"));
+        assert_eq!(std::fs::read(path).unwrap(), b"original");
         assert_eq!(std::fs::read_dir(directory.path()).unwrap().count(), 1);
     }
 
