@@ -246,6 +246,9 @@ Only the subset exercised by this repository's tests should be considered suppor
 
 ## Development and testing
 
+See [DEVELOPMENT_STATUS.md](DEVELOPMENT_STATUS.md) for the staged plan's
+implemented items, validation evidence, and outstanding work.
+
 The CI-equivalent local checks are:
 
 ```bash
@@ -282,8 +285,7 @@ tests. The comparison checks target file bytes, including literal runtime
 output, defaults/omit, loop values, string types, and rejected string conditions.
 
 Dependency advisories are checked in CI against `Cargo.lock`. CI also enforces
-an 80% line-coverage floor; the current all-target result is 81.12%. This is a
-regression baseline, not a claim that every remote SSH path is exercised end to
+an 80% line-coverage floor. This is a regression baseline, not a claim that every remote SSH path is exercised end to
 end.
 
 ## License
