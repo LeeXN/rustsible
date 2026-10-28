@@ -48,7 +48,7 @@
     - name: List each file
       debug:
         msg: "{{ item }}"
-      loop: "{{ txt_files.stdout_lines | default(value=[]) }}"
+      loop: "{{ txt_files.stdout_lines | default([]) }}"
     
     - name: Check disk usage
       command: df -h

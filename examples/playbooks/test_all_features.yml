@@ -357,7 +357,7 @@
           ✅ Features Demonstrated:
           - Complex variable structures and nested data
           - Conditional execution with when statements
-          - Template rendering with Tera engine
+          - Template rendering with MiniJinja engine
           - Loop execution with complex data structures
           - User and group management
           - File and directory operations

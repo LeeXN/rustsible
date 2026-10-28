@@ -18,6 +18,75 @@ fn local_inventory() -> NamedTempFile {
 }
 
 #[test]
+fn sources_follow_playbook_directory_and_runtime_output_is_not_retemplated() -> Result<()> {
+    let project = TempDir::new()?;
+    let unrelated = TempDir::new()?;
+    let inventory_file = local_inventory();
+    std::fs::write(project.path().join("input.bin"), [0, 255, 42])?;
+    std::fs::write(
+        project.path().join("input.j2"),
+        "{{ result.stdout }}|{{ missing | default('0012') }}|{{ number_string }}",
+    )?;
+    let playbook = project.path().join("site.yml");
+    std::fs::write(
+        &playbook,
+        format!(
+            r#"- hosts: localhost
+  gather_facts: false
+  vars:
+    number_string: '0012'
+  tasks:
+    - shell: printf '\173\173 should_never_render \175\175'
+      register: result
+    - copy:
+        src: input.bin
+        dest: {0}/binary
+    - template:
+        src: input.j2
+        dest: {0}/rendered
+    - copy:
+        content: "{{{{ result.stdout }}}}|{{{{ missing | default('0012') }}}}|{{{{ number_string }}}}"
+        dest: {0}/copied
+    - template:
+        content: '{{{{ result.stdout }}}}'
+        dest: {0}/inline
+"#,
+            project.path().display()
+        ),
+    )?;
+    let output = Command::new(env!("CARGO_BIN_EXE_rustsible"))
+        .current_dir(unrelated.path())
+        .args([
+            "playbook",
+            playbook.to_str().unwrap(),
+            "-i",
+            inventory_file.path().to_str().unwrap(),
+        ])
+        .output()?;
+    assert!(
+        output.status.success(),
+        "{}\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(std::fs::read(project.path().join("binary"))?, [0, 255, 42]);
+    let expected = "{{ should_never_render }}|0012|0012";
+    assert_eq!(
+        std::fs::read_to_string(project.path().join("rendered"))?,
+        expected
+    );
+    assert_eq!(
+        std::fs::read_to_string(project.path().join("copied"))?,
+        expected
+    );
+    assert_eq!(
+        std::fs::read_to_string(project.path().join("inline"))?,
+        "{{ should_never_render }}"
+    );
+    Ok(())
+}
+
+#[test]
 fn registered_results_survive_plays_but_play_and_task_vars_do_not() -> Result<()> {
     let inventory_file = local_inventory();
     let output_dir = TempDir::new()?;

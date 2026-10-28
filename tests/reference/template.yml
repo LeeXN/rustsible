@@ -1,0 +1,26 @@
+- hosts: all
+  gather_facts: false
+  vars:
+    number_string: '0012'
+    alias: '{{ number_string }}'
+  tasks:
+    - shell: printf '\173\173 should_never_render \175\175'
+      register: output
+    - copy:
+        content: '{{ alias }}'
+        dest: '@OUTPUT@/number'
+        mode: '{{ missing_mode | default(omit) }}'
+    - copy:
+        content: '{{ true | string }}'
+        dest: '@OUTPUT@/boolean-text'
+    - template:
+        src: input.j2
+        dest: '@OUTPUT@/template'
+    - copy:
+        content: '{{ item }}'
+        dest: '@OUTPUT@/loop-{{ item }}'
+      loop: ['{{ number_string }}', '0042']
+    - copy:
+        content: compared
+        dest: '@OUTPUT@/condition'
+      when: number_string == '0012'

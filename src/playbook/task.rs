@@ -1,15 +1,15 @@
+use crate::playbook::templar::TemplateContext;
 #[allow(unused_imports)]
 use anyhow::Result;
 use anyhow::{anyhow, Context};
 use log::{debug, info, warn};
+use minijinja::Environment;
 use serde_yaml::{Mapping, Value};
 use std::collections::HashMap;
 use std::time::Instant;
-use tera::{Context as TeraContext, Tera};
 
 use crate::inventory::Host;
 use crate::modules::ModuleResult;
-use crate::playbook::filters::register_ansible_filters;
 use crate::ssh::connection::Connection;
 
 const MAX_ARGUMENT_TEMPLATE_DEPTH: usize = 64;
@@ -98,6 +98,8 @@ pub struct Task {
     pub name: String,
     pub module: String,
     pub args: Mapping,
+    /// Absolute source file anchors local resources independently of cwd.
+    pub source_file: Option<std::path::PathBuf>,
     /// The task-level `become` setting. `None` inherits the play setting,
     /// while `Some(false)` explicitly disables play-level escalation.
     pub become_override: Option<bool>,
@@ -120,26 +122,6 @@ pub struct Task {
     pub loop_items: Option<Value>,
     pub loop_var_name: Option<String>, // Name for loop variable (default: item)
     pub index_var_name: Option<String>, // Name for index variable
-}
-
-// Helper function to check for and extract simple variable names like {{ var }} or {{ var.sub_var }}
-fn extract_simple_variable(input: &str) -> Option<&str> {
-    let trimmed = input.trim();
-    if trimmed.starts_with("{{") && trimmed.ends_with("}}") {
-        let inner = trimmed[2..trimmed.len() - 2].trim();
-        // Allow alphanumeric, underscore, and dot for nested access
-        if !inner.is_empty()
-            && inner
-                .chars()
-                .all(|c| c.is_alphanumeric() || c == '_' || c == '.')
-            && !inner.starts_with('.')
-            && !inner.ends_with('.')
-            && !inner.contains("..")
-        {
-            return Some(inner);
-        }
-    }
-    None
 }
 
 // Helper to perform nested lookups like "application.features"
@@ -176,23 +158,39 @@ impl Task {
         vars: &HashMap<String, Value>,
         check_mode: bool,
     ) -> Result<TaskResult> {
+        self.execute_with_definitions(host, &HashMap::new(), vars, check_mode)
+    }
+
+    pub(crate) fn execute_with_definitions(
+        &self,
+        host: &Host,
+        data: &HashMap<String, Value>,
+        definitions: &HashMap<String, Value>,
+        check_mode: bool,
+    ) -> Result<TaskResult> {
+        let mut definitions = definitions.clone();
+        for (name, value) in &self.vars {
+            let name = name
+                .as_str()
+                .context("Task variable names must be strings")?;
+            definitions.insert(name.to_owned(), value.clone());
+        }
+        let vars = crate::playbook::templar::resolve_definitions(&definitions, data)?;
         let start_time = Instant::now();
         info!("TASK [{}] on host {}", self.name, host.name);
 
-        let vars = self.merge_task_vars(vars)?;
         // A task may opt into check mode, but it must never opt out of a
         // command-line dry run and unexpectedly mutate the target.
         let check_mode = check_mode || self.check_mode.unwrap_or(false);
 
-        let mut tera = Tera::default();
-        register_ansible_filters(&mut tera);
+        let mut engine = crate::playbook::templar::environment();
         let mut results = Vec::new();
         let mut registered_loop_results = Vec::new();
 
         if let Some(items) = &self.loop_items {
-            let initial_context = crate::playbook::templar::create_tera_context(&vars)?;
+            let initial_context = crate::playbook::templar::create_context(&vars)?;
             let items_list =
-                match self.resolve_loop_items(items, &mut tera, &initial_context, &vars)? {
+                match self.resolve_loop_items(items, &mut engine, &initial_context, &vars)? {
                     Some(list) => list,
                     None => {
                         let mut result = TaskResult::new(&host.name);
@@ -224,11 +222,11 @@ impl Task {
                     iter_vars.insert(index_var.clone(), Value::Number(idx.into()));
                 }
 
-                let iter_context = crate::playbook::templar::create_tera_context(&iter_vars)?;
+                let iter_context = crate::playbook::templar::create_context(&iter_vars)?;
 
                 if let Some(when) = &self.when {
-                    let mut condition_tera = Tera::default();
-                    if !self.evaluate_condition(when, &mut condition_tera, &iter_context)? {
+                    let mut condition_engine = crate::playbook::templar::environment();
+                    if !self.evaluate_condition(when, &mut condition_engine, &iter_context)? {
                         debug!("Skipping loop iteration due to when condition");
                         let mut result = TaskResult::new(&host.name);
                         result.skipped = true;
@@ -260,7 +258,7 @@ impl Task {
 
                 let mut result = match iter_task.execute_module(
                     host,
-                    &mut tera,
+                    &mut engine,
                     &iter_context,
                     &iter_vars,
                     check_mode,
@@ -296,10 +294,10 @@ impl Task {
                 results.push(result);
             }
         } else {
-            let context = crate::playbook::templar::create_tera_context(&vars)?;
+            let context = crate::playbook::templar::create_context(&vars)?;
             if let Some(when) = &self.when {
-                let mut condition_tera = Tera::default();
-                if !self.evaluate_condition(when, &mut condition_tera, &context)? {
+                let mut condition_engine = crate::playbook::templar::environment();
+                if !self.evaluate_condition(when, &mut condition_engine, &context)? {
                     debug!("Skipping task due to when condition");
                     let mut result = TaskResult::new(&host.name);
                     result.skipped = true;
@@ -315,7 +313,7 @@ impl Task {
                 }
             }
 
-            let mut result = self.execute_module(host, &mut tera, &context, &vars, check_mode)?;
+            let mut result = self.execute_module(host, &mut engine, &context, &vars, check_mode)?;
             result.no_log = self.no_log;
             results.push(result);
         }
@@ -395,25 +393,11 @@ impl Task {
         Ok(final_result)
     }
 
-    fn merge_task_vars(
-        &self,
-        inherited: &HashMap<String, Value>,
-    ) -> Result<HashMap<String, Value>> {
-        let mut merged = inherited.clone();
-        for (key, value) in &self.vars {
-            let Value::String(key) = key else {
-                return Err(anyhow!("Task variable names must be strings"));
-            };
-            merged.insert(key.clone(), value.clone());
-        }
-        Ok(merged)
-    }
-
     fn execute_module(
         &self,
         host: &Host,
-        tera: &mut Tera,
-        _context: &TeraContext,
+        engine: &mut Environment<'_>,
+        _context: &TemplateContext,
         vars: &HashMap<String, Value>,
         check_mode: bool,
     ) -> Result<TaskResult> {
@@ -422,10 +406,10 @@ impl Task {
             self.module, self.name
         );
 
-        let context = crate::playbook::templar::create_tera_context(vars)?;
+        let context = crate::playbook::templar::create_context(vars)?;
         let become_user = if self.is_become {
             let rendered =
-                crate::playbook::templar::render_value(&self.become_user, tera, &context, true)?;
+                crate::playbook::templar::render_value(&self.become_user, engine, &context, true)?;
             let Value::String(rendered) = rendered else {
                 return Err(anyhow!("become_user must render to a string"));
             };
@@ -438,9 +422,25 @@ impl Task {
         } else {
             self.become_user.clone()
         };
-        let resolved_args = self.resolve_args(tera, &context, vars)?;
+        let mut resolved_args = self.resolve_args(engine, &context, vars)?;
 
         let module_name = self.normalized_module_name();
+        if matches!(module_name, "copy" | "template") {
+            if let (Some(source), Some(Value::String(src))) = (
+                &self.source_file,
+                resolved_args.get_mut(Value::String("src".into())),
+            ) {
+                let path = std::path::Path::new(src);
+                if path.is_relative() {
+                    *src = source
+                        .parent()
+                        .context("Task source has no parent directory")?
+                        .join(path)
+                        .to_string_lossy()
+                        .into_owned();
+                }
+            }
+        }
         if !Self::is_supported_module(module_name) {
             return Err(anyhow!("Unsupported module: {}", self.module));
         }
@@ -536,40 +536,14 @@ impl Task {
                 &become_user,
                 check_mode,
             )?,
-            "template" => {
-                debug!("Executing template module");
-
-                // 为模板添加任务变量到 resolved_args 中
-                let mut template_args = resolved_args.clone();
-
-                // 如果已有 vars 参数，则合并；否则创建新的
-                let mut vars_mapping = Mapping::new();
-                if let Some(Value::Mapping(existing_vars)) =
-                    template_args.get(Value::String("vars".to_string()))
-                {
-                    vars_mapping = existing_vars.clone();
-                }
-
-                // 将任务变量添加到 vars_mapping 中
-                for (key, value) in vars.iter() {
-                    vars_mapping.insert(Value::String(key.clone()), value.clone());
-                }
-
-                // 更新 template_args 中的 vars 参数
-                template_args.insert(
-                    Value::String("vars".to_string()),
-                    Value::Mapping(vars_mapping),
-                );
-
-                debug!("Added task variables to template context");
-                crate::modules::template::execute(
-                    connection,
-                    &Value::Mapping(template_args),
-                    self.is_become,
-                    &become_user,
-                    check_mode,
-                )?
-            }
+            "template" => crate::modules::template::execute_with_context(
+                connection,
+                &Value::Mapping(resolved_args),
+                self.is_become,
+                &become_user,
+                check_mode,
+                vars,
+            )?,
             "package" => {
                 debug!("Executing package module");
                 crate::modules::package::execute(
@@ -656,17 +630,17 @@ impl Task {
     fn evaluate_condition(
         &self,
         condition: &Value,
-        tera: &mut Tera,
-        context: &TeraContext,
+        engine: &mut Environment<'_>,
+        context: &TemplateContext,
     ) -> Result<bool> {
         match condition {
             Value::String(condition) => {
-                crate::playbook::templar::evaluate_condition(condition, tera, context)
+                crate::playbook::templar::evaluate_condition(condition, engine, context)
             }
             Value::Bool(value) => Ok(*value),
             Value::Sequence(conditions) => {
                 for condition in conditions {
-                    if !self.evaluate_condition(condition, tera, context)? {
+                    if !self.evaluate_condition(condition, engine, context)? {
                         return Ok(false);
                     }
                 }
@@ -681,37 +655,21 @@ impl Task {
     fn resolve_loop_items(
         &self,
         items: &Value,
-        tera: &mut Tera,
-        context: &TeraContext,
-        vars: &HashMap<String, Value>,
+        engine: &mut Environment<'_>,
+        context: &TemplateContext,
+        _vars: &HashMap<String, Value>,
     ) -> Result<Option<Vec<Value>>> {
         match items {
-            Value::Sequence(seq) => Ok(Some(seq.clone())),
+            Value::Sequence(_) => {
+                let Value::Sequence(items) =
+                    self.render_argument_value(items, engine, context, false, false, 0, &mut 0)?
+                else {
+                    unreachable!("Rendering a sequence preserves its type");
+                };
+                Ok(Some(items))
+            }
             Value::String(var_name) => {
-                // Try direct variable lookup first for simple OR nested cases like "{{ my_list }}" or "{{ data.list }}"
-                if let Some(key_str) = extract_simple_variable(var_name) {
-                    debug!("Resolving a loop through direct variable lookup");
-                    // Use the new nested lookup helper
-                    if let Some(value) = get_nested_value(key_str, vars) {
-                        match value {
-                            Value::Sequence(seq) => {
-                                debug!("Resolved a loop sequence through direct lookup");
-                                return Ok(Some(seq.clone()));
-                            }
-                            _ => {
-                                warn!("A loop variable was not a sequence; falling back to template rendering");
-                                // Fall through to render_value
-                            }
-                        }
-                    } else {
-                        warn!("A loop variable was not found by direct lookup; falling back to template rendering");
-                        // Fall through to render_value
-                    }
-                }
-
-                // Fallback to rendering for complex expressions or if direct lookup failed
-                debug!("Resolving loop items through template rendering");
-                match crate::playbook::templar::render_value(var_name, tera, context, false) {
+                match crate::playbook::templar::render_value(var_name, engine, context, false) {
                     Ok(Value::Sequence(resolved_seq)) => Ok(Some(resolved_seq)),
                     Ok(Value::String(s))
                         if !var_name.contains("{{") && !var_name.contains("{%") =>
@@ -744,8 +702,8 @@ impl Task {
 
     fn resolve_args(
         &self,
-        _tera: &mut Tera, // Original Tera instance (can be kept for potential future shared state)
-        context: &TeraContext,
+        engine: &mut Environment<'_>,
+        context: &TemplateContext,
         vars: &HashMap<String, Value>,
     ) -> Result<Mapping> {
         let mut resolved = Mapping::new();
@@ -754,17 +712,6 @@ impl Task {
             self.args.len(),
             self.name
         );
-
-        // Use a fresh Tera instance for argument rendering to isolate filter registration
-        let mut arg_tera = Tera::default();
-
-        // Register custom filters needed for Ansible compatibility
-        register_ansible_filters(&mut arg_tera);
-
-        // 添加更多有用的过滤器和函数，特别是处理数值比较和条件表达式
-        arg_tera
-            .add_raw_template("tmp_if_expr", "{% if true %}true{% else %}false{% endif %}")
-            .context("Failed to initialize the argument template engine")?;
 
         let module_name = self.normalized_module_name();
         let mut rendered_nodes = 0;
@@ -781,10 +728,15 @@ impl Task {
             let is_mode_param =
                 matches!(module_name, "file" | "copy" | "template") && key == "mode";
 
+            if module_name == "template" && matches!(key.as_str(), "content" | "vars") {
+                resolved.insert(Value::String(key.clone()), value.clone());
+                continue;
+            }
+
             let rendered_value = self
                 .render_argument_value(
                     value,
-                    &mut arg_tera,
+                    engine,
                     context,
                     force_string,
                     is_mode_param,
@@ -832,8 +784,8 @@ impl Task {
     fn render_argument_value(
         &self,
         value: &Value,
-        tera: &mut Tera,
-        context: &TeraContext,
+        engine: &mut Environment<'_>,
+        context: &TemplateContext,
         force_string: bool,
         is_mode_param: bool,
         depth: usize,
@@ -859,7 +811,7 @@ impl Task {
         match value {
             Value::String(value) => {
                 let rendered_value =
-                    crate::playbook::templar::render_value(value, tera, context, force_string)?;
+                    crate::playbook::templar::render_value(value, engine, context, force_string)?;
 
                 if is_mode_param {
                     if let Value::String(mode) = &rendered_value {
@@ -872,32 +824,14 @@ impl Task {
                     }
                 }
 
-                // A rendered scalar can itself resolve to structured YAML/JSON.
-                // Walk that structure too, so strings sourced from variables
-                // receive the same treatment as structures written inline.
-                if matches!(
-                    rendered_value,
-                    Value::Mapping(_) | Value::Sequence(_) | Value::Tagged(_)
-                ) {
-                    self.render_argument_value(
-                        &rendered_value,
-                        tera,
-                        context,
-                        force_string,
-                        is_mode_param,
-                        depth + 1,
-                        rendered_nodes,
-                    )
-                } else {
-                    Ok(rendered_value)
-                }
+                Ok(rendered_value)
             }
             Value::Sequence(values) => values
                 .iter()
                 .map(|value| {
                     self.render_argument_value(
                         value,
-                        tera,
+                        engine,
                         context,
                         force_string,
                         is_mode_param,
@@ -915,7 +849,7 @@ impl Task {
                     };
                     let value = self.render_argument_value(
                         value,
-                        tera,
+                        engine,
                         context,
                         force_string,
                         is_mode_param,
@@ -930,7 +864,7 @@ impl Task {
                 let mut rendered = (**tagged).clone();
                 rendered.value = self.render_argument_value(
                     &tagged.value,
-                    tera,
+                    engine,
                     context,
                     force_string,
                     is_mode_param,
@@ -1128,6 +1062,7 @@ mod tests {
             name: "Test Task".to_string(),
             module: "debug".to_string(),
             args: Mapping::new(),
+            source_file: None,
             become_override: None,
             is_become: false,
             become_user: "root".to_string(),
@@ -1263,10 +1198,14 @@ mod tests {
     }
 
     // Modify to return the vars map as well
-    fn create_test_tera_and_context(
+    fn create_test_environment_and_context(
         vars_map: Option<HashMap<String, Value>>,
-    ) -> (Tera, TeraContext, HashMap<String, Value>) {
-        let tera = Tera::default();
+    ) -> (
+        Environment<'static>,
+        TemplateContext,
+        HashMap<String, Value>,
+    ) {
+        let engine = crate::playbook::templar::environment();
         let mut vars = HashMap::new();
         if let Some(map) = vars_map {
             vars.extend(map);
@@ -1329,8 +1268,8 @@ mod tests {
             Value::Sequence(complex_list.clone()),
         );
 
-        let context = crate::playbook::templar::create_tera_context(&vars).unwrap();
-        (tera, context, vars) // Return vars map
+        let context = crate::playbook::templar::create_context(&vars).unwrap();
+        (engine, context, vars) // Return vars map
     }
 
     #[test]
@@ -1347,13 +1286,12 @@ mod tests {
             ("play_only".to_string(), Value::Bool(true)),
         ]);
 
-        let merged = task.merge_task_vars(&inherited).unwrap();
-        assert_eq!(
-            merged.get("scope"),
-            Some(&Value::String("task".to_string()))
-        );
-        assert_eq!(merged.get("task_only"), Some(&Value::Bool(true)));
-        assert_eq!(merged.get("play_only"), Some(&Value::Bool(true)));
+        task.args = mapping(&[(
+            "msg",
+            Value::String("{{ scope }}:{{ task_only }}:{{ play_only }}".into()),
+        )]);
+        let result = task.execute(&Host::new("localhost"), &inherited).unwrap();
+        assert_eq!(result.msg, "task:True:True");
         assert_eq!(
             inherited.get("scope"),
             Some(&Value::String("play".to_string()))
@@ -1363,22 +1301,22 @@ mod tests {
     #[test]
     fn when_sequence_uses_and_semantics() {
         let task = create_test_task();
-        let mut tera = Tera::default();
-        let context = TeraContext::new();
+        let mut engine = crate::playbook::templar::environment();
+        let context = TemplateContext::new();
         let all_true = Value::Sequence(vec![Value::Bool(true), Value::Bool(true)]);
         let one_false = Value::Sequence(vec![Value::Bool(true), Value::Bool(false)]);
 
         assert!(task
-            .evaluate_condition(&all_true, &mut tera, &context)
+            .evaluate_condition(&all_true, &mut engine, &context)
             .unwrap());
         assert!(!task
-            .evaluate_condition(&one_false, &mut tera, &context)
+            .evaluate_condition(&one_false, &mut engine, &context)
             .unwrap());
     }
 
     #[test]
     fn test_get_nested_value_simple() {
-        let (_tera, _context, vars) = create_test_tera_and_context(None);
+        let (_tera, _context, vars) = create_test_environment_and_context(None);
         assert_eq!(
             get_nested_value("greeting", &vars),
             Some(&Value::String("Hello".to_string()))
@@ -1394,7 +1332,7 @@ mod tests {
 
     #[test]
     fn test_get_nested_value_nested() {
-        let (_tera, _context, vars) = create_test_tera_and_context(None);
+        let (_tera, _context, vars) = create_test_environment_and_context(None);
         let expected_value = Value::String("1.2.3".to_string()); // Explicit expected value
         assert_eq!(
             get_nested_value("application.version", &vars),
@@ -1404,7 +1342,7 @@ mod tests {
 
     #[test]
     fn test_get_nested_value_list() {
-        let (_tera, _context, vars) = create_test_tera_and_context(None);
+        let (_tera, _context, vars) = create_test_environment_and_context(None);
         let features_key = Value::String("features".to_string()); // Explicit key for lookup
         let expected_features_ref = vars
             .get("application")
@@ -1421,7 +1359,7 @@ mod tests {
 
     #[test]
     fn test_get_nested_value_not_found() {
-        let (_tera, _context, vars) = create_test_tera_and_context(None);
+        let (_tera, _context, vars) = create_test_environment_and_context(None);
         assert_eq!(get_nested_value("nonexistent", &vars), None);
         assert_eq!(get_nested_value("application.nonexistent", &vars), None);
         assert_eq!(get_nested_value("greeting.nonexistent", &vars), None); // Cannot index into string
@@ -1432,11 +1370,11 @@ mod tests {
     fn test_resolve_loop_items_direct_list() {
         let task = create_test_task();
         let items = Value::Sequence(vec![Value::Number(1.into()), Value::Number(2.into())]);
-        let (mut tera, context, vars) = create_test_tera_and_context(None); // Capture vars
+        let (mut engine, context, vars) = create_test_environment_and_context(None); // Capture vars
 
         // Pass vars to resolve_loop_items
         let result = task
-            .resolve_loop_items(&items, &mut tera, &context, &vars)
+            .resolve_loop_items(&items, &mut engine, &context, &vars)
             .unwrap();
         assert_eq!(
             result,
@@ -1453,11 +1391,11 @@ mod tests {
             Value::String("apple".to_string()),
             Value::String("banana".to_string()),
         ];
-        let (mut tera, context, vars) = create_test_tera_and_context(None); // Capture vars
+        let (mut engine, context, vars) = create_test_environment_and_context(None); // Capture vars
 
         // Pass vars to resolve_loop_items
         let result = task
-            .resolve_loop_items(&items_var, &mut tera, &context, &vars)
+            .resolve_loop_items(&items_var, &mut engine, &context, &vars)
             .unwrap();
         assert_eq!(result, Some(expected_list));
     }
@@ -1468,7 +1406,7 @@ mod tests {
         let task = create_test_task();
         let items_var = Value::String("{{ application.features }}".to_string());
         // Capture vars correctly here
-        let (mut tera, context, vars) = create_test_tera_and_context(None);
+        let (mut engine, context, vars) = create_test_environment_and_context(None);
         let features_key = Value::String("features".to_string()); // Explicit key for lookup
         let expected_list = vars
             .get("application")
@@ -1482,7 +1420,7 @@ mod tests {
             .clone();
 
         let result = task
-            .resolve_loop_items(&items_var, &mut tera, &context, &vars)
+            .resolve_loop_items(&items_var, &mut engine, &context, &vars)
             .unwrap();
         assert_eq!(result, Some(expected_list));
     }
@@ -1502,11 +1440,11 @@ mod tests {
                 Value::String("B".into()),
             )])),
         ];
-        let (mut tera, context, vars) = create_test_tera_and_context(None); // Capture vars
+        let (mut engine, context, vars) = create_test_environment_and_context(None); // Capture vars
 
         // Pass vars to resolve_loop_items
         let result = task
-            .resolve_loop_items(&items_var, &mut tera, &context, &vars)
+            .resolve_loop_items(&items_var, &mut engine, &context, &vars)
             .unwrap();
         assert_eq!(result, Some(expected_list));
     }
@@ -1515,12 +1453,12 @@ mod tests {
     fn test_resolve_loop_items_render_fallback() {
         // Test fallback to rendering for a slightly more complex expression
         let task = create_test_task();
-        // Use a filter or expression Tera needs to evaluate
+        // Use a filter or expression the engine evaluates
         let items_expr = Value::String("{{ items_list | join(\",\") }}".to_string()); // This resolves to a string, not a list
-        let (mut tera, context, vars) = create_test_tera_and_context(None);
+        let (mut engine, context, vars) = create_test_environment_and_context(None);
 
         // Pass vars to resolve_loop_items
-        let result = task.resolve_loop_items(&items_expr, &mut tera, &context, &vars);
+        let result = task.resolve_loop_items(&items_expr, &mut engine, &context, &vars);
 
         // We expect this to fail because the *rendered expression* is not a sequence.
         // Simply check that it returned an error.
@@ -1538,10 +1476,10 @@ mod tests {
     fn test_resolve_loop_items_invalid_expr() {
         let task = create_test_task();
         let items_expr = Value::String("{{ undefined_var | non_existent_filter }}".to_string());
-        let (mut tera, context, vars) = create_test_tera_and_context(None); // Capture vars
+        let (mut engine, context, vars) = create_test_environment_and_context(None); // Capture vars
 
         // Pass vars to resolve_loop_items
-        let result = task.resolve_loop_items(&items_expr, &mut tera, &context, &vars);
+        let result = task.resolve_loop_items(&items_expr, &mut engine, &context, &vars);
         assert!(result.is_err()); // Expecting rendering error
         assert!(result
             .unwrap_err()
@@ -1554,10 +1492,10 @@ mod tests {
         // Test when the variable exists but is not a list
         let task = create_test_task();
         let items_expr = Value::String("{{ greeting }}".to_string()); // 'greeting' is a string
-        let (mut tera, context, vars) = create_test_tera_and_context(None); // Capture vars
+        let (mut engine, context, vars) = create_test_environment_and_context(None); // Capture vars
 
         // Pass vars to resolve_loop_items
-        let result = task.resolve_loop_items(&items_expr, &mut tera, &context, &vars);
+        let result = task.resolve_loop_items(&items_expr, &mut engine, &context, &vars);
         // Should hit the direct lookup, find 'greeting', see it's not a sequence,
         // fall back to rendering
         assert!(result.is_err());
@@ -1571,11 +1509,11 @@ mod tests {
     fn test_resolve_loop_items_bare_string() {
         let task = create_test_task();
         let items_bare = Value::String("single_item".to_string());
-        let (mut tera, context, vars) = create_test_tera_and_context(None); // Capture vars
+        let (mut engine, context, vars) = create_test_environment_and_context(None); // Capture vars
 
         // Pass vars to resolve_loop_items
         let result = task
-            .resolve_loop_items(&items_bare, &mut tera, &context, &vars)
+            .resolve_loop_items(&items_bare, &mut engine, &context, &vars)
             .unwrap();
         // Should not be caught by simple var check, should not contain {{ }},
         // should fall back to interpreting the string as a single-item list.
@@ -1610,8 +1548,8 @@ mod tests {
                 Value::String("rendered-key".to_string()),
             ),
         ]);
-        let (mut tera, context, vars) = create_test_tera_and_context(Some(extra_vars));
-        let resolved = task.resolve_args(&mut tera, &context, &vars).unwrap();
+        let (mut engine, context, vars) = create_test_environment_and_context(Some(extra_vars));
+        let resolved = task.resolve_args(&mut engine, &context, &vars).unwrap();
         let payload = resolved
             .get(Value::String("payload".to_string()))
             .unwrap()
@@ -1649,8 +1587,8 @@ mod tests {
                 Value::String("0750".to_string()),
             ),
         ]);
-        let context = crate::playbook::templar::create_tera_context(&vars).unwrap();
-        let mut tera = Tera::default();
+        let context = crate::playbook::templar::create_context(&vars).unwrap();
+        let mut engine = crate::playbook::templar::environment();
 
         let mut template_task = create_test_task();
         template_task.module = "template".to_string();
@@ -1662,11 +1600,11 @@ mod tests {
             ),
         ]);
         let resolved = template_task
-            .resolve_args(&mut tera, &context, &vars)
+            .resolve_args(&mut engine, &context, &vars)
             .unwrap();
         assert_eq!(
             resolved.get(Value::String("content".to_string())),
-            Some(&Value::String("42".to_string()))
+            Some(&Value::String("{{ answer }}".to_string()))
         );
         assert_eq!(
             resolved.get(Value::String("mode".to_string())),
@@ -1678,7 +1616,9 @@ mod tests {
             ("msg", Value::String("{{ answer }}".to_string())),
             ("var", Value::String("answer".to_string())),
         ]);
-        let resolved = debug_task.resolve_args(&mut tera, &context, &vars).unwrap();
+        let resolved = debug_task
+            .resolve_args(&mut engine, &context, &vars)
+            .unwrap();
         assert_eq!(
             resolved.get(Value::String("msg".to_string())),
             Some(&Value::String("42".to_string()))
@@ -1692,8 +1632,8 @@ mod tests {
     #[test]
     fn resolve_args_removes_default_omit_parameters() {
         let vars = HashMap::new();
-        let context = crate::playbook::templar::create_tera_context(&vars).unwrap();
-        let mut tera = Tera::default();
+        let context = crate::playbook::templar::create_context(&vars).unwrap();
+        let mut engine = crate::playbook::templar::environment();
         let mut task = create_test_task();
         task.module = "get_url".to_string();
         task.args = mapping(&[
@@ -1705,13 +1645,13 @@ mod tests {
             ),
         ]);
 
-        let resolved = task.resolve_args(&mut tera, &context, &vars).unwrap();
+        let resolved = task.resolve_args(&mut engine, &context, &vars).unwrap();
         assert!(!resolved.contains_key(Value::String("checksum".to_string())));
     }
 
     #[test]
     fn resolve_args_propagates_nested_render_errors_and_rejects_non_string_keys() {
-        let (mut tera, context, vars) = create_test_tera_and_context(None);
+        let (mut engine, context, vars) = create_test_environment_and_context(None);
         let mut task = create_test_task();
         task.args.insert(
             Value::String("payload".to_string()),
@@ -1721,7 +1661,7 @@ mod tests {
             )]))]),
         );
         let error = task
-            .resolve_args(&mut tera, &context, &vars)
+            .resolve_args(&mut engine, &context, &vars)
             .unwrap_err()
             .to_string();
         assert!(error.contains("Failed to render an argument"));
@@ -1734,7 +1674,7 @@ mod tests {
             )])),
         );
         let error = task
-            .resolve_args(&mut tera, &context, &vars)
+            .resolve_args(&mut engine, &context, &vars)
             .unwrap_err()
             .to_string();
         assert!(error.contains("mapping keys must be strings"));
@@ -1742,7 +1682,7 @@ mod tests {
 
     #[test]
     fn resolve_args_enforces_depth_and_node_limits() {
-        let (mut tera, context, vars) = create_test_tera_and_context(None);
+        let (mut engine, context, vars) = create_test_environment_and_context(None);
         let mut task = create_test_task();
 
         let mut deeply_nested = Value::String("leaf".to_string());
@@ -1752,7 +1692,7 @@ mod tests {
         task.args
             .insert(Value::String("payload".to_string()), deeply_nested);
         let error = task
-            .resolve_args(&mut tera, &context, &vars)
+            .resolve_args(&mut engine, &context, &vars)
             .unwrap_err()
             .to_string();
         assert!(error.contains("maximum nesting depth"));
@@ -1762,7 +1702,7 @@ mod tests {
             Value::Sequence(vec![Value::Null; MAX_ARGUMENT_TEMPLATE_NODES]),
         );
         let error = task
-            .resolve_args(&mut tera, &context, &vars)
+            .resolve_args(&mut engine, &context, &vars)
             .unwrap_err()
             .to_string();
         assert!(error.contains("maximum node count"));

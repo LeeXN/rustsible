@@ -1,0 +1,7 @@
+- hosts: all
+  gather_facts: false
+  tasks:
+    - copy:
+        content: must-not-exist
+        dest: '@OUTPUT@/unsafe-condition'
+      when: "'false'"

@@ -138,14 +138,17 @@ impl Play {
         info!("PLAY [{}] on {} hosts", self.name, hosts.len());
         println!("\n{}", format!("PLAY [{}]", self.name).bold());
 
+        let definitions: HashMap<String, HashMap<String, Value>> = hosts
+            .iter()
+            .map(|host| (host.name.clone(), self.initial_host_vars(host)))
+            .collect();
         let mut contexts: HashMap<String, HashMap<String, Value>> = hosts
             .iter()
             .map(|host| {
-                let mut vars = self.initial_host_vars(host);
-                if let Some(persistent) = state.variables.get(&host.name) {
-                    vars.extend(persistent.clone());
-                }
-                (host.name.clone(), vars)
+                (
+                    host.name.clone(),
+                    state.variables.get(&host.name).cloned().unwrap_or_default(),
+                )
             })
             .collect();
         let mut active_hosts: HashSet<String> = hosts
@@ -171,6 +174,7 @@ impl Play {
                 name: "Gathering Facts".to_string(),
                 module: "setup".to_string(),
                 args: Mapping::new(),
+                source_file: None,
                 become_override: None,
                 is_become: false,
                 become_user: "root".to_string(),
@@ -196,6 +200,7 @@ impl Play {
                     .filter(|host| active_hosts.contains(&host.name))
                     .collect(),
                 &contexts,
+                &definitions,
                 check_mode,
                 forks,
             );
@@ -284,6 +289,7 @@ impl Play {
                 task,
                 runnable_hosts,
                 &contexts,
+                &definitions,
                 check_mode,
                 forks,
             );
@@ -407,6 +413,7 @@ impl Play {
                     &handler.task,
                     handler_hosts,
                     &contexts,
+                    &definitions,
                     check_mode,
                     forks,
                 );
@@ -516,6 +523,7 @@ impl Play {
         task: &Task,
         hosts: Vec<&'a Host>,
         contexts: &HashMap<String, HashMap<String, Value>>,
+        definitions: &HashMap<String, HashMap<String, Value>>,
         check_mode: bool,
         forks: usize,
     ) -> Vec<(&'a Host, Task, Result<TaskResult>)> {
@@ -525,15 +533,18 @@ impl Play {
                 let mut workers = Vec::with_capacity(batch.len());
                 for host in batch.iter().copied() {
                     let host_vars = contexts.get(&host.name);
+                    let host_definitions = definitions.get(&host.name);
                     let effective_task = play.apply_play_settings(task, host);
                     let worker_task = effective_task.clone();
-                    let worker = scope.spawn(move || match host_vars {
-                        Some(vars) => worker_task.execute_with_options(host, vars, check_mode),
-                        None => Err(anyhow::anyhow!(
-                            "Internal error: no variable context for host '{}'",
-                            host.name
-                        )),
-                    });
+                    let worker =
+                        scope.spawn(move || match (host_vars, host_definitions) {
+                            (Some(vars), Some(definitions)) => worker_task
+                                .execute_with_definitions(host, vars, definitions, check_mode),
+                            _ => Err(anyhow::anyhow!(
+                                "Internal error: no variable context for host '{}'",
+                                host.name
+                            )),
+                        });
                     workers.push((host, effective_task, worker));
                 }
 
@@ -547,6 +558,17 @@ impl Play {
                                 host.name
                             )),
                         };
+                        let result = result.map_err(|error| {
+                            if let Some(source) = &effective_task.source_file {
+                                anyhow::anyhow!(
+                                    "{}: task '{}': {error:#}",
+                                    source.display(),
+                                    effective_task.name
+                                )
+                            } else {
+                                error
+                            }
+                        });
                         (host, effective_task, result)
                     })
                     .collect::<Vec<_>>()
@@ -700,6 +722,7 @@ mod tests {
             name: name.to_string(),
             module: "command".to_string(),
             args,
+            source_file: None,
             become_override: None,
             is_become: false,
             become_user: "root".to_string(),

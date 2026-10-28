@@ -3,7 +3,7 @@ mod handlers;
 mod parser;
 mod play;
 mod task;
-mod templar;
+pub(crate) mod templar;
 
 use crate::inventory::Inventory;
 use anyhow::Result;
