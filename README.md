@@ -51,7 +51,10 @@ The systemd module rejects non-systemd hosts explicitly.
 `copy`, `template`, and `lineinfile` prepare replacements in a private directory
 on the destination filesystem before committing them. They preserve existing
 permissions, ownership, ACLs, and extended attributes unless explicitly changed;
-preparation failures leave the original inode intact. Destinations must be
+preparation failures leave the original inode intact. Transfers must be
+complete before commit: stdin and HTTP responses that end early are rejected.
+Ownership is applied before mode/ACL/xattr so `chown` cannot silently clear
+set-id bits or extended metadata in the prepared file. Destinations must be
 regular files or absent: symbolic links are rejected. This transitional file
 installer requires GNU coreutils (`cp`, `stat`, `mktemp`, `sync`, `mv`) on targets;
 it fails if protection metadata cannot be preserved.

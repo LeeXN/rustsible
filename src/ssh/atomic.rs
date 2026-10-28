@@ -15,7 +15,11 @@ pub(crate) struct FileMetadata<'a> {
 /// rather than a successful deployment that silently removes a protection.
 /// The private staging directory is on the destination filesystem. Resolving
 /// its parent once also prevents ancestor symlink changes redirecting writes.
-pub(crate) fn install_command(path: &str, metadata: FileMetadata<'_>) -> Result<String> {
+pub(crate) fn install_command(
+    path: &str,
+    metadata: FileMetadata<'_>,
+    expected_size: usize,
+) -> Result<String> {
     if path.is_empty() || path.contains('\0') {
         bail!("File destination must be a non-empty path without NUL bytes");
     }
@@ -85,8 +89,12 @@ trap 'rm -rf -- "$staging"' EXIT
 trap 'exit 1' HUP INT TERM
 temporary=$staging/content
 cat > "$temporary"
-if [ "$original" != absent ]; then
-    cp --attributes-only --preserve=mode,ownership,xattr --dereference -- "$target" "$temporary"
+"#,
+    );
+    command.push_str(&format!("[ \"$(stat -c %s -- \"$temporary\")\" = {expected_size} ] || {{ echo 'Incomplete file transfer' >&2; exit 1; }}\n"));
+    command.push_str(
+        r#"if [ "$original" != absent ]; then
+    cp --attributes-only --preserve=ownership --dereference -- "$target" "$temporary"
 else
     chmod 0644 -- "$temporary"
 fi
@@ -98,6 +106,14 @@ fi
         (None, Some(_)) => command.push_str("chown -- \":$gid\" \"$temporary\"\n"),
         (None, None) => {}
     }
+    // chown may clear set-id bits and capabilities even for an unchanged
+    // owner. Restore mode/ACLs/xattrs only after all ownership operations.
+    command.push_str(
+        r#"if [ "$original" != absent ]; then
+    cp --attributes-only --preserve=mode,xattr --dereference -- "$target" "$temporary"
+fi
+"#,
+    );
     if let Some(mode) = metadata.mode {
         command.push_str(&format!("chmod -- {} \"$temporary\"\n", shell_quote(mode)));
     }
@@ -117,7 +133,7 @@ pub(crate) fn install(
     become_user: Option<&str>,
     metadata: FileMetadata<'_>,
 ) -> Result<()> {
-    let command = install_command(path, metadata)?;
+    let command = install_command(path, metadata, content.len())?;
     let (code, _, stderr) = if let Some(user) = become_user {
         connection.execute_sudo_command_with_input(&command, user, content)?
     } else {
@@ -194,22 +210,83 @@ mod tests {
         std::fs::write(&path, b"original").unwrap();
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o751)).unwrap();
         let before = std::fs::metadata(&path).unwrap();
-        let command = install_command(path.to_str().unwrap(), FileMetadata::default()).unwrap();
+        let command =
+            install_command(path.to_str().unwrap(), FileMetadata::default(), 128 * 1024).unwrap();
         let connection = LocalConnection::new(&Host::new("localhost")).unwrap();
         // The OS enforces the write limit on the child; no test hook can
         // accidentally bypass the real streaming/write failure path.
-        let (code, _, _) = connection
-            .execute_command_with_input(
-                &format!("ulimit -f 1; sh -c {}", shell_quote(&command)),
-                &[42; 128 * 1024],
-            )
-            .unwrap();
-        assert_ne!(code, 0);
+        let outcome = connection.execute_command_with_input(
+            &format!("ulimit -f 1; sh -c {}", shell_quote(&command)),
+            &[42; 128 * 1024],
+        );
+        match outcome {
+            Ok((code, _, _)) => assert_ne!(code, 0),
+            // The child may hit the limit before stdin finishes. Either the
+            // child failure or its closed input pipe is the expected outcome.
+            Err(error) => assert!(
+                error
+                    .downcast_ref::<std::io::Error>()
+                    .is_some_and(|error| error.kind() == std::io::ErrorKind::BrokenPipe),
+                "{error:#}"
+            ),
+        }
         let after = std::fs::metadata(&path).unwrap();
         assert_eq!(std::fs::read(&path).unwrap(), b"original");
         assert_eq!(
             (after.ino(), after.mode(), after.uid(), after.gid()),
             (before.ino(), before.mode(), before.uid(), before.gid())
+        );
+        assert_eq!(std::fs::read_dir(directory.path()).unwrap().count(), 1);
+    }
+
+    #[test]
+    fn explicit_unchanged_owner_preserves_unspecified_setid_mode() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("artifact");
+        std::fs::write(&path, b"original").unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o4755)).unwrap();
+        let before = std::fs::metadata(&path).unwrap();
+        let owner = before.uid().to_string();
+        let connection = LocalConnection::new(&Host::new("localhost")).unwrap();
+        install(
+            &connection,
+            path.to_str().unwrap(),
+            b"replacement",
+            None,
+            FileMetadata {
+                owner: Some(&owner),
+                ..FileMetadata::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), b"replacement");
+        assert_eq!(std::fs::metadata(&path).unwrap().mode(), before.mode());
+    }
+
+    #[test]
+    fn early_eof_does_not_install_partial_content() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("artifact");
+        std::fs::write(&path, b"original").unwrap();
+        let original = std::fs::metadata(&path).unwrap();
+        let command =
+            install_command(path.to_str().unwrap(), FileMetadata::default(), 999).unwrap();
+        let connection = LocalConnection::new(&Host::new("localhost")).unwrap();
+        let (code, _, stderr) = connection
+            .execute_command_with_input(&command, b"short")
+            .unwrap();
+        assert_ne!(code, 0);
+        assert!(stderr.contains("Incomplete file transfer"));
+        assert_eq!(std::fs::read(&path).unwrap(), b"original");
+        let after = std::fs::metadata(&path).unwrap();
+        assert_eq!(
+            (after.ino(), after.mode(), after.uid(), after.gid()),
+            (
+                original.ino(),
+                original.mode(),
+                original.uid(),
+                original.gid()
+            )
         );
         assert_eq!(std::fs::read_dir(directory.path()).unwrap().count(), 1);
     }
@@ -287,7 +364,12 @@ mod tests {
         .unwrap();
         std::fs::set_permissions(&cp, std::fs::Permissions::from_mode(0o755)).unwrap();
         let connection = LocalConnection::new(&Host::new("localhost")).unwrap();
-        let command = install_command(target.to_str().unwrap(), FileMetadata::default()).unwrap();
+        let command = install_command(
+            target.to_str().unwrap(),
+            FileMetadata::default(),
+            b"replacement".len(),
+        )
+        .unwrap();
         let (code, _, _) = connection
             .execute_command_with_input(
                 &format!(

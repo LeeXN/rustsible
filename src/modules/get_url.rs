@@ -102,14 +102,21 @@ with tempfile.TemporaryDirectory(prefix=".rustsible-get-url-", dir=directory) as
         with open(temporary, "xb") as target:
             os.chmod(temporary, 0o600)
             with urllib.request.urlopen(url, timeout=30) as response:
+                # HTTPResponse decrements length during reads; retain the
+                # original framing length before streaming the response.
+                expected_length = response.length
+                received = 0
                 while True:
                     chunk = response.read(1024 * 1024)
                     if not chunk:
                         break
                     target.write(chunk)
+                    received += len(chunk)
                     source_sha1_hash.update(chunk)
                     if verification_hash:
                         verification_hash.update(chunk)
+                if expected_length is not None and received != expected_length:
+                    raise RuntimeError("incomplete HTTP response body")
             target.flush()
             os.fsync(target.fileno())
         source_sha1 = source_sha1_hash.hexdigest()
@@ -222,7 +229,10 @@ mod tests {
     use std::io::{Read, Write};
     use std::os::unix::fs::{MetadataExt, PermissionsExt};
 
-    fn http_response(bytes: &'static [u8]) -> (String, std::thread::JoinHandle<()>) {
+    fn http_response(
+        bytes: &'static [u8],
+        expected_length: Option<usize>,
+    ) -> (String, std::thread::JoinHandle<()>) {
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let url = format!("http://{}/artifact", listener.local_addr().unwrap());
         listener.set_nonblocking(true).unwrap();
@@ -240,7 +250,7 @@ mod tests {
                         write!(
                             stream,
                             "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
-                            bytes.len()
+                            expected_length.unwrap_or(bytes.len())
                         )
                         .unwrap();
                         stream.write_all(bytes).unwrap();
@@ -288,7 +298,7 @@ mod tests {
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
         let original = std::fs::metadata(&path).unwrap();
         crate::testing::test_xattr(&path, "user.rustsible-protection", Some(b"keep-protection"));
-        let (url, server) = http_response(b"hello");
+        let (url, server) = http_response(b"hello", None);
         let args = serde_yaml::to_value(serde_json::json!({
             "url": url, "dest": path, "force": false,
             "checksum": "sha1:aaf4c61ddcc5e8a2dabede0f3b482cd9aea9434d",
@@ -327,7 +337,7 @@ mod tests {
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o751)).unwrap();
         let original = std::fs::metadata(&path).unwrap();
         let connection = LocalConnection::new(&Host::new("localhost")).unwrap();
-        let (url, server) = http_response(b"corrupt");
+        let (url, server) = http_response(b"corrupt", None);
         let args = serde_yaml::to_value(serde_json::json!({
             "url": url, "dest": path, "force": true,
             "checksum": "sha1:aaf4c61ddcc5e8a2dabede0f3b482cd9aea9434d",
@@ -353,6 +363,33 @@ mod tests {
                     .contains(error));
             }
         }
+        assert_eq!(std::fs::read(&path).unwrap(), b"original");
+        let after = std::fs::metadata(&path).unwrap();
+        assert_eq!(
+            (after.ino(), after.mode(), after.uid(), after.gid()),
+            (
+                original.ino(),
+                original.mode(),
+                original.uid(),
+                original.gid()
+            )
+        );
+        assert_eq!(std::fs::read_dir(directory.path()).unwrap().count(), 1);
+    }
+
+    #[test]
+    fn truncated_http_body_does_not_replace_existing_file() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("artifact");
+        std::fs::write(&path, b"original").unwrap();
+        let original = std::fs::metadata(&path).unwrap();
+        let (url, server) = http_response(b"short", Some(999));
+        let args =
+            serde_yaml::to_value(serde_json::json!({"url": url, "dest": path, "force": true}))
+                .unwrap();
+        let connection = LocalConnection::new(&Host::new("localhost")).unwrap();
+        assert!(execute(&connection, &args, false, "root", false).is_err());
+        server.join().unwrap();
         assert_eq!(std::fs::read(&path).unwrap(), b"original");
         let after = std::fs::metadata(&path).unwrap();
         assert_eq!(
