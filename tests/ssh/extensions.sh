@@ -1,10 +1,12 @@
 # The collection was assembled from static ELF artifacts before acceptance.
 # Packing and installation inspect bytes; they do not execute package content.
 collection_source=$(realpath -- "$5")
+[[ -f $collection_source/roles/demo/tasks/main.yml ]] || { echo 'Assembled example collection is missing its role source' >&2; exit 1; }
 "$controller_binary" collection pack "$collection_source" --output "$fixture_dir/native.tar.gz"
 "$controller_binary" collection verify "$fixture_dir/native.tar.gz" > "$fixture_dir/native-verify.log"
 "$controller_binary" collection install "$fixture_dir/native.tar.gz" --path "$fixture_dir/installed"
 collection_paths=$fixture_dir/installed
+[[ -f $collection_paths/ansible_collections/example/native/roles/demo/tasks/main.yml ]] || { echo 'Installed example collection is missing its role content' >&2; exit 1; }
 cat > "$fixture_dir/record.json" <<'JSON'
 {"title":"Native Provider","literal":"{{ missing_variable.must_not_execute }}","count":7}
 JSON

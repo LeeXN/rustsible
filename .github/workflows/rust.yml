@@ -123,12 +123,12 @@ jobs:
         run: bash tests/ssh/run.sh target/${{ matrix.target }}/release/rustsible target/workers vault musl target/${{ matrix.target }}/release/examples/prompt_fixture
       - name: Assemble the native example collection without executing its programs
         run: |
-          cp -R examples/native-collection target/example-collection
-          cargo run --locked -p rustsible-native-example --example collection_manifest -- target/example-collection ${{ matrix.arch }}=target/${{ matrix.target }}/release/rustsible-example-extension
+          cp -R examples/native-collection "${{ runner.temp }}/native-example-collection"
+          cargo run --locked -p rustsible-native-example --example collection_manifest -- "${{ runner.temp }}/native-example-collection" ${{ matrix.arch }}=target/${{ matrix.target }}/release/rustsible-example-extension
       - name: Native collections, providers and async over SSH
-        run: bash tests/ssh/run.sh target/${{ matrix.target }}/release/rustsible target/workers extensions glibc target/example-collection
+        run: bash tests/ssh/run.sh target/${{ matrix.target }}/release/rustsible target/workers extensions glibc "${{ runner.temp }}/native-example-collection"
       - name: Native collections without Python or curl on musl
-        run: bash tests/ssh/run.sh target/${{ matrix.target }}/release/rustsible target/workers extensions musl target/example-collection
+        run: bash tests/ssh/run.sh target/${{ matrix.target }}/release/rustsible target/workers extensions musl "${{ runner.temp }}/native-example-collection"
       - name: Native execution without Python or curl (glibc)
         run: bash tests/ssh/run.sh target/${{ matrix.target }}/release/rustsible target/workers native glibc target/${{ matrix.target }}/release/examples/http_fixture
       - name: Native execution without Python or curl (musl)
