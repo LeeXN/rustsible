@@ -300,6 +300,35 @@ See [the rolling example](examples/rolling/playbook.yml). The SSH strategy
 fixture uses three distinct servers and checks physical identities, batch
 barriers, cross-host facts, parallel delegation, idempotency, check and cleanup.
 
+## Target readiness and HTTP
+
+`wait_for` supports a TCP host/port, file presence/absence, or a multiline
+`search_regex` over a regular UTF-8 file. Port/path are mutually exclusive;
+regex matching requires a path and reads at most 8 MiB. States are
+started/present and stopped/absent. Timeout defaults to 300 seconds,
+connect_timeout to 5, delay to zero, and sleep to one; timers use nonnegative
+whole seconds, with a positive connect timeout. With no condition it sleeps.
+For conditions, delay counts toward timeout and timeout=0 expires without a
+probe. Absent/stopped file waits test disappearance, regardless of search_regex.
+It performs read-only queries and is skipped in global check mode.
+
+`uri` executes on the target using the get_url client/trust/proxy path.
+It supports HTTP method, string headers, raw/JSON/form-urlencoded bodies,
+integer/list `status_code` (default 200), positive timeout (default 30), and
+`return_content`. JSON content types are parsed into `json` independently of
+return_content. Requested content must be UTF-8; request/response bodies are
+limited to 8 MiB. Unexpected statuses retain status and returned error content.
+URI reports changed=false; use changed_when when the API's action requires it.
+
+TLS verification defaults on. `ca_path` adds a target PEM CA bundle (up to
+4 MiB); native roots and target proxy variables remain available. use_proxy
+can disable proxies. follow_redirects is safe by default (GET/HEAD), none, or
+all, with a ten-redirect limit. Basic auth accepts url_username/url_password
+(user/password aliases); force_basic_auth controls preemptive authentication.
+Credential-bearing responses retain raw register data and a censored display
+policy. URLs in errors omit credential-bearing URL data. URI check skips the
+request. Client deadlines and task timeout also bound waits and HTTP operations.
+
 ## Assertions and groups
 
 `assert` and `fail` run on the controller and do not require a target connection.
@@ -577,6 +606,8 @@ The following built-in modules are registered for playbooks:
 | `assert` | Evaluate raw boolean conditions on the controller, with success/failure messages and quiet display |
 | `fail` | Fail deliberately with a message on the controller |
 | `group` | Manage Linux group names/GIDs/present/absent/system through account tools |
+| `wait_for` | Wait for target TCP/file/regular-text conditions |
+| `uri` | Call target HTTP APIs with bounded body/status/TLS/proxy handling |
 | `meta` | Flush handlers, clear host errors, reset connections, or end host/play execution |
 | `copy` | Copy a controller file or literal content |
 | `file` | Manage files, directories, links, and permissions |
@@ -652,6 +683,10 @@ runs the three-server deployment/delegation scenarios.
 `bash tests/ssh/run.sh CONTROLLER WORKER_DIRECTORY async [glibc|musl]`
 checks disconnect survival, state permissions/identity isolation, background
 native files, poll/cleanup, no_log, detached descendants and noexec.
+`bash tests/ssh/run.sh CONTROLLER WORKERS network [glibc|musl] HTTP_FIXTURE`
+checks three identities, HTTP/TLS/private CA/proxy, authentication, until
+readiness, global check and cleanup. Reference comparison also needs the
+http_fixture example executable, passed as its optional second argument.
 
 Dependency advisories are checked in CI against `Cargo.lock`. CI also enforces
 an 80% line-coverage floor. This is a regression baseline, not a claim that every remote SSH path is exercised end to

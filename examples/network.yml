@@ -1,0 +1,19 @@
+- hosts: localhost
+  gather_facts: false
+  vars:
+    health_host: 127.0.0.1
+    health_port: 8080
+    health_url: 'http://{{ health_host }}:{{ health_port }}/health'
+  tasks:
+    - wait_for:
+        host: '{{ health_host }}'
+        port: '{{ health_port }}'
+        timeout: 30
+    - uri:
+        url: '{{ health_url }}'
+        status_code: [200, 503]
+        timeout: 5
+      register: health
+      until: health.status == 200
+      retries: 5
+      delay: 1

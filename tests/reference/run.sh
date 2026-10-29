@@ -2,9 +2,12 @@
 set -euo pipefail
 repo_dir=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../.." && pwd)
 binary=$(realpath -- "${1:-$repo_dir/target/debug/rustsible}")
+network_fixture=$(realpath -- "${2:-$(dirname -- "$binary")/examples/http_fixture}")
+fixture_pid=''
 fixture_dir=$(mktemp -d /tmp/rustsible-reference.XXXXXXXX)
 cleanup() {
     local result=$?
+    if [[ -n $fixture_pid ]]; then kill -KILL "$fixture_pid" 2>/dev/null || true; wait "$fixture_pid" 2>/dev/null || true; fi
     if (( result != 0 )); then
         for log in "$fixture_dir"/*.log; do [[ ! -f $log ]] || cat "$log" >&2; done
     fi
@@ -137,6 +140,19 @@ mv "$fixture_dir/assert-output" "$fixture_dir/reference-assertions"
 mkdir "$fixture_dir/assert-output"
 "$binary" playbook -i "$fixture_dir/inventory" "$fixture_dir/assertions.yml" > "$fixture_dir/native-assertions.log" 2>&1
 diff -r "$fixture_dir/reference-assertions" "$fixture_dir/assert-output"
+[[ -x $network_fixture ]] || { echo 'Reference comparison requires the http_fixture example executable' >&2; exit 1; }
+"$network_fixture" 127.0.0.1:0 "$fixture_dir" > "$fixture_dir/network-address.log" &
+fixture_pid=$!
+for _ in {1..100}; do [[ ! -s $fixture_dir/network-address.log ]] || break; sleep 0.05; done
+address=$(head -n 1 "$fixture_dir/network-address.log")
+port=${address##*:}
+mkdir "$fixture_dir/network-output"
+sed "s|@OUTPUT@|$fixture_dir/network-output|g; s|@ADDRESS@|$address|g; s|@PORT@|$port|g" "$repo_dir/tests/reference/network.yml" > "$fixture_dir/network.yml"
+uv tool run --from ansible-core==2.21.0 ansible-playbook -i "$fixture_dir/inventory" "$fixture_dir/network.yml" > "$fixture_dir/reference-network.log" 2>&1
+mv "$fixture_dir/network-output" "$fixture_dir/reference-network"
+mkdir "$fixture_dir/network-output"
+"$binary" playbook -i "$fixture_dir/inventory" "$fixture_dir/network.yml" > "$fixture_dir/native-network.log" 2>&1
+diff -r "$fixture_dir/reference-network" "$fixture_dir/network-output"
 if uv tool run --from ansible-core==2.21.0 ansible-playbook \
     -i "$fixture_dir/inventory" "$fixture_dir/non_boolean.yml" > "$fixture_dir/reference-condition.log" 2>&1; then
     echo 'Reference unexpectedly accepted a string condition' >&2; exit 1

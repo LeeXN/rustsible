@@ -45,6 +45,67 @@ pub fn handle(connection: TcpStream, root: &Path, tls: Option<Arc<ServerConfig>>
         request
     };
     let path = target.split('?').next().unwrap_or("/");
+    if path == "/eventually" {
+        static REQUESTS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+        let ready = REQUESTS.fetch_add(1, std::sync::atomic::Ordering::Relaxed) >= 2;
+        let status = if ready { "200 OK" } else { "503 Unavailable" };
+        let body = if ready {
+            b"ready".as_slice()
+        } else {
+            b"pending".as_slice()
+        };
+        write!(
+            stream,
+            "HTTP/1.1 {status}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+            body.len()
+        )?;
+        if method != "HEAD" {
+            stream.write_all(body)?;
+        }
+        return Ok(());
+    }
+    if path == "/echo" || path == "/auth" {
+        let headers = text
+            .lines()
+            .skip(1)
+            .filter_map(|line| line.split_once(':'))
+            .map(|(name, value)| (name.trim().to_ascii_lowercase(), value.trim().to_owned()))
+            .collect::<std::collections::BTreeMap<_, _>>();
+        if path == "/auth" {
+            let authenticated = headers
+                .get("authorization")
+                .is_some_and(|value| value == "Basic dXNlcjpwYXNz");
+            if !authenticated {
+                stream.write_all(b"HTTP/1.1 401 Unauthorized\r\nWWW-Authenticate: Basic realm=fixture\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")?;
+                return Ok(());
+            }
+        }
+        let length = headers
+            .get("content-length")
+            .map(|value| value.parse::<usize>())
+            .transpose()?
+            .unwrap_or(0);
+        if length > 8 * 1024 * 1024 {
+            bail!("Fixture body too large");
+        }
+        let mut body = vec![0; length];
+        stream.read_exact(&mut body)?;
+        let body = serde_json::to_vec(
+            &serde_json::json!({"method":method,"body":String::from_utf8_lossy(&body),"headers":headers}),
+        )?;
+        write!(stream, "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n", body.len())?;
+        if method != "HEAD" {
+            stream.write_all(&body)?;
+        }
+        stream.flush()?;
+        return Ok(());
+    }
+    if path == "/oversized" {
+        stream.write_all(
+            b"HTTP/1.1 200 OK\r\nContent-Length: 9437184\r\nConnection: close\r\n\r\n",
+        )?;
+        return Ok(());
+    }
     if path == "/redirect" || path == "/redirect-loop" {
         let location = if path == "/redirect" {
             "/hello"

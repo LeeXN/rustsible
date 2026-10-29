@@ -33,6 +33,8 @@ pub const NATIVE_MODULES: &[&str] = &[
     "package",
     "async_status",
     "group",
+    "wait_for",
+    "uri",
 ];
 
 #[derive(Serialize, Deserialize)]

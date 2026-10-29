@@ -74,8 +74,11 @@ rustsible ad-hoc localhost -i examples/inventory/hosts \
 `command` 按参数列表执行，不解释管道或重定向；默认展开环境变量，但不会启动 shell。需要这些 shell
 语法时请显式使用 `shell`。远程 SSH 默认严格校验 host key。
 
-## 安全提示
+`network.yml` 展示 TCP 就绪等待和 HTTP 健康查询重试。实际执行前将
+health_host/health_port/health_url 配成隔离服务；默认地址为
+`http://127.0.0.1:8080/health`，示例不自动启动服务。
 
+## 安全提示
 - 示例 inventory 只应放测试值，不要提交真实密码或私钥。
 - `package`、`service` 和 `user` 会调用目标系统工具，通常需要 `become`。
 - `--check` 是最佳努力的预测，不替代隔离环境中的实际验证。

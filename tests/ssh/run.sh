@@ -8,7 +8,7 @@ rustsible() { "$controller_binary" --worker-dir "$worker_dir" "$@"; }
 mode=${3:-full}
 libc=${4:-glibc}
 http_fixture=${5:-}
-if [[ ( $mode == native || $mode == systems ) && ! -x $http_fixture ]]; then
+if [[ ( $mode == native || $mode == systems || $mode == network ) && ! -x $http_fixture ]]; then
     echo 'Native acceptance requires the static http_fixture example as argument 5' >&2; exit 1
 fi
 fixture_dir=$(mktemp -d)
@@ -130,6 +130,10 @@ if [[ $mode == async ]]; then
 fi
 if [[ $mode == basic ]]; then
     source "$repo_dir/tests/ssh/basic.sh"
+    exit 0
+fi
+if [[ $mode == network ]]; then
+    source "$repo_dir/tests/ssh/network.sh"
     exit 0
 fi
 cat > "$fixture_dir/playbook.yml" <<'EOF'
