@@ -1,0 +1,5 @@
+ARG BASE=opensuse/leap:16.0
+FROM rustsible-manager-dnf:local AS packages
+FROM ${BASE}
+COPY --from=packages /srv/versions /srv/versions
+CMD ["sleep", "infinity"]

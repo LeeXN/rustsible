@@ -201,7 +201,10 @@ fn latest(manager: Manager, name: &str, current: &str) -> Result<bool> {
 fn refresh(manager: Manager) -> Result<()> {
     let argv: &[&str] = match manager {
         Manager::Apt => &["-q", "update"],
-        Manager::Dnf | Manager::Yum => &["-q", "makecache"],
+        // DNF makecache may reuse unexpired metadata. Yum's makecache already
+        // expires repositories; DNF requires an explicit refresh option.
+        Manager::Dnf => &["-q", "--refresh", "makecache"],
+        Manager::Yum => &["-q", "makecache"],
         Manager::Pacman => &["-Sy", "--noconfirm"],
         Manager::Zypper => &["--non-interactive", "refresh"],
         Manager::Apk => &["update"],

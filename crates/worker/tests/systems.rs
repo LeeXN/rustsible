@@ -266,7 +266,11 @@ pacman)
 dnf|yum)
     case "$*" in
     *check-update*) [ "$(/bin/cat "$VERSION")" = 2 ] || exit 100;;
-    *makecache*) :;;
+    *makecache*)
+        case "${0##*/} $*" in
+        yum*|*--refresh*) :;;
+        *) exit 8;;
+        esac;;
     *upgrade*) printf 2 > "$VERSION";;
     *) exit 8;;
     esac;;
@@ -312,7 +316,7 @@ esac
         }
         let result = worker.run(
             "package",
-            json!({"name":["one","two"],"state":"latest"}),
+            json!({"name":["one","two"],"state":"latest","update_cache":manager != "pacman"}),
             false,
         );
         assert!(

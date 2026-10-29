@@ -119,9 +119,13 @@ unconfirmed operations terminate their owned execution trees.
 
 The current real OS acceptance covers Debian systemd/APT, Alpine OpenRC/APK,
 and Debian SysV, including normal/root/non-root-become identities and local/SSH
-transports. DNF/Yum/Pacman/Zypper and Upstart paths are ported with deterministic
-planning tests but still need distribution-specific runtime acceptance before
-being considered release-verified. Zypper `state=latest` remains explicitly
+transports on x86_64 and aarch64. Additional x86_64 fixtures exercise real Rocky
+DNF, CentOS Yum, Arch Pacman and openSUSE Zypper against generated local package
+repositories, with networking disabled during execution. Ubuntu Upstart runs as
+PID 1 and serves a real HTTP daemon across subsequent tasks. Run these fixtures
+with `bash tests/managers/run.sh CONTROLLER WORKERS MANAGER` and
+`bash tests/managers/upstart.sh CONTROLLER WORKERS HTTP_FIXTURE`.
+Zypper `state=latest` remains explicitly
 unsupported. Package specifications currently require concrete names; APT
 `name=version` is recognized. Existing-account home repair requires the target
 OS's `mkhomedir_helper` tool.
