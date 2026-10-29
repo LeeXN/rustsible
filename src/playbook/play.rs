@@ -219,6 +219,13 @@ impl RunState {
             .lock()
             .map_err(|_| anyhow::anyhow!("Host runtime state was poisoned"))
     }
+    pub(crate) fn set_execution_modes(&mut self, check: bool, diff: bool) {
+        self.globals = std::sync::Arc::new(HashMap::from([
+            ("ansible_check_mode".into(), Value::Bool(check)),
+            ("ansible_diff_mode".into(), Value::Bool(diff)),
+        ]));
+    }
+
     pub(crate) fn prepare(
         &mut self,
         inventory: &crate::inventory::Inventory,
@@ -226,13 +233,14 @@ impl RunState {
         config: Option<&std::path::Path>,
     ) -> Result<()> {
         let groups = inventory.group_members();
-        let mut globals = HashMap::from([
+        let mut globals = (*self.globals).clone();
+        globals.extend(HashMap::from([
             ("groups".into(), serde_yaml::to_value(&groups)?),
             (
                 "playbook_dir".into(),
                 Value::String(playbook_dir.to_string_lossy().into_owned()),
             ),
-        ]);
+        ]));
         if let Some(source) = &inventory.source {
             globals.insert(
                 "inventory_file".into(),

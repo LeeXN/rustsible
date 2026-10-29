@@ -2466,3 +2466,63 @@ fn reusable_deployment_example_predicts_new_directories_without_creating_busines
     assert!(!destination.exists());
     Ok(())
 }
+
+#[test]
+fn execution_mode_magic_variables_gate_business_work_and_cannot_be_spoofed() -> Result<()> {
+    let directory = TempDir::new()?;
+    let path = directory.path().join("business");
+    let predicted = directory.path().join("task-prediction");
+    let inventory = local_inventory();
+    let playbook = fixture_file(&format!("- hosts: all\n  gather_facts: false\n  tasks:\n    - assert:\n        that:\n          - ansible_check_mode == expected\n          - ansible_diff_mode\n    - copy: {{content: done, dest: '{}'}}\n      when: not ansible_check_mode\n    - copy: {{content: predicted, dest: '{}'}}\n      check_mode: true\n      when: not ansible_check_mode\n",path.display(),predicted.display()));
+    for (check, extra) in [
+        (
+            true,
+            r#"{"expected":true,"ansible_check_mode":false,"ansible_diff_mode":false}"#,
+        ),
+        (
+            false,
+            r#"{"expected":false,"ansible_check_mode":true,"ansible_diff_mode":false}"#,
+        ),
+    ] {
+        let mut command = controller();
+        command
+            .arg("playbook")
+            .arg(playbook.path())
+            .arg("-i")
+            .arg(inventory.path())
+            .arg("--diff")
+            .arg("-e")
+            .arg(extra);
+        if check {
+            command.arg("--check");
+        }
+        let output = command.output()?;
+        assert!(
+            output.status.success(),
+            "{}{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_eq!(path.exists(), !check);
+        assert!(!predicted.exists());
+    }
+    let output = controller()
+        .args([
+            "ad-hoc",
+            "all",
+            "-m",
+            "assert",
+            "-a",
+            r#"{"that":"ansible_check_mode"}"#,
+            "--check",
+        ])
+        .arg("-i")
+        .arg(inventory.path())
+        .output()?;
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    Ok(())
+}

@@ -153,6 +153,7 @@ fn execute_in_scope(
     );
     state.extra = std::sync::Arc::new(extra);
     state.tags = std::sync::Arc::new(options.tags.clone());
+    state.set_execution_modes(options.check_mode, options.diff);
     state.prepare(
         &inventory,
         playbook_source.parent().context("Playbook has no parent")?,

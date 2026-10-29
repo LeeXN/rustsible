@@ -145,6 +145,7 @@ fn run_adhoc_in_scope(
             .with_extensions(options.extensions.clone())
             .with_diff(options.diff),
     );
+    state.set_execution_modes(options.check_mode, options.diff);
     state.prepare(
         inventory,
         &std::env::current_dir()?,
