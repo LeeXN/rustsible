@@ -14,6 +14,7 @@ pub struct Config {
     pub file: Option<PathBuf>,
     pub inventory: Option<PathBuf>,
     pub worker_dir: Option<PathBuf>,
+    pub role_paths: Vec<PathBuf>,
     pub forks: Option<usize>,
     pub verbosity: Option<u8>,
     defaults: HashMap<String, Value>,
@@ -59,6 +60,7 @@ impl Config {
         for (name, section, key) in [
             ("ANSIBLE_INVENTORY", "defaults", "inventory"),
             ("ANSIBLE_FORKS", "defaults", "forks"),
+            ("ANSIBLE_ROLES_PATH", "defaults", "roles_path"),
             ("ANSIBLE_VERBOSITY", "defaults", "verbosity"),
             ("ANSIBLE_REMOTE_USER", "defaults", "remote_user"),
             ("ANSIBLE_PRIVATE_KEY_FILE", "defaults", "private_key_file"),
@@ -136,6 +138,11 @@ impl Config {
         match (section, key) {
             ("defaults", "inventory") => self.inventory = Some(resolve_path(base, value)?),
             ("defaults", "worker_dir") => self.worker_dir = Some(resolve_path(base, value)?),
+            ("defaults", "roles_path") => {
+                self.role_paths = std::env::split_paths(value)
+                    .map(|path| resolve_path(base, &path.to_string_lossy()))
+                    .collect::<Result<Vec<_>>>()?;
+            }
             ("defaults", "forks") => {
                 let count = value.parse::<usize>().context("forks must be an integer")?;
                 if count == 0 {
@@ -293,5 +300,21 @@ mod tests {
                 "{content}"
             );
         }
+    }
+
+    #[test]
+    fn role_paths_keep_config_relative_search_order() {
+        let config = Config::parse(
+            "[defaults]\nroles_path=vendor/roles:/opt/roles",
+            Path::new("/project/ansible.cfg"),
+        )
+        .unwrap();
+        assert_eq!(
+            config.role_paths,
+            vec![
+                PathBuf::from("/project/vendor/roles"),
+                PathBuf::from("/opt/roles")
+            ]
+        );
     }
 }

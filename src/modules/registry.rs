@@ -64,7 +64,7 @@ impl Invocation {
     pub fn needs_connection(&self) -> bool {
         !matches!(
             self.module,
-            Builtin::Debug | Builtin::SetFact | Builtin::IncludeVars
+            Builtin::Debug | Builtin::SetFact | Builtin::IncludeVars | Builtin::Meta
         ) && !self.skip_check()
     }
     pub(crate) fn execute(
@@ -104,14 +104,21 @@ impl Invocation {
                     ..Default::default()
                 });
             }
-            let config = config.context("Target module needs a connection configuration")?;
             if self.module == Builtin::Meta {
-                runtime.reset(&config.name)?;
+                if self.args.get("action").and_then(Value::as_str) != Some("reset_connection") {
+                    bail!("This meta action requires playbook execution");
+                }
+                let host = vars
+                    .get("inventory_hostname")
+                    .and_then(Value::as_str)
+                    .context("Connection reset requires an inventory host")?;
+                runtime.reset(host)?;
                 return Ok(ModuleResult {
                     msg: "Connection reset".into(),
-                    ..ModuleResult::default()
+                    ..Default::default()
                 });
             }
+            let config = config.context("Target module needs a connection configuration")?;
             let timeout_ms = self.timeout_ms.unwrap_or(
                 crate::ssh::connection::command_timeout(config)?
                     .as_millis()

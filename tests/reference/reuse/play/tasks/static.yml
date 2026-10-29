@@ -1,0 +1,3 @@
+- set_fact:
+    active: false
+- command: touch @OUTPUT@/must-not-run

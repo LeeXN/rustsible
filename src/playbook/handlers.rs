@@ -4,4 +4,7 @@ use crate::playbook::Task;
 #[derive(Debug, Clone)]
 pub struct Handler {
     pub task: Task,
+    pub listen: Vec<String>,
+    pub hosts: Option<std::collections::HashSet<String>>,
+    pub cached_name: Option<String>,
 }

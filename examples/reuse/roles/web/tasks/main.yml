@@ -1,0 +1,6 @@
+- template:
+    src: config.j2
+    dest: '{{ demo_output }}/config'
+    mode: '0600'
+  notify: web configuration changed
+

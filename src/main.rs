@@ -58,6 +58,7 @@ fn main() -> Result<()> {
             let inventory = load_inventory(sub_matches, &config)?;
             let forks = config.host_limit(sub_matches)?;
             let options = playbook::ExecutionOptions {
+                role_paths: config.role_paths.clone(),
                 limit: sub_matches.get_one::<String>("limit").cloned(),
                 config_file: config.file.clone(),
                 extra_vars: sub_matches

@@ -1,0 +1,6 @@
+- stat:
+    path: '{{ demo_output }}/config'
+  register: deployed_config
+- debug:
+    msg: 'Config exists: {{ deployed_config.stat.exists }}'
+

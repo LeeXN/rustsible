@@ -1,0 +1,5 @@
+- template:
+    src: config.j2
+    dest: '@OUTPUT@/config'
+  notify: 'web : reload'
+- shell: "printf '%s' 'role;' >> @OUTPUT@/order"

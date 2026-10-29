@@ -1,0 +1,5 @@
+- set_fact:
+    include_enabled: false
+- copy:
+    content: '{{ include_param }}'
+    dest: '@OUTPUT@/included'

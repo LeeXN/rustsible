@@ -25,6 +25,7 @@ impl RuntimeVariables {
         definitions: &HashMap<String, Value>,
         overlays: &[&serde_yaml::Mapping],
         keywords: Option<&HashMap<String, Value>>,
+        params: Option<&serde_yaml::Mapping>,
     ) -> Result<(HashMap<String, Value>, HashMap<String, Value>)> {
         let mut baseline = HashMap::new();
         if let Some(keywords) = keywords {
@@ -60,6 +61,23 @@ impl RuntimeVariables {
         }
         data.extend(self.registered.clone());
         definitions.extend(higher);
+        if let Some(params) = params {
+            let params = params
+                .iter()
+                .map(|(name, value)| {
+                    Ok((
+                        name.as_str()
+                            .context("Include/role parameter names must be strings")?
+                            .to_owned(),
+                        value.clone(),
+                    ))
+                })
+                .collect::<Result<HashMap<_, _>>>()?;
+            for name in params.keys() {
+                data.remove(name);
+            }
+            crate::inventory::host::merge_variable_layer(&mut definitions, &params);
+        }
         crate::inventory::host::merge_variable_layer(&mut definitions, &self.extra);
         for name in self.extra.keys() {
             data.remove(name);

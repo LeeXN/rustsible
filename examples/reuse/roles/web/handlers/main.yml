@@ -1,0 +1,7 @@
+- name: record configuration update
+  listen: web configuration changed
+  copy:
+    content: '{{ greeting }}'
+    dest: '{{ demo_output }}/handler-result'
+    mode: '0600'
+

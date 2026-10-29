@@ -1,0 +1,3 @@
+- name: reload
+  listen: refresh_topic
+  shell: "printf '%s' 'handler-{{ role_param }};' >> @OUTPUT@/order"

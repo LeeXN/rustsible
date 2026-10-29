@@ -14,7 +14,7 @@ pub use handlers::Handler;
 pub use play::Play;
 pub(crate) use play::RunState;
 pub(crate) use task::render_module_arguments;
-pub use task::{Task, TaskResult};
+pub use task::{Task, TaskGroup, TaskResult, TaskScope};
 
 /// Options that affect a complete playbook execution.
 ///
@@ -28,6 +28,7 @@ pub struct ExecutionOptions {
     pub worker_dir: Option<std::path::PathBuf>,
     pub extra_vars: Vec<String>,
     pub config_file: Option<std::path::PathBuf>,
+    pub role_paths: Vec<std::path::PathBuf>,
 }
 
 impl Default for ExecutionOptions {
@@ -39,6 +40,7 @@ impl Default for ExecutionOptions {
             worker_dir: None,
             extra_vars: Vec::new(),
             config_file: None,
+            role_paths: Vec::new(),
         }
     }
 }
@@ -54,7 +56,15 @@ pub fn execute_with_options(
 ) -> Result<()> {
     info!("Loading playbook from file: {}", playbook_file);
 
-    let playbook = parser::parse_playbook(playbook_file)?;
+    let extra = crate::vars::extra(&options.extra_vars)?;
+    let mut playbook = parser::parse_playbook(
+        playbook_file,
+        &parser::ParseOptions {
+            variables: extra.clone(),
+            role_paths: options.role_paths.clone(),
+            ..Default::default()
+        },
+    )?;
     let mut inventory = inventory.clone();
     let playbook_source = std::path::Path::new(playbook_file).canonicalize()?;
     if inventory.source.as_ref().and_then(|path| path.parent()) != playbook_source.parent() {
@@ -83,20 +93,16 @@ pub fn execute_with_options(
     let mut failures = Vec::new();
     let mut state = play::RunState::default();
     state.workers = crate::worker::Runtime::new(options.worker_dir.clone());
-    state.extra = std::sync::Arc::new(crate::vars::extra(&options.extra_vars)?);
+    state.extra = std::sync::Arc::new(extra);
     state.prepare(
         &inventory,
         playbook_source.parent().context("Playbook has no parent")?,
         options.config_file.as_deref(),
     )?;
 
-    for (index, play) in playbook.plays.iter().enumerate() {
-        info!(
-            "PLAY [{}] ({}/{})",
-            play.name,
-            index + 1,
-            playbook.plays.len()
-        );
+    let play_count = playbook.plays.len();
+    for (index, play) in playbook.plays.iter_mut().enumerate() {
+        info!("PLAY [{}] ({}/{})", play.name, index + 1, play_count);
 
         let mut hosts = inventory.filter_hosts(&play.hosts);
         if let Some(limited) = &limited_hosts {

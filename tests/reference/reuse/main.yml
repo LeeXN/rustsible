@@ -1,0 +1,4 @@
+- import_playbook: play/app.yml
+  vars:
+    active: true
+    include_enabled: true

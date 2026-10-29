@@ -482,6 +482,615 @@ fn configuration_become_defaults_stay_below_play_task_and_variable_settings() ->
 }
 
 #[test]
+fn static_imports_keep_nested_sources_bindings_and_per_task_conditions() -> Result<()> {
+    let directory = TempDir::new()?;
+    let nested = directory.path().join("nested");
+    let elsewhere = directory.path().join("elsewhere");
+    std::fs::create_dir(&nested)?;
+    std::fs::create_dir(&elsewhere)?;
+    std::fs::write(nested.join("payload"), "from nested source")?;
+    std::fs::write(
+        directory.path().join("site.yml"),
+        "- import_playbook: '{{ selected }}'\n  vars:\n    greeting: import\n",
+    )?;
+    std::fs::write(nested.join("vars.yml"), "ready: true")?;
+    std::fs::write(
+        nested.join("site.yml"),
+        r#"
+- hosts: localhost
+  gather_facts: false
+  vars:
+    greeting: childplay
+  vars_files: [vars.yml]
+  tasks:
+    - ansible.builtin.import_tasks: deploy.yml
+      vars:
+        message: '{{ greeting }}'
+    - import_tasks: conditional.yml
+      when: ready
+"#,
+    )?;
+    std::fs::write(
+        nested.join("deploy.yml"),
+        format!(
+            r#"
+- copy:
+    src: payload
+    dest: {0}/payload
+- copy:
+    content: '{{{{ message }}}}|{{{{ playbook_dir }}}}'
+    dest: {0}/context
+"#,
+            directory.path().display()
+        ),
+    )?;
+    std::fs::write(
+        nested.join("conditional.yml"),
+        format!(
+            r#"
+- set_fact:
+    ready: false
+- command: touch {}/must-not-run
+"#,
+            directory.path().display()
+        ),
+    )?;
+    let inventory = local_inventory();
+    let output = controller()
+        .current_dir(&elsewhere)
+        .arg("playbook")
+        .arg(directory.path().join("site.yml"))
+        .arg("-i")
+        .arg(inventory.path())
+        .args(["-e", "selected=nested/site.yml"])
+        .output()?;
+    assert!(
+        output.status.success(),
+        "{}\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        std::fs::read_to_string(directory.path().join("payload"))?,
+        "from nested source"
+    );
+    assert_eq!(
+        std::fs::read_to_string(directory.path().join("context"))?,
+        format!("import|{}", nested.display())
+    );
+    assert!(!directory.path().join("must-not-run").exists());
+    Ok(())
+}
+
+#[test]
+fn static_import_cycles_and_invalid_children_fail_before_any_target_modification() -> Result<()> {
+    let directory = TempDir::new()?;
+    let root = directory.path().display();
+    let inventory = local_inventory();
+    let book = directory.path().join("site.yml");
+    std::fs::write(&book, format!("- hosts: localhost\n  gather_facts: false\n  tasks:\n    - command: touch {root}/changed\n    - import_tasks: bad.yml\n"))?;
+    for content in ["- import_tasks: bad.yml", "- definitely_not_a_module: {}"] {
+        std::fs::write(directory.path().join("bad.yml"), content)?;
+        let output = controller()
+            .arg("playbook")
+            .arg(&book)
+            .arg("-i")
+            .arg(inventory.path())
+            .output()?;
+        assert!(!output.status.success());
+        assert!(!directory.path().join("changed").exists());
+        assert!(String::from_utf8_lossy(&output.stderr).contains("bad.yml"));
+    }
+    std::fs::write(&book, "- import_playbook: site.yml")?;
+    let output = controller()
+        .arg("playbook")
+        .arg(&book)
+        .arg("-i")
+        .arg(inventory.path())
+        .output()?;
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("Import cycle"));
+    Ok(())
+}
+
+#[test]
+fn dynamic_includes_select_before_expansion_and_keep_loop_bindings_and_parameter_scope(
+) -> Result<()> {
+    let directory = TempDir::new()?;
+    let root = directory.path().display();
+    std::fs::create_dir(directory.path().join("tasks"))?;
+    for name in ["one", "two"] {
+        std::fs::write(
+            directory.path().join(format!("tasks/{name}.yml")),
+            format!(
+                r#"
+- set_fact:
+    ready: false
+- shell: 'printf "%s|%s;" "{{{{ item }}}}" "{{{{ message }}}}" >> {root}/order'
+  vars:
+    message: child
+"#
+            ),
+        )?;
+    }
+    std::fs::write(
+        directory.path().join("site.yml"),
+        format!(
+            r#"
+- hosts: node
+  gather_facts: false
+  vars:
+    ready: true
+  tasks:
+    - set_fact:
+        target_address: localhost
+        ansible_connection: local
+    - include_tasks: missing.yml
+      when: false
+    - include_tasks: tasks/{{{{ item }}}}.yml
+      when: ready
+      loop: [one, two, one]
+      vars:
+        message: parent
+    - copy:
+        content: '{{{{ message | default("absent") }}}}'
+        dest: {root}/scope
+"#
+        ),
+    )?;
+    let inventory =
+        fixture_file("node ansible_host='{{ target_address }}' ansible_connection=ssh\n");
+    let output = controller()
+        .arg("playbook")
+        .arg(directory.path().join("site.yml"))
+        .arg("-i")
+        .arg(inventory.path())
+        .output()?;
+    assert!(
+        output.status.success(),
+        "{}\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        std::fs::read_to_string(directory.path().join("order"))?,
+        "one|parent;two|parent;one|parent;"
+    );
+    assert_eq!(
+        std::fs::read_to_string(directory.path().join("scope"))?,
+        "absent"
+    );
+    Ok(())
+}
+
+#[test]
+fn selected_dynamic_include_cycles_fail_and_skip_the_next_modification() -> Result<()> {
+    let directory = TempDir::new()?;
+    let book = directory.path().join("site.yml");
+    std::fs::write(
+        directory.path().join("recursive.yml"),
+        "- include_tasks: recursive.yml\n",
+    )?;
+    std::fs::write(&book, format!("- hosts: localhost\n  gather_facts: false\n  tasks:\n    - include_tasks: recursive.yml\n    - command: touch {}/later\n", directory.path().display()))?;
+    let inventory = local_inventory();
+    let output = controller()
+        .arg("playbook")
+        .arg(book)
+        .arg("-i")
+        .arg(inventory.path())
+        .output()?;
+    assert!(!output.status.success());
+    assert!(!directory.path().join("later").exists());
+    let text = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        text.contains("Import cycle") && text.contains("recursive.yml"),
+        "{text}"
+    );
+    Ok(())
+}
+
+#[test]
+fn roles_load_dependencies_sources_scopes_handlers_and_skip_duplicate_invocations() -> Result<()> {
+    let directory = TempDir::new()?;
+    let root = directory.path().display();
+    for role in ["common", "web"] {
+        for part in [
+            "tasks",
+            "defaults",
+            "vars",
+            "handlers",
+            "meta",
+            "files",
+            "templates",
+        ] {
+            std::fs::create_dir_all(directory.path().join(format!("roles/{role}/{part}")))?;
+        }
+    }
+    std::fs::write(
+        directory.path().join("roles/common/defaults/main.yml"),
+        "dependency_value: base\n",
+    )?;
+    std::fs::write(
+        directory.path().join("roles/common/tasks/main.yml"),
+        format!("- shell: \"printf '%s' 'dependency;' >> {root}/order\"\n"),
+    )?;
+    std::fs::write(
+        directory.path().join("roles/web/meta/main.yml"),
+        "dependencies: [common]\n",
+    )?;
+    std::fs::write(
+        directory.path().join("roles/web/defaults/main.yml"),
+        "default_value: default\nconflict: default\n",
+    )?;
+    std::fs::write(
+        directory.path().join("roles/web/vars/main.yml"),
+        "conflict: rolevars\nrole_value: role\n",
+    )?;
+    std::fs::write(
+        directory.path().join("roles/web/files/payload"),
+        "role payload",
+    )?;
+    std::fs::write(
+        directory.path().join("roles/web/templates/config.j2"),
+        "{{ default_value }}|{{ conflict }}|{{ role_value }}|{{ dependency_value }}",
+    )?;
+    std::fs::write(
+        directory.path().join("roles/web/tasks/main.yml"),
+        format!(
+            r#"
+- copy:
+    src: payload
+    dest: {root}/payload
+- template:
+    src: config.j2
+    dest: {root}/config
+  vars:
+    conflict: task
+  notify: reload
+- shell: "printf '%s' 'role;' >> {root}/order"
+"#
+        ),
+    )?;
+    std::fs::write(directory.path().join("roles/web/handlers/main.yml"), format!("- name: reload\n  copy:\n    content: '{{{{ conflict }}}}'\n    dest: {root}/handler\n"))?;
+    std::fs::write(
+        directory.path().join("site.yml"),
+        format!(
+            r#"
+- hosts: localhost
+  gather_facts: false
+  vars:
+    conflict: play
+  roles:
+    - role: web
+      conflict: parameter
+    - role: web
+      conflict: parameter
+  tasks:
+    - copy:
+        content: '{{{{ conflict }}}}|{{{{ default_value }}}}'
+        dest: {root}/public
+"#
+        ),
+    )?;
+    let inventory = local_inventory();
+    let output = controller()
+        .arg("playbook")
+        .arg(directory.path().join("site.yml"))
+        .arg("-i")
+        .arg(inventory.path())
+        .output()?;
+    assert!(
+        output.status.success(),
+        "{}\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    for (name, expected) in [
+        ("payload", "role payload"),
+        ("config", "default|parameter|role|base"),
+        ("public", "rolevars|default"),
+        ("handler", "parameter"),
+        ("order", "dependency;role;"),
+    ] {
+        assert_eq!(
+            std::fs::read_to_string(directory.path().join(name))?,
+            expected,
+            "{name}"
+        );
+    }
+    Ok(())
+}
+
+#[test]
+fn pre_main_post_phases_flush_listeners_in_definition_order_and_last_names_win() -> Result<()> {
+    let directory = TempDir::new()?;
+    let root = directory.path().display();
+    let book = fixture_file(&format!(
+        r#"
+- hosts: localhost
+  gather_facts: false
+  pre_tasks:
+    - shell: "printf '%s' 'pre;' >> {root}/order"
+      notify: all_reloads
+  tasks:
+    - shell: "printf '%s' 'main;' >> {root}/order"
+      notify: last
+  post_tasks:
+    - shell: "printf '%s' 'post;' >> {root}/order"
+      notify: [all_reloads, last]
+  handlers:
+    - name: first
+      listen: all_reloads
+      shell: "printf '%s' 'h1;' >> {root}/order"
+    - name: second
+      listen: all_reloads
+      shell: "printf '%s' 'h2;' >> {root}/order"
+    - name: last
+      shell: "printf '%s' 'shadowed;' >> {root}/order"
+    - name: last
+      shell: "printf '%s' 'h4;' >> {root}/order"
+"#
+    ));
+    let inventory = local_inventory();
+    let output = controller()
+        .arg("playbook")
+        .arg(book.path())
+        .arg("-i")
+        .arg(inventory.path())
+        .output()?;
+    assert!(
+        output.status.success(),
+        "{}\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        std::fs::read_to_string(directory.path().join("order"))?,
+        "pre;h1;h2;main;h4;post;h1;h2;h4;"
+    );
+    Ok(())
+}
+
+#[test]
+fn loop_notifications_only_queue_changed_items_and_unknown_names_stop_later_tasks() -> Result<()> {
+    let directory = TempDir::new()?;
+    let root = directory.path().display();
+    let book = fixture_file(&format!(
+        r#"
+- hosts: localhost
+  gather_facts: false
+  tasks:
+    - command: /bin/true
+      changed_when: item == 'two'
+      notify: '{{{{ item }}}}'
+      loop: [one, two]
+  handlers:
+    - name: one
+      command: touch {root}/one
+    - name: two
+      command: touch {root}/two
+"#
+    ));
+    let inventory = local_inventory();
+    let output = controller()
+        .arg("playbook")
+        .arg(book.path())
+        .arg("-i")
+        .arg(inventory.path())
+        .output()?;
+    assert!(
+        output.status.success(),
+        "{}\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(!directory.path().join("one").exists());
+    assert!(directory.path().join("two").exists());
+    let bad = fixture_file(&format!("- hosts: localhost\n  gather_facts: false\n  tasks:\n    - command: /bin/true\n      notify: missing\n    - command: touch {root}/later\n"));
+    let output = controller()
+        .arg("playbook")
+        .arg(bad.path())
+        .arg("-i")
+        .arg(inventory.path())
+        .output()?;
+    assert!(!output.status.success());
+    assert!(!directory.path().join("later").exists());
+    Ok(())
+}
+
+#[test]
+fn dynamic_roles_keep_private_exports_loop_context_and_parameterized_handlers() -> Result<()> {
+    let directory = TempDir::new()?;
+    let root = directory.path().display();
+    for role in ["private", "base"] {
+        for part in ["tasks", "defaults", "vars", "handlers", "meta"] {
+            std::fs::create_dir_all(directory.path().join(format!("roles/{role}/{part}")))?;
+        }
+    }
+    std::fs::write(
+        directory.path().join("roles/base/defaults/main.yml"),
+        "dependency_value: dependency\n",
+    )?;
+    std::fs::write(
+        directory.path().join("roles/private/meta/main.yml"),
+        "dependencies: [base]\n",
+    )?;
+    std::fs::write(
+        directory.path().join("roles/private/vars/main.yml"),
+        "private_value: private\n",
+    )?;
+    std::fs::write(
+        directory.path().join("roles/private/tasks/main.yml"),
+        format!(
+            r#"
+- copy:
+    content: '{{{{ private_value }}}}|{{{{ dependency_value }}}}|{{{{ label }}}}'
+    dest: {root}/{{{{ label }}}}
+  notify: 'reload {{{{ label }}}}'
+"#
+        ),
+    )?;
+    std::fs::write(
+        directory.path().join("roles/private/handlers/main.yml"),
+        format!(
+            r#"
+- name: 'reload {{{{ label }}}}'
+  copy:
+    content: '{{{{ label }}}}'
+    dest: {root}/handler-{{{{ label }}}}
+"#
+        ),
+    )?;
+    std::fs::write(
+        directory.path().join("site.yml"),
+        format!(
+            r#"
+- hosts: localhost
+  gather_facts: false
+  tasks:
+    - include_role:
+        name: nonexistent
+      when: false
+    - include_role:
+        name: private
+      loop: [one, two]
+      vars:
+        label: '{{{{ item }}}}'
+    - copy:
+        content: '{{{{ private_value | default("absent") }}}}|{{{{ dependency_value | default("absent") }}}}'
+        dest: {root}/public
+"#
+        ),
+    )?;
+    let inventory = local_inventory();
+    let output = controller()
+        .arg("playbook")
+        .arg(directory.path().join("site.yml"))
+        .arg("-i")
+        .arg(inventory.path())
+        .output()?;
+    assert!(
+        output.status.success(),
+        "{}\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        std::fs::read_to_string(directory.path().join("public"))?,
+        "absent|absent"
+    );
+    for name in ["one", "two"] {
+        assert_eq!(
+            std::fs::read_to_string(directory.path().join(name))?,
+            format!("private|dependency|{name}")
+        );
+        assert_eq!(
+            std::fs::read_to_string(directory.path().join(format!("handler-{name}")))?,
+            name
+        );
+    }
+    Ok(())
+}
+
+#[test]
+fn blocks_rescue_failures_run_always_and_reactivate_recovered_hosts() -> Result<()> {
+    let directory = TempDir::new()?;
+    let root = directory.path().display();
+    let book = fixture_file(&format!(
+        r#"
+- hosts: localhost
+  gather_facts: false
+  tasks:
+    - block:
+        - name: deliberate failure
+          command: /bin/false
+        - command: touch {root}/skipped
+      rescue:
+        - copy:
+            content: '{{{{ ansible_failed_task.name }}}}|{{{{ ansible_failed_result.rc }}}}'
+            dest: {root}/rescued
+      always:
+        - command: touch {root}/always
+    - command: touch {root}/continued
+- hosts: localhost
+  gather_facts: false
+  tasks:
+    - command: touch {root}/next-play
+"#
+    ));
+    let inventory = local_inventory();
+    let output = controller()
+        .arg("playbook")
+        .arg(book.path())
+        .arg("-i")
+        .arg(inventory.path())
+        .output()?;
+    assert!(
+        output.status.success(),
+        "{}\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        std::fs::read_to_string(directory.path().join("rescued"))?,
+        "deliberate failure|1"
+    );
+    assert!(!directory.path().join("skipped").exists());
+    for name in ["always", "continued", "next-play"] {
+        assert!(directory.path().join(name).exists(), "{name}");
+    }
+    assert!(String::from_utf8_lossy(&output.stdout).contains("rescued=1"));
+    Ok(())
+}
+
+#[test]
+fn failed_rescue_still_runs_always_and_preserves_failure_but_nested_rescue_can_recover(
+) -> Result<()> {
+    let directory = TempDir::new()?;
+    let root = directory.path().display();
+    let book = fixture_file(&format!(
+        r#"
+- hosts: localhost
+  gather_facts: false
+  tasks:
+    - block:
+        - block:
+            - command: /bin/false
+          rescue:
+            - command: /bin/false
+          always:
+            - command: touch {root}/inner-always
+      rescue:
+        - command: touch {root}/outer-rescue
+      always:
+        - command: touch {root}/outer-always
+    - command: touch {root}/continued
+"#
+    ));
+    let inventory = local_inventory();
+    let output = controller()
+        .arg("playbook")
+        .arg(book.path())
+        .arg("-i")
+        .arg(inventory.path())
+        .output()?;
+    assert!(
+        output.status.success(),
+        "{}\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    for name in ["inner-always", "outer-rescue", "outer-always", "continued"] {
+        assert!(directory.path().join(name).exists(), "{name}");
+    }
+    Ok(())
+}
+
+#[test]
 fn task_attempts_conditions_environment_and_loop_results_follow_real_execution() -> Result<()> {
     let directory = TempDir::new()?;
     let root = directory.path().display();
@@ -1157,7 +1766,7 @@ fn test_unknown_module_returns_nonzero_exit_status() -> Result<()> {
 fn playbook_cli_prints_the_complete_parse_error_chain() -> Result<()> {
     let inventory_file = local_inventory();
     let playbook_file = fixture_file(
-        "---\n- name: unsupported pre tasks\n  hosts: localhost\n  pre_tasks: []\n  tasks: []\n",
+        "---\n- name: unsupported serial\n  hosts: localhost\n  serial: 1\n  tasks: []\n",
     );
 
     let output = controller()
@@ -1171,7 +1780,7 @@ fn playbook_cli_prints_the_complete_parse_error_chain() -> Result<()> {
     let stderr = String::from_utf8(output.stderr)?;
     assert!(stderr.contains("Failed to parse play 1 in document 1"));
     assert!(
-        stderr.contains("Play keyword 'pre_tasks' is recognized but not supported"),
+        stderr.contains("Play keyword 'serial' is recognized but not supported"),
         "stderr omitted the root cause: {stderr}"
     );
     Ok(())
@@ -1249,6 +1858,7 @@ fn documented_subset_examples_remain_parseable() -> Result<()> {
         "playbooks/test_user.yml",
         "manual/local-smoke.yml",
         "manual/cleanup-local.yml",
+        "reuse/main.yml",
     ] {
         let path = manifest_dir.join("examples").join(relative_path);
         let error = run_playbook(path.to_str().unwrap(), &inventory).unwrap_err();
@@ -1419,5 +2029,436 @@ fn native_copy_inline_content_keeps_nul_and_literal_template_bytes() -> Result<(
         String::from_utf8_lossy(&output.stderr)
     );
     assert_eq!(std::fs::read(path)?, content.as_bytes());
+    Ok(())
+}
+#[test]
+fn force_handlers_and_explicit_flush_keep_notifications_without_replaying_completed_handlers(
+) -> Result<()> {
+    let directory = TempDir::new()?;
+    let root = directory.path().display();
+    let book = fixture_file(&format!(
+        r#"
+- hosts: localhost
+  gather_facts: false
+  force_handlers: true
+  tasks:
+    - command: /bin/true
+      notify: mark
+    - meta: flush_handlers
+    - command: /bin/true
+      notify: mark
+    - command: /bin/false
+  handlers:
+    - name: mark
+      shell: "printf x >> {root}/handler"
+"#
+    ));
+    let inventory = local_inventory();
+    let output = controller()
+        .arg("playbook")
+        .arg(book.path())
+        .arg("-i")
+        .arg(inventory.path())
+        .output()?;
+    assert!(!output.status.success());
+    assert_eq!(
+        std::fs::read_to_string(directory.path().join("handler"))?,
+        "xx"
+    );
+    Ok(())
+}
+
+#[test]
+fn meta_end_host_end_play_and_clear_errors_keep_play_lifetimes_separate() -> Result<()> {
+    let directory = TempDir::new()?;
+    let root = directory.path().display();
+    let inventory = fixture_file("one ansible_connection=local ansible_host=localhost\ntwo ansible_connection=local ansible_host=localhost\n");
+    let book = fixture_file(&format!(
+        r#"
+- hosts: all
+  gather_facts: false
+  tasks:
+    - meta: end_host
+      when: inventory_hostname == 'one'
+    - command: touch {root}/first-{{{{ inventory_hostname }}}}
+- hosts: all
+  gather_facts: false
+  tasks:
+    - command: touch {root}/second-{{{{ inventory_hostname }}}}
+    - meta: end_play
+    - command: touch {root}/never
+- hosts: all
+  gather_facts: false
+  tasks:
+    - command: /bin/false
+      when: inventory_hostname == 'one'
+    - meta: clear_host_errors
+- hosts: all
+  gather_facts: false
+  tasks:
+    - command: touch {root}/recovered-{{{{ inventory_hostname }}}}
+"#
+    ));
+    let output = controller()
+        .arg("playbook")
+        .arg(book.path())
+        .arg("-i")
+        .arg(inventory.path())
+        .output()?;
+    assert!(
+        !output.status.success(),
+        "original failure must remain in recap"
+    );
+    assert!(!directory.path().join("first-one").exists());
+    assert!(!directory.path().join("never").exists());
+    for name in [
+        "first-two",
+        "second-one",
+        "second-two",
+        "recovered-one",
+        "recovered-two",
+    ] {
+        assert!(
+            directory.path().join(name).exists(),
+            "{name}: {}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+    Ok(())
+}
+#[test]
+fn unreachable_block_does_not_rescue_or_run_always_and_can_be_cleared_for_a_later_play(
+) -> Result<()> {
+    let directory = TempDir::new()?;
+    let root = directory.path().display();
+    let listener = std::net::TcpListener::bind("127.0.0.1:0")?;
+    let port = listener.local_addr()?.port();
+    let inventory = fixture_file(&format!("lost ansible_connection=ssh ansible_host=127.0.0.1 ansible_port={port} ansible_ssh_timeout=1\nhealthy ansible_connection=local ansible_host=localhost\n"));
+    let book = fixture_file(&format!(
+        r#"
+- hosts: lost
+  gather_facts: false
+  tasks:
+    - block:
+        - command: /bin/true
+          ignore_errors: true
+      rescue:
+        - set_fact:
+            wrong_rescue: true
+      always:
+        - set_fact:
+            wrong_always: true
+- hosts: all
+  gather_facts: false
+  tasks:
+    - meta: clear_host_errors
+- hosts: lost
+  gather_facts: false
+  vars:
+    ansible_connection: local
+  tasks:
+    - copy:
+        content: '{{{{ wrong_rescue | default("no") }}}}|{{{{ wrong_always | default("no") }}}}'
+        dest: {root}/recovered
+"#
+    ));
+    let output = controller()
+        .arg("playbook")
+        .arg(book.path())
+        .arg("-i")
+        .arg(inventory.path())
+        .output()?;
+    assert!(!output.status.success());
+    assert_eq!(
+        std::fs::read_to_string(directory.path().join("recovered"))?,
+        "no|no"
+    );
+    assert!(String::from_utf8_lossy(&output.stdout).contains("unreachable=1"));
+    Ok(())
+}
+
+#[test]
+fn ignore_unreachable_is_explicit_and_block_always_obeys_check_and_no_log() -> Result<()> {
+    let directory = TempDir::new()?;
+    let root = directory.path().display();
+    let listener = std::net::TcpListener::bind("127.0.0.1:0")?;
+    let port = listener.local_addr()?.port();
+    let inventory = fixture_file(&format!("lost ansible_connection=ssh ansible_host=127.0.0.1 ansible_port={port} ansible_ssh_timeout=1\n"));
+    let book = fixture_file(&format!(
+        r#"
+- hosts: all
+  gather_facts: false
+  tasks:
+    - command: /bin/true
+      ignore_unreachable: true
+    - set_fact:
+        ansible_connection: local
+    - command: touch {root}/continued
+"#
+    ));
+    let output = controller()
+        .arg("playbook")
+        .arg(book.path())
+        .arg("-i")
+        .arg(inventory.path())
+        .output()?;
+    assert!(
+        output.status.success(),
+        "{}\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(directory.path().join("continued").exists());
+    let safe = fixture_file(&format!(
+        r#"
+- hosts: all
+  gather_facts: false
+  vars:
+    ansible_connection: local
+  tasks:
+    - block:
+        - debug:
+            msg: BLOCK_PRIVATE_SENTINEL
+          failed_when: true
+      rescue:
+        - copy:
+            content: secret
+            dest: {root}/rescue
+      always:
+        - copy:
+            content: BLOCK_PRIVATE_SENTINEL
+            dest: {root}/always
+          check_mode: false
+      no_log: true
+"#
+    ));
+    let output = controller()
+        .arg("playbook")
+        .arg(safe.path())
+        .arg("-i")
+        .arg(inventory.path())
+        .arg("--check")
+        .output()?;
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(!directory.path().join("rescue").exists() && !directory.path().join("always").exists());
+    let text = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(!text.contains("BLOCK_PRIVATE_SENTINEL"), "{text}");
+    Ok(())
+}
+#[test]
+fn role_cycles_and_plugin_content_are_rejected_during_static_loading() -> Result<()> {
+    let directory = TempDir::new()?;
+    let root = directory.path().display();
+    for role in ["one", "two"] {
+        std::fs::create_dir_all(directory.path().join(format!("roles/{role}/meta")))?;
+    }
+    std::fs::write(
+        directory.path().join("roles/one/meta/main.yml"),
+        "dependencies: [two]",
+    )?;
+    std::fs::write(
+        directory.path().join("roles/two/meta/main.yml"),
+        "dependencies: [one]",
+    )?;
+    let book = directory.path().join("site.yml");
+    std::fs::write(&book, format!("- hosts: localhost\n  gather_facts: false\n  tasks:\n    - command: touch {root}/changed\n    - import_role:\n        name: one\n"))?;
+    let inventory = local_inventory();
+    let output = controller()
+        .arg("playbook")
+        .arg(&book)
+        .arg("-i")
+        .arg(inventory.path())
+        .output()?;
+    assert!(!output.status.success());
+    assert!(!directory.path().join("changed").exists());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("Role dependency/include cycle"));
+    std::fs::write(
+        directory.path().join("roles/one/meta/main.yml"),
+        "dependencies: []",
+    )?;
+    std::fs::create_dir(directory.path().join("roles/one/library"))?;
+    std::fs::write(
+        directory.path().join("roles/one/library/copy.py"),
+        "raise RuntimeError('must never execute')",
+    )?;
+    let output = controller()
+        .arg("playbook")
+        .arg(&book)
+        .arg("-i")
+        .arg(inventory.path())
+        .output()?;
+    assert!(!output.status.success());
+    assert!(!directory.path().join("changed").exists());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("Role plugin content is unsupported"));
+    Ok(())
+}
+
+#[test]
+fn imported_roles_expose_static_vars_before_execution_and_dynamic_public_is_explicit() -> Result<()>
+{
+    let directory = TempDir::new()?;
+    let root = directory.path().display();
+    std::fs::create_dir_all(directory.path().join("roles/demo/vars"))?;
+    std::fs::write(
+        directory.path().join("roles/demo/vars/main.yml"),
+        "exposed: role",
+    )?;
+    let book = directory.path().join("site.yml");
+    std::fs::write(
+        &book,
+        format!(
+            r#"
+- hosts: localhost
+  gather_facts: false
+  tasks:
+    - copy:
+        content: '{{{{ exposed }}}}'
+        dest: {root}/before
+    - import_role:
+        name: demo
+- hosts: localhost
+  gather_facts: false
+  tasks:
+    - include_role:
+        name: demo
+        public: true
+    - copy:
+        content: '{{{{ exposed }}}}'
+        dest: {root}/after
+"#
+        ),
+    )?;
+    let inventory = local_inventory();
+    let output = controller()
+        .arg("playbook")
+        .arg(book)
+        .arg("-i")
+        .arg(inventory.path())
+        .output()?;
+    assert!(
+        output.status.success(),
+        "{}\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        std::fs::read_to_string(directory.path().join("before"))?,
+        "role"
+    );
+    assert_eq!(
+        std::fs::read_to_string(directory.path().join("after"))?,
+        "role"
+    );
+    Ok(())
+}
+
+#[test]
+fn imported_playbook_conditions_gate_facts_and_are_rechecked_on_each_task() -> Result<()> {
+    let directory = TempDir::new()?;
+    let root = directory.path().display();
+    let source = directory.path().join("site.yml");
+    std::fs::write(&source, "- import_playbook: unreachable.yml\n  when: false\n- import_playbook: conditional.yml\n  vars: {enabled: true}\n  when: enabled\n")?;
+    std::fs::write(directory.path().join("unreachable.yml"), "- hosts: localhost\n  vars: {ansible_connection: ssh, ansible_host: unreachable.invalid}\n  tasks:\n    - command: /bin/false\n")?;
+    std::fs::write(directory.path().join("conditional.yml"), format!("- hosts: localhost\n  gather_facts: false\n  tasks:\n    - set_fact: {{enabled: false}}\n    - command: touch {root}/must-not-run\n"))?;
+    let inventory = local_inventory();
+    let output = controller()
+        .arg("playbook")
+        .arg(source)
+        .arg("-i")
+        .arg(inventory.path())
+        .output()?;
+    assert!(
+        output.status.success(),
+        "{}\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(!directory.path().join("must-not-run").exists());
+    assert!(String::from_utf8_lossy(&output.stdout).contains("unreachable=0"));
+    Ok(())
+}
+
+#[test]
+fn handler_chains_share_register_state_and_recursive_flush_runs_each_handler_once() -> Result<()> {
+    let directory = TempDir::new()?;
+    let root = directory.path().display();
+    let book = fixture_file(&format!(
+        r#"
+- hosts: localhost
+  gather_facts: false
+  tasks:
+    - command: /bin/true
+      notify: first
+    - meta: flush_handlers
+    - copy:
+        content: '{{{{ handler_result.stdout }}}}'
+        dest: {root}/registered
+  handlers:
+    - name: first
+      command: /bin/echo from-handler
+      register: handler_result
+      notify: second
+    - name: second
+      shell: printf second >> {root}/order
+      notify: recursive
+    - name: recursive
+      meta: flush_handlers
+"#
+    ));
+    let inventory = local_inventory();
+    let output = controller()
+        .arg("playbook")
+        .arg(book.path())
+        .arg("-i")
+        .arg(inventory.path())
+        .output()?;
+    assert!(
+        output.status.success(),
+        "{}\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        std::fs::read_to_string(directory.path().join("order"))?,
+        "second"
+    );
+    assert_eq!(
+        std::fs::read_to_string(directory.path().join("registered"))?,
+        "from-handler"
+    );
+    Ok(())
+}
+
+#[test]
+fn reusable_deployment_example_predicts_new_directories_without_creating_business_files(
+) -> Result<()> {
+    let directory = TempDir::new()?;
+    let destination = directory.path().join("output");
+    let inventory = local_inventory();
+    let output = controller()
+        .arg("playbook")
+        .arg(PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("examples/reuse/main.yml"))
+        .arg("-i")
+        .arg(inventory.path())
+        .arg("-e")
+        .arg(format!("demo_output={}", destination.display()))
+        .arg("--check")
+        .output()?;
+    assert!(
+        output.status.success(),
+        "{}\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(!destination.exists());
     Ok(())
 }
