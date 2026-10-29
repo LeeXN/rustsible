@@ -58,6 +58,17 @@ mv "$fixture_dir/variables-output" "$fixture_dir/reference-variables"
 mkdir "$fixture_dir/variables-output"
 "$binary" playbook -i "$fixture_dir/inventory" "$fixture_dir/variables.yml" -e configuration=extra -e item=extra -e probe=extra > "$fixture_dir/native-variables.log" 2>&1
 diff -r "$fixture_dir/reference-variables" "$fixture_dir/variables-output"
+cp -a "$repo_dir/tests/reference/reuse" "$fixture_dir/reuse"
+mkdir "$fixture_dir/reuse-output"
+while IFS= read -r -d '' file; do
+    sed -i "s|@OUTPUT@|$fixture_dir/reuse-output|g" "$file"
+done < <(find "$fixture_dir/reuse" -type f -print0)
+ANSIBLE_CONFIG="$fixture_dir/reuse/ansible.cfg" uv tool run --from ansible-core==2.21.0 ansible-playbook -i "$fixture_dir/inventory" "$fixture_dir/reuse/main.yml" > "$fixture_dir/reference-reuse.log" 2>&1
+mv "$fixture_dir/reuse-output" "$fixture_dir/reference-reuse"
+mkdir "$fixture_dir/reuse-output"
+"$binary" --config "$fixture_dir/reuse/ansible.cfg" playbook -i "$fixture_dir/inventory" "$fixture_dir/reuse/main.yml" > "$fixture_dir/native-reuse.log" 2>&1
+diff -r "$fixture_dir/reference-reuse" "$fixture_dir/reuse-output"
+[[ ! -e $fixture_dir/reuse-output/must-not-run ]]
 if uv tool run --from ansible-core==2.21.0 ansible-playbook \
     -i "$fixture_dir/inventory" "$fixture_dir/non_boolean.yml" > "$fixture_dir/reference-condition.log" 2>&1; then
     echo 'Reference unexpectedly accepted a string condition' >&2; exit 1
@@ -66,4 +77,4 @@ if "$binary" playbook -i "$fixture_dir/inventory" "$fixture_dir/non_boolean.yml"
     echo 'Rustsible unexpectedly accepted a string condition' >&2; exit 1
 fi
 [[ ! -e $fixture_dir/result/unsafe-condition ]]
-printf 'Ansible 2.21.0 comparison passed: templates/types, native files, retries/conditions, environment, command prediction, fact names/fields/filtering, variable sources and host scope\n'
+printf 'Ansible 2.21.0 comparison passed: templates/types, native files, retries/conditions, environment, command prediction, fact names/fields/filtering, variable sources, host scope, imports/roles and handler/rescue phases\n'

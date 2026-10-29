@@ -18,8 +18,25 @@ pub fn copy(args: &Value, payload: &Path, check: bool) -> Result<ModuleResult> {
     let attributes = Attributes::parse(args)?;
     let dest = get_param::<String>(args, "dest")?;
     let force = get_optional_param::<bool>(args, "force")?.unwrap_or(true);
-    let mut destination = Destination::open(&dest)?;
     let mut source = File::open(payload)?;
+    let mut destination = match Destination::open(&dest) {
+        Ok(destination) => destination,
+        Err(error)
+            if check
+                && error
+                    .downcast_ref::<std::io::Error>()
+                    .is_some_and(|error| error.kind() == std::io::ErrorKind::NotFound) =>
+        {
+            // A preceding directory task predicts creation without creating it.
+            // Copy/template can still predict a missing destination, as the
+            // reference action does; real installation keeps strict parent checks.
+            return Ok(result(
+                true,
+                "Destination is absent (parent does not yet exist)",
+            ));
+        }
+        Err(error) => return Err(error),
+    };
     let content_changed =
         destination.file.is_none() || (force && !destination.equals(&mut source)?);
     let changed = content_changed

@@ -276,8 +276,17 @@ impl Builtin {
                 }
             }
             Self::Meta => {
-                if string("action") != Some("reset_connection") {
-                    bail!("Only meta action reset_connection is currently supported");
+                if !matches!(
+                    string("action"),
+                    Some(
+                        "reset_connection"
+                            | "flush_handlers"
+                            | "clear_host_errors"
+                            | "end_host"
+                            | "end_play"
+                    )
+                ) {
+                    bail!("Unsupported meta action");
                 }
             }
             Self::Copy | Self::Template => {

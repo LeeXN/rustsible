@@ -1,0 +1,30 @@
+- hosts: localhost
+  gather_facts: false
+  pre_tasks:
+    - shell: "printf '%s' 'pre;' >> @OUTPUT@/order"
+      notify: refresh_topic
+  roles:
+    - role: web
+      role_param: parameter
+  tasks:
+    - import_tasks: tasks/static.yml
+      when: active
+    - include_tasks: tasks/dynamic.yml
+      when: include_enabled
+      vars:
+        include_param: included
+    - block:
+        - name: deliberate failure
+          command: /bin/false
+      rescue:
+        - copy:
+            content: '{{ ansible_failed_task.name }}|{{ ansible_failed_result.rc }}'
+            dest: '@OUTPUT@/rescued'
+      always:
+        - shell: "printf '%s' 'always;' >> @OUTPUT@/order"
+    - meta: flush_handlers
+    - copy:
+        content: '{{ shared_default }}|{{ public_value }}'
+        dest: '@OUTPUT@/public'
+  post_tasks:
+    - shell: "printf '%s' 'post;' >> @OUTPUT@/order"

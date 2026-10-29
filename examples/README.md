@@ -22,9 +22,14 @@ examples/
 ```
 
 `test_all_features.yml` 和 `test_package.yml` 是迁移审查素材，刻意保留了
-`group`、`set_fact` 等尚未实现的 Ansible 功能，当前会被明确拒绝。其余文件
+`group` 等尚未实现的 Ansible 功能，当前会被明确拒绝。其余文件
 用于当前子集的示例，但也不构成完整兼容性保证。遇到不支持的模块、关键字或表达式时，
 Rustsible 会返回错误，而不会静默忽略。
+
+`reuse/main.yml` 展示 playbook 导入、角色模板与参数、动态任务文件、listen
+handler 和 block/rescue/always。用本地 inventory 运行，文件仅写入
+`/tmp/rustsible-reuse-demo`；可用 `-e demo_output=/其他测试目录` 改路径。
+`--check` 下 command 不执行，救援分支不会为了示例而制造失败。
 
 ## 运行
 
@@ -42,7 +47,7 @@ rustsible ad-hoc localhost -i examples/inventory/hosts \
   -m command -a "uptime"
 ```
 
-`command` 按参数列表执行，不解释管道、重定向或变量展开；需要这些 shell
+`command` 按参数列表执行，不解释管道或重定向；默认展开环境变量，但不会启动 shell。需要这些 shell
 语法时请显式使用 `shell`。远程 SSH 默认严格校验 host key。
 
 ## 安全提示

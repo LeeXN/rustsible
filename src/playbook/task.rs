@@ -19,9 +19,65 @@ use crate::ssh::config::ConnectionConfig;
 const MAX_ARGUMENT_TEMPLATE_DEPTH: usize = 64;
 const MAX_ARGUMENT_TEMPLATE_NODES: usize = 10_000;
 
+#[derive(Debug, Clone, Default, serde::Serialize)]
+pub struct TaskScope {
+    pub role_id: Option<String>,
+    pub allow_duplicates: bool,
+    pub(crate) boundary: Option<Boundary>,
+    pub defaults: Mapping,
+    pub role_vars: Mapping,
+    pub role_params: Mapping,
+    pub params: Mapping,
+    /// Loop/include bindings are runtime data, never template definitions.
+    pub locals: HashMap<String, Value>,
+    pub role_path: Option<std::path::PathBuf>,
+    pub role_name: Option<String>,
+    pub parent_roles: Vec<std::path::PathBuf>,
+    pub ancestors: Vec<std::path::PathBuf>,
+}
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+pub(crate) enum Boundary {
+    Start,
+    End,
+    Flush,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum IncludeKind {
+    Tasks,
+    Role,
+}
+pub(crate) fn include_kind(name: &str) -> Option<IncludeKind> {
+    match name
+        .strip_prefix("ansible.builtin.")
+        .or_else(|| name.strip_prefix("ansible.legacy."))
+        .unwrap_or(name)
+    {
+        "include_tasks" => Some(IncludeKind::Tasks),
+        "include_role" => Some(IncludeKind::Role),
+        _ => None,
+    }
+}
+#[derive(Debug, Clone)]
+pub(crate) struct IncludeRequest {
+    pub iteration: usize,
+    pub kind: IncludeKind,
+    pub args: Mapping,
+    pub parent: Task,
+}
+#[derive(Debug, Clone, Default)]
+pub struct TaskGroup {
+    pub tasks: Vec<Task>,
+    pub rescue: Vec<Task>,
+    pub always: Vec<Task>,
+}
+
 /// Task result structure for tracking execution status
 #[derive(Debug, Clone)]
 pub struct TaskResult {
+    pub(crate) meta: Option<String>,
+    pub(crate) includes: Vec<IncludeRequest>,
+    pub(crate) notifications: Vec<String>,
     pub changed: bool,
     pub failed: bool,
     pub unreachable: bool,
@@ -56,6 +112,9 @@ impl TaskResult {
         let mut values = HashMap::new();
         insert_output_values(&mut values, String::new(), String::new(), None);
         TaskResult {
+            meta: None,
+            includes: Vec::new(),
+            notifications: Vec::new(),
             changed: false,
             failed: false,
             unreachable: false,
@@ -78,6 +137,9 @@ impl TaskResult {
         );
 
         TaskResult {
+            meta: None,
+            includes: Vec::new(),
+            notifications: Vec::new(),
             changed: module_result.changed,
             failed: module_result.failed
                 || module_result.rc.is_some_and(|rc| rc != 0)
@@ -97,6 +159,10 @@ impl TaskResult {
 /// Task structure representing a single action in a play
 #[derive(Debug, Clone)]
 pub struct Task {
+    pub group: Option<Box<TaskGroup>>,
+    pub parent: Option<std::sync::Arc<Task>>,
+    pub original: Option<std::sync::Arc<Task>>,
+    pub scope: TaskScope,
     pub name: String,
     pub module: String,
     pub args: Mapping,
@@ -122,9 +188,10 @@ pub struct Task {
     pub timeout: Option<Value>,
     pub environment: Mapping,
     pub notify: Vec<String>,
-    pub ignore_errors: bool,
+    pub ignore_errors: Option<bool>,
+    pub ignore_unreachable: Option<bool>,
     /// Hide task payloads and errors from terminal/log output.
-    pub no_log: bool,
+    pub no_log: Option<bool>,
     pub vars: Mapping,
     #[allow(dead_code)]
     pub tags: Vec<String>, // Keep this for future use
@@ -157,6 +224,96 @@ fn get_nested_value<'a>(key: &str, vars: &'a HashMap<String, Value>) -> Option<&
 }
 
 impl Task {
+    /// Import/block settings are lexical defaults. Optional booleans preserve
+    /// an explicit child false rather than treating it as a missing setting.
+    pub(crate) fn inherit(&mut self, parent: &Task) {
+        if let Some(existing) = self.parent.take() {
+            let mut existing = (*existing).clone();
+            existing.inherit(parent);
+            self.parent = Some(std::sync::Arc::new(existing));
+        } else {
+            self.parent = Some(std::sync::Arc::new(parent.raw().clone()));
+        }
+    }
+    pub(crate) fn raw(&self) -> &Task {
+        self.original.as_deref().unwrap_or(self)
+    }
+    pub(crate) fn effective(&self) -> Task {
+        if self.original.is_some() {
+            return self.clone();
+        }
+        let mut task = self.clone();
+        if let Some(parent) = task.parent.take() {
+            task.inherit_fields(&parent.effective());
+        }
+        task.original = Some(std::sync::Arc::new(self.clone()));
+        task
+    }
+    fn inherit_fields(&mut self, parent: &Task) {
+        for (target, inherited) in [
+            (&mut self.scope.defaults, &parent.scope.defaults),
+            (&mut self.scope.role_vars, &parent.scope.role_vars),
+            (&mut self.scope.role_params, &parent.scope.role_params),
+            (&mut self.scope.params, &parent.scope.params),
+        ] {
+            let mut variables = inherited.clone();
+            crate::vars::merge(&mut variables, target.clone());
+            *target = variables;
+        }
+        let mut locals = parent.scope.locals.clone();
+        locals.extend(self.scope.locals.clone());
+        self.scope.locals = locals;
+        if self.scope.role_path.is_none() {
+            self.scope.role_path = parent.scope.role_path.clone();
+            self.scope.role_name = parent.scope.role_name.clone();
+            self.scope.parent_roles = parent.scope.parent_roles.clone();
+        }
+        if self.scope.ancestors.is_empty() {
+            self.scope.ancestors = parent.scope.ancestors.clone();
+        }
+        let mut variables = parent.vars.clone();
+        crate::vars::merge(&mut variables, self.vars.clone());
+        self.vars = variables;
+        let mut environment = parent.environment.clone();
+        environment.extend(self.environment.clone());
+        self.environment = environment;
+        self.become_override = self.become_override.or(parent.become_override);
+        self.become_user_override = self
+            .become_user_override
+            .clone()
+            .or_else(|| parent.become_user_override.clone());
+        self.is_become = self.become_override.unwrap_or(parent.is_become);
+        self.become_user = self
+            .become_user_override
+            .clone()
+            .unwrap_or_else(|| parent.become_user.clone());
+        self.connection = self
+            .connection
+            .clone()
+            .or_else(|| parent.connection.clone());
+        self.check_mode = self.check_mode.or(parent.check_mode);
+        self.ignore_errors = self.ignore_errors.or(parent.ignore_errors);
+        self.ignore_unreachable = self.ignore_unreachable.or(parent.ignore_unreachable);
+        self.no_log = self.no_log.or(parent.no_log);
+        if self.timeout.is_none() {
+            self.timeout = parent.timeout.clone();
+        }
+        let mut conditions = Vec::new();
+        for condition in [&parent.when, &self.when].into_iter().flatten() {
+            if let Value::Sequence(values) = condition {
+                conditions.extend(values.clone());
+            } else {
+                conditions.push(condition.clone());
+            }
+        }
+        self.when = (!conditions.is_empty()).then_some(Value::Sequence(conditions));
+        let mut notify = parent.notify.clone();
+        notify.extend(self.notify.clone());
+        self.notify = notify;
+        let mut tags = parent.tags.clone();
+        tags.extend(self.tags.clone());
+        self.tags = tags;
+    }
     pub fn execute(&self, host: &Host, vars: &HashMap<String, Value>) -> Result<TaskResult> {
         self.execute_with_options(host, vars, false)
     }
@@ -191,6 +348,16 @@ impl Task {
         check_mode: bool,
         workers: &crate::worker::Runtime,
     ) -> Result<TaskResult> {
+        if self.original.is_none() && self.parent.is_some() {
+            return self.effective().execute_with_definitions(
+                host,
+                runtime,
+                definitions,
+                play_vars,
+                check_mode,
+                workers,
+            );
+        }
         let mut keywords = HashMap::new();
         if let Some(value) = self.become_override.or(self.is_become.then_some(true)) {
             keywords.insert("ansible_become".into(), Value::Bool(value));
@@ -202,8 +369,39 @@ impl Task {
         {
             keywords.insert("ansible_become_user".into(), Value::String(value.clone()));
         }
-        let (mut definitions, mut data) =
-            runtime.layers(definitions, &[play_vars, &self.vars], Some(&keywords))?;
+        let mut scoped_definitions = self
+            .scope
+            .defaults
+            .iter()
+            .map(|(name, value)| {
+                Ok((
+                    name.as_str()
+                        .context("Role default names must be strings")?
+                        .to_owned(),
+                    value.clone(),
+                ))
+            })
+            .collect::<Result<HashMap<_, _>>>()?;
+        crate::inventory::host::merge_variable_layer(&mut scoped_definitions, definitions);
+        let mut params = self.scope.role_params.clone();
+        crate::vars::merge(&mut params, self.scope.params.clone());
+        let (mut definitions, mut data) = runtime.layers(
+            &scoped_definitions,
+            &[play_vars, &self.scope.role_vars, &self.vars],
+            Some(&keywords),
+            Some(&params),
+        )?;
+        if let Some(path) = &self.scope.role_path {
+            data.insert(
+                "role_path".into(),
+                Value::String(path.to_string_lossy().into_owned()),
+            );
+        }
+        if let Some(name) = &self.scope.role_name {
+            data.insert("role_name".into(), Value::String(name.clone()));
+            data.insert("ansible_role_name".into(), Value::String(name.clone()));
+        }
+        data.extend(self.scope.locals.clone());
         data.insert(
             "inventory_hostname".into(),
             Value::String(host.name.clone()),
@@ -229,7 +427,7 @@ impl Task {
                         let mut result = TaskResult::new(&host.name);
                         result.skipped = true;
                         result.msg = "No items in loop".to_string();
-                        result.no_log = self.no_log;
+                        result.no_log = self.no_log.unwrap_or(false);
                         print_task_result(
                             &host.name,
                             &self.name,
@@ -274,7 +472,7 @@ impl Task {
                         let mut result = TaskResult::new(&host.name);
                         result.skipped = true;
                         result.msg = "Skipped loop item due to condition".to_string();
-                        result.no_log = self.no_log;
+                        result.no_log = self.no_log.unwrap_or(false);
                         let elapsed = start_time.elapsed();
                         print_loop_iteration_result(
                             &host.name,
@@ -296,11 +494,15 @@ impl Task {
                     }
                 }
 
-                if self.normalized_module_name() != "debug" {
-                    ConnectionConfig::require_resolved(&definitions, &iter_vars)?;
-                }
                 let mut iter_task = self.clone();
                 iter_task.loop_items = None;
+                iter_task.scope.locals.insert(loop_var.into(), item.clone());
+                if let Some(index) = &self.index_var_name {
+                    iter_task
+                        .scope
+                        .locals
+                        .insert(index.clone(), Value::Number(idx.into()));
+                }
 
                 let mut result = match iter_task.execute_attempts(
                     host,
@@ -308,6 +510,7 @@ impl Task {
                     &iter_vars,
                     check_mode,
                     workers,
+                    &definitions,
                 ) {
                     Ok(result) => result,
                     Err(error) => {
@@ -317,9 +520,13 @@ impl Task {
                         result
                     }
                 };
-                result.no_log = self.no_log;
+                result.no_log = self.no_log.unwrap_or(false);
+                self.resolve_notifications(&mut result, &iter_vars, &mut engine);
+                for include in &mut result.includes {
+                    include.iteration = idx;
+                }
 
-                if !result.failed && !result.skipped {
+                if !result.skipped {
                     if let Some(Value::Mapping(facts)) = result.values.get("ansible_facts") {
                         let variables = facts
                             .iter()
@@ -389,7 +596,7 @@ impl Task {
                     let mut result = TaskResult::new(&host.name);
                     result.skipped = true;
                     result.msg = "Skipped due to condition".to_string();
-                    result.no_log = self.no_log;
+                    result.no_log = self.no_log.unwrap_or(false);
                     print_task_result(
                         &host.name,
                         &self.name,
@@ -400,12 +607,10 @@ impl Task {
                 }
             }
 
-            if self.normalized_module_name() != "debug" {
-                ConnectionConfig::require_resolved(&definitions, &vars)?;
-            }
             let mut result =
-                self.execute_attempts(host, &mut engine, &vars, check_mode, workers)?;
-            result.no_log = self.no_log;
+                self.execute_attempts(host, &mut engine, &vars, check_mode, workers, &definitions)?;
+            result.no_log = self.no_log.unwrap_or(false);
+            self.resolve_notifications(&mut result, &vars, &mut engine);
             results.push(result);
         }
 
@@ -414,6 +619,15 @@ impl Task {
         let skipped = !results.is_empty() && results.iter().all(|r| r.skipped);
 
         let mut final_result = TaskResult::new(&host.name);
+        final_result.meta = results.iter().find_map(|result| result.meta.clone());
+        final_result.includes = results
+            .iter()
+            .flat_map(|result| result.includes.clone())
+            .collect();
+        final_result.notifications = results
+            .iter()
+            .flat_map(|result| result.notifications.clone())
+            .collect();
         final_result.changed = changed;
         // Keep the underlying outcome intact. Whether a failure is ignored is
         // a play-execution policy decision and must not erase the module result
@@ -422,7 +636,7 @@ impl Task {
         final_result.unreachable = results.iter().any(|result| result.unreachable);
         final_result.uncertain = results.iter().any(|result| result.uncertain);
         final_result.skipped = skipped;
-        final_result.no_log = self.no_log;
+        final_result.no_log = self.no_log.unwrap_or(false);
 
         if self.loop_items.is_some() {
             final_result.values.insert(
@@ -494,6 +708,7 @@ impl Task {
         vars: &HashMap<String, Value>,
         check: bool,
         workers: &crate::worker::Runtime,
+        definitions: &HashMap<String, Value>,
     ) -> Result<TaskResult> {
         let context = crate::playbook::templar::create_context(vars)?;
         let has_until = self
@@ -519,14 +734,14 @@ impl Task {
         }
         let mut attempt_vars = vars.clone();
         for attempt in 1..=total {
-            let context = crate::playbook::templar::create_context(&attempt_vars)?;
             let mut result =
-                self.execute_module(host, engine, &context, &attempt_vars, check, workers)?;
+                self.execute_module(host, engine, definitions, &attempt_vars, check, workers)?;
             if total > 1 {
                 result
                     .values
                     .insert("attempts".into(), Value::Number(attempt.into()));
             }
+            self.merge_action_variables(&result, &mut attempt_vars)?;
             if result.unreachable || result.uncertain || result.skipped {
                 return Ok(result);
             }
@@ -636,7 +851,7 @@ impl Task {
         &self,
         host: &Host,
         engine: &mut Environment<'_>,
-        _context: &TemplateContext,
+        definitions: &HashMap<String, Value>,
         vars: &HashMap<String, Value>,
         check_mode: bool,
         workers: &crate::worker::Runtime,
@@ -658,38 +873,91 @@ impl Task {
             ));
         }
         let mut resolved_args = self.resolve_args(engine, &context, vars)?;
+        if matches!(Builtin::lookup(&self.module), Ok(Builtin::Meta)) {
+            Builtin::Meta.validate_parameters(&Value::Mapping(resolved_args.clone()))?;
+            let mut result = TaskResult::new(&host.name);
+            result.meta = resolved_args
+                .get(Value::String("action".into()))
+                .and_then(Value::as_str)
+                .map(str::to_owned);
+            result.msg = "Meta action selected".into();
+            return Ok(result);
+        }
+
+        if let Some(kind) = include_kind(&self.module) {
+            let allowed: &[&str] = if kind == IncludeKind::Tasks {
+                &["file", "apply"]
+            } else {
+                &[
+                    "name",
+                    "tasks_from",
+                    "vars_from",
+                    "defaults_from",
+                    "handlers_from",
+                    "public",
+                    "allow_duplicates",
+                    "apply",
+                ]
+            };
+            crate::modules::param::validate_params(
+                &Value::Mapping(resolved_args.clone()),
+                allowed,
+            )?;
+            let key = if kind == IncludeKind::Tasks {
+                "file"
+            } else {
+                "name"
+            };
+            if resolved_args
+                .get(Value::String(key.into()))
+                .and_then(Value::as_str)
+                .is_none_or(|name| name.is_empty() || name.contains('\0'))
+            {
+                return Err(anyhow!("Include requires a nonempty {key} string"));
+            }
+            let mut result = TaskResult::new(&host.name);
+            result.values.insert(
+                "include".into(),
+                resolved_args
+                    .get(Value::String(key.into()))
+                    .expect("Validated include")
+                    .clone(),
+            );
+            result.includes.push(IncludeRequest {
+                iteration: 0,
+                kind,
+                args: resolved_args,
+                parent: self.clone(),
+            });
+            result.msg = "Include selected".into();
+            return Ok(result);
+        }
 
         let module_name = self.normalized_module_name();
         if matches!(module_name, "copy" | "template") {
-            if let (Some(source), Some(Value::String(src))) = (
-                &self.source_file,
-                resolved_args.get_mut(Value::String("src".into())),
-            ) {
-                let path = std::path::Path::new(src);
-                if path.is_relative() {
-                    *src = source
-                        .parent()
-                        .context("Task source has no parent directory")?
-                        .join(path)
-                        .to_string_lossy()
-                        .into_owned();
-                }
+            if let Some(Value::String(path)) = resolved_args.get_mut(Value::String("src".into())) {
+                *path = self
+                    .source_path(
+                        if module_name == "copy" {
+                            "files"
+                        } else {
+                            "templates"
+                        },
+                        path,
+                        vars,
+                    )
+                    .to_string_lossy()
+                    .into_owned();
             }
         }
         if module_name == "include_vars" {
             for key in ["file", "dir"] {
-                if let (Some(source), Some(Value::String(path))) = (
-                    &self.source_file,
-                    resolved_args.get_mut(Value::String(key.into())),
-                ) {
-                    if std::path::Path::new(path).is_relative() {
-                        *path = source
-                            .parent()
-                            .context("Task source has no parent")?
-                            .join(&*path)
-                            .to_string_lossy()
-                            .into_owned();
-                    }
+                if let Some(Value::String(path)) = resolved_args.get_mut(Value::String(key.into()))
+                {
+                    *path = self
+                        .source_path("vars", path, vars)
+                        .to_string_lossy()
+                        .into_owned();
                 }
             }
         }
@@ -726,6 +994,7 @@ impl Task {
                 invocation.execute(None, vars, workers),
             ));
         }
+        ConnectionConfig::require_resolved(definitions, vars)?;
         let mut connection_vars = vars.clone();
         if let Some(connection) = &self.connection {
             let value = crate::playbook::templar::render_value(connection, engine, &context, true)?;
@@ -748,6 +1017,122 @@ impl Task {
         Builtin::lookup(&self.module)
             .map(Builtin::name)
             .unwrap_or(&self.module)
+    }
+    fn merge_action_variables(
+        &self,
+        result: &TaskResult,
+        variables: &mut HashMap<String, Value>,
+    ) -> Result<()> {
+        let Some(Value::Mapping(facts)) = result.values.get("ansible_facts") else {
+            return Ok(());
+        };
+        match Builtin::lookup(&self.module) {
+            Ok(Builtin::SetFact) => {
+                let values = facts
+                    .iter()
+                    .map(|(name, value)| {
+                        Ok((
+                            name.as_str()
+                                .context("Fact names must be strings")?
+                                .to_owned(),
+                            value.clone(),
+                        ))
+                    })
+                    .collect::<Result<HashMap<_, _>>>()?;
+                crate::inventory::host::merge_variable_layer(variables, &values);
+            }
+            Ok(Builtin::IncludeVars) => {
+                let definitions = facts
+                    .iter()
+                    .map(|(name, value)| {
+                        Ok((
+                            name.as_str()
+                                .context("Variable names must be strings")?
+                                .to_owned(),
+                            value.clone(),
+                        ))
+                    })
+                    .collect::<Result<HashMap<_, _>>>()?;
+                for name in definitions.keys() {
+                    variables.remove(name);
+                }
+                *variables =
+                    crate::playbook::templar::resolve_definitions(&definitions, variables)?;
+            }
+            Ok(Builtin::Setup) => crate::playbook::Play::merge_facts(variables, facts)?,
+            _ => {}
+        }
+        Ok(())
+    }
+    fn resolve_notifications(
+        &self,
+        result: &mut TaskResult,
+        vars: &HashMap<String, Value>,
+        engine: &mut Environment<'_>,
+    ) {
+        if !result.changed || result.failed || result.skipped {
+            return;
+        }
+        let resolved = (|| -> Result<Vec<String>> {
+            let mut vars = vars.clone();
+            self.merge_action_variables(result, &mut vars)?;
+            if let Some(register) = &self.register {
+                vars.insert(register.clone(), result.registered_value());
+            }
+            let context = crate::playbook::templar::create_context(&vars)?;
+            self.notify
+                .iter()
+                .map(|name| {
+                    crate::playbook::templar::render_value(name, engine, &context, true)?
+                        .as_str()
+                        .filter(|name| !name.is_empty())
+                        .map(str::to_owned)
+                        .context("Handler notification must resolve to a nonempty string")
+                })
+                .collect()
+        })();
+        match resolved {
+            Ok(names) => result.notifications = names,
+            Err(error) => {
+                result.failed = true;
+                result.msg = format!("Cannot render handler notification: {error:#}");
+            }
+        }
+    }
+
+    fn source_path(
+        &self,
+        directory: &str,
+        path: &str,
+        vars: &HashMap<String, Value>,
+    ) -> std::path::PathBuf {
+        let path = std::path::Path::new(path);
+        if path.is_absolute() {
+            return path.to_path_buf();
+        }
+        let mut candidates = Vec::new();
+        for role in self
+            .scope
+            .role_path
+            .iter()
+            .chain(self.scope.parent_roles.iter().rev())
+        {
+            candidates.push(role.join(directory).join(path));
+        }
+        if let Some(base) = self.source_file.as_ref().and_then(|source| source.parent()) {
+            candidates.push(base.join(path));
+            candidates.push(base.join(directory).join(path));
+        }
+        if let Some(base) = vars.get("playbook_dir").and_then(Value::as_str) {
+            candidates.push(std::path::Path::new(base).join(directory).join(path));
+            candidates.push(std::path::Path::new(base).join(path));
+        }
+        candidates
+            .iter()
+            .find(|path| path.exists())
+            .cloned()
+            .or_else(|| candidates.into_iter().next())
+            .unwrap_or_else(|| path.to_path_buf())
     }
 
     fn evaluate_condition(
@@ -1186,6 +1571,10 @@ mod tests {
 
     fn create_test_task() -> Task {
         Task {
+            group: None,
+            parent: None,
+            original: None,
+            scope: TaskScope::default(),
             name: "Test Task".to_string(),
             module: "debug".to_string(),
             args: Mapping::new(),
@@ -1206,8 +1595,9 @@ mod tests {
             timeout: None,
             environment: Mapping::new(),
             notify: Vec::new(),
-            ignore_errors: false,
-            no_log: false,
+            ignore_errors: None,
+            ignore_unreachable: None,
+            no_log: None,
             vars: Mapping::new(),
             tags: Vec::new(),
             loop_items: None,
@@ -1255,7 +1645,7 @@ mod tests {
     fn no_log_marks_results_for_censored_rendering() {
         let host = Host::new("localhost");
         let mut task = create_test_task();
-        task.no_log = true;
+        task.no_log = Some(true);
         task.args = mapping(&[("msg", Value::String("secret value".to_string()))]);
 
         let result = task.execute(&host, &HashMap::new()).unwrap();

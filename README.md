@@ -12,7 +12,7 @@ Rustsible is an experimental, Ansible-inspired configuration and command runner 
 Rustsible currently provides:
 
 - INI and YAML inventory parsing, group variables, child groups, and host-pattern filtering;
-- playbook tasks, variables, loops, conditions, registered results, handlers, and `become` support;
+- playbook imports, task includes, roles, blocks, variables, loops, conditions, registered results, handlers, and `become` support;
 - ad-hoc module execution;
 - local command execution and remote execution through SSH;
 - playbook support for `command`, `shell`, `debug`, `copy`, `file`, `template`, `lineinfile`, `user`, `service`, `systemd`, `stat`, `get_url`, and `package`;
@@ -84,13 +84,13 @@ their file/section/key instead of silently changing execution expectations.
 
 | Section | Implemented keys |
 | --- | --- |
-| `[defaults]` | `inventory` (one file), `forks`, `verbosity`, `remote_user`, `private_key_file`, `timeout`, `host_key_checking`, Rustsible's `worker_dir` |
+| `[defaults]` | `inventory` (one file), `forks`, `verbosity`, `remote_user`, `private_key_file`, `timeout`, `host_key_checking`, `roles_path`, Rustsible's `worker_dir` |
 | `[privilege_escalation]` | `become`, `become_user`, `become_method` (`sudo`) |
 
 The corresponding `ANSIBLE_INVENTORY`, `ANSIBLE_FORKS`, `ANSIBLE_VERBOSITY`,
 `ANSIBLE_REMOTE_USER`, `ANSIBLE_PRIVATE_KEY_FILE`, `ANSIBLE_TIMEOUT`,
 `ANSIBLE_HOST_KEY_CHECKING`, `ANSIBLE_BECOME`, `ANSIBLE_BECOME_USER`, and
-`ANSIBLE_BECOME_METHOD` environment settings are recognized.
+`ANSIBLE_BECOME_METHOD`, and `ANSIBLE_ROLES_PATH` environment settings are recognized.
 
 Facts run on the target. Setup supports `gather_subset`, `filter` (a string or
 list of shell patterns), and `gather_timeout` (1–604800 seconds, default 10).
@@ -215,6 +215,54 @@ Zypper `state=latest` remains explicitly
 unsupported. Package specifications currently require concrete names; APT
 `name=version` is recognized. Existing-account home repair requires the target
 OS's `mkhomedir_helper` tool.
+
+## Task reuse and failure recovery
+
+`import_playbook`, `import_tasks`, and `import_role` expand during loading, so
+invalid static content fails before target operations. `include_tasks` and
+`include_role` expand only after their conditions select them; loops retain a
+separate variable context for each item. Static filenames can use play/role
+definitions and extra variables; use dynamic includes for host/runtime choices.
+Each task keeps its actual source file for nested imports, variable files,
+`copy` sources, and templates, including when started from another directory.
+Imported conditions are checked on each child task; dynamic include conditions
+select the include itself. `apply` supplies settings inherited by dynamic children.
+
+Roles support `tasks`, `defaults`, `vars`, `handlers`, and `meta/dependencies`,
+inline role parameters, `tasks_from`/`defaults_from`/`vars_from`/`handlers_from`,
+`public`, and `allow_duplicates`. Search starts in the playbook's `roles/`, then
+configured `roles_path` (colon separated) or the standard user/system role
+directories, followed by the parent role's directory and playbook/current
+directories. Dependencies run first; ancestry cycles fail with their chain.
+Role defaults are below inventory values; role variables, task variables,
+persistent host results, role/include parameters, then extra variables have
+increasing priority. Play roles and static imports expose their variables to
+the play by default. Dynamic roles are private unless `public: true`; public
+values become available to subsequent tasks. Nonempty plugin directories and
+role `argument_specs` are rejected during role loading.
+
+`pre_tasks`, role/main tasks, and `post_tasks` each finish with a handler flush.
+Handlers run in definition order, accept `listen`, deduplicate notifications,
+and retain normal register/fact/condition behavior. The last definition wins
+for a repeated handler name. `force_handlers: true` runs pending handlers on
+hosts with module failures, provided their connection result is still known.
+
+`block`, `rescue`, and `always` inherit task settings and variables. A module
+failure enters rescue with `ansible_failed_task` and `ansible_failed_result`;
+a successful rescue restores the host and is counted as rescued. Always runs
+after normal or rescued module execution, including a failed rescue. An
+unreachable host or an uncertain modification result enters neither rescue nor
+always. `ignore_errors` applies to module failures; `ignore_unreachable` is a
+separate explicit setting. Global check mode and `no_log` also cover these paths.
+
+Playbooks support `meta: flush_handlers`, `clear_host_errors`, `reset_connection`,
+`end_host`, and `end_play`. Clear errors allows excluded hosts into later plays;
+it preserves the failure recap and exit status. End host/play stops that play
+without excluding the host from later plays. Ad-hoc meta supports only reset.
+Blocks cannot loop or register as a unit; static imports cannot loop. Tags,
+rolling batches, delegation, and async are still outside the implemented scope.
+See [the reusable deployment example](examples/reuse/main.yml) and the pinned
+reference scenarios under [tests/reference/reuse](tests/reference/reuse).
 
 ## Build
 
@@ -435,7 +483,7 @@ The following built-in modules are registered for playbooks:
 | `debug` | Display a message or variable |
 | `set_fact` | Retain typed host values during a playbook run |
 | `include_vars` | Load controller variable files or directories |
-| `meta` | Reset a host's worker connection (`reset_connection`) |
+| `meta` | Flush handlers, clear host errors, reset connections, or end host/play execution |
 | `copy` | Copy a controller file or literal content |
 | `file` | Manage files, directories, links, and permissions |
 | `template` | Render a MiniJinja/Jinja template |
@@ -498,6 +546,11 @@ condition results with **ansible-core 2.21.0**. It uses `uv` to isolate the
 Python reference tool; reference dependencies are not needed by normal Cargo
 tests. The comparison checks target file bytes, including literal runtime
 output, defaults/omit, loop values, string types, and rejected string conditions.
+It also compares imported tasks, role dependencies/parameters/templates,
+handler phases and listen topics, and block rescue/always file results.
+`bash tests/ssh/run.sh CONTROLLER WORKER_DIRECTORY reuse [glibc|musl]`
+checks that deployment through real SSH with three execution identities,
+including check-mode business-state equality and worker cleanup.
 
 Dependency advisories are checked in CI against `Cargo.lock`. CI also enforces
 an 80% line-coverage floor. This is a regression baseline, not a claim that every remote SSH path is exercised end to

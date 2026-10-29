@@ -15,8 +15,13 @@ pub struct Play {
     pub name: String,
     pub hosts: String,
     pub tasks: Vec<Task>,
+    pub pre_tasks: Vec<Task>,
+    pub post_tasks: Vec<Task>,
     pub handlers: Vec<Handler>,
     pub vars: Mapping,
+    pub role_defaults: Mapping,
+    pub role_vars: Mapping,
+    pub role_paths: Vec<std::path::PathBuf>,
     pub vars_files: Vec<Value>,
     pub source_file: Option<std::path::PathBuf>,
     pub environment: Mapping,
@@ -28,10 +33,16 @@ pub struct Play {
     pub become_user_override: Option<String>,
     /// Stop the containing playbook immediately if this play fails.
     pub fail_fast: bool,
+    pub force_handlers: bool,
+    pub ignore_errors: Option<bool>,
+    pub ignore_unreachable: Option<bool>,
+    pub no_log: Option<bool>,
     /// Play-level connection override (`local`, `ssh`, or `smart`).
     pub connection: Option<String>,
     /// Ansible gathers facts by default; only an explicit false disables it.
     pub gather_facts: bool,
+    /// Static playbook import conditions also gate implicit facts gathering.
+    pub import_condition: Option<Value>,
     pub gather_subset: Option<Value>,
     pub gather_timeout: Option<Value>,
     #[allow(dead_code)]
@@ -47,6 +58,36 @@ struct HostStats {
     failed: usize,
     skipped: usize,
     ignored: usize,
+    rescued: usize,
+}
+
+struct PlayStatus<'a> {
+    hosts: &'a [Host],
+    definitions: HashMap<String, HashMap<String, Value>>,
+    flushing: usize,
+    ran_handlers: HashSet<(String, usize)>,
+    active_hosts: HashSet<String>,
+    stats: HashMap<String, HostStats>,
+    failures: HashMap<String, Vec<TaskFailure>>,
+    ended: HashSet<String>,
+    notified_handlers: HashSet<(String, String)>,
+}
+#[derive(Clone)]
+struct TaskFailure {
+    task: Task,
+    result: TaskResult,
+}
+enum Scheduled {
+    Task(Box<Task>, HashSet<String>),
+    Rescue(std::rc::Rc<std::cell::RefCell<BlockFrame>>),
+    Always(std::rc::Rc<std::cell::RefCell<BlockFrame>>),
+    End(std::rc::Rc<std::cell::RefCell<BlockFrame>>),
+}
+struct BlockFrame {
+    members: HashSet<String>,
+    rescue: Vec<Task>,
+    always: Vec<Task>,
+    pending: HashMap<String, Vec<TaskFailure>>,
 }
 
 /// Only host runtime data survives plays. Scoped inventory/play/task overlays
@@ -58,6 +99,8 @@ pub(crate) struct RunState {
     globals: std::sync::Arc<HashMap<String, Value>>,
     inventory: HashMap<String, HashMap<String, Value>>,
     contexts: HashMap<String, RuntimeVariables>,
+    seen_roles: HashSet<(String, String)>,
+    ran_roles: HashSet<(String, String)>,
     excluded: HashSet<String>,
     stats: HashMap<String, HostStats>,
 }
@@ -136,7 +179,7 @@ impl RunState {
                     .contexts
                     .get(name)
                     .context("Missing host variable scope")?;
-                let (definitions, mut data) = scope.layers(definitions, &[], None)?;
+                let (definitions, mut data) = scope.layers(definitions, &[], None, None)?;
                 data.insert("hostvars".into(), hosts.clone());
                 let mut values =
                     crate::playbook::templar::resolve_definitions(&definitions, &data)?;
@@ -175,6 +218,7 @@ impl RunState {
             self.inventory.get(host).context("Missing inventory host")?,
             &[],
             None,
+            None,
         )?;
         crate::playbook::templar::resolve_definitions(&definitions, &data)
     }
@@ -185,7 +229,7 @@ impl RunState {
         for name in names {
             let stats = &self.stats[name];
             println!(
-                "{:<30} : ok={} changed={} unreachable={} failed={} skipped={} ignored={} uncertain={}",
+                "{:<30} : ok={} changed={} unreachable={} failed={} skipped={} ignored={} uncertain={} rescued={}",
                 name,
                 stats.ok,
                 stats.changed,
@@ -194,6 +238,7 @@ impl RunState {
                 stats.skipped,
                 stats.ignored,
                 stats.uncertain,
+                stats.rescued,
             );
         }
     }
@@ -203,15 +248,13 @@ impl RunState {
         let mut updates = Vec::new();
         if let Some(Value::Sequence(items)) = result.values.get("results") {
             for item in items {
-                if item.get("failed").and_then(Value::as_bool) != Some(true)
-                    && item.get("skipped").and_then(Value::as_bool) != Some(true)
-                {
+                if item.get("skipped").and_then(Value::as_bool) != Some(true) {
                     if let Some(facts) = item.get("ansible_facts") {
                         updates.push(facts);
                     }
                 }
             }
-        } else if !result.failed && !result.skipped {
+        } else if !result.skipped {
             if let Some(facts) = result.values.get("ansible_facts") {
                 updates.push(facts);
             }
@@ -267,13 +310,15 @@ impl Play {
         forks: usize,
     ) -> Result<()> {
         let mut state = RunState::default();
-        let result = self.execute_in_run(hosts, check_mode, forks, &mut state);
+        let result = self
+            .clone()
+            .execute_in_run(hosts, check_mode, forks, &mut state);
         state.print_recap();
         result
     }
 
     pub(crate) fn execute_in_run(
-        &self,
+        &mut self,
         hosts: &[Host],
         check_mode: bool,
         forks: usize,
@@ -298,6 +343,19 @@ impl Play {
         }
 
         let start_time = Instant::now();
+        state.seen_roles.clear();
+        state.ran_roles.clear();
+        if let Some(directory) = self.source_file.as_ref().and_then(|source| source.parent()) {
+            let mut globals = (*state.globals).clone();
+            globals.insert(
+                "playbook_dir".into(),
+                Value::String(directory.to_string_lossy().into_owned()),
+            );
+            state.globals = std::sync::Arc::new(globals);
+            for scope in state.contexts.values_mut() {
+                scope.globals = state.globals.clone();
+            }
+        }
         info!("PLAY [{}] on {} hosts", self.name, hosts.len());
         println!("\n{}", format!("PLAY [{}]", self.name).bold());
 
@@ -319,12 +377,12 @@ impl Play {
                 .entry(host.name.clone())
                 .or_insert_with(|| host.inventory_variables());
         }
-        let mut active_hosts: HashSet<String> = hosts
+        let active_hosts: HashSet<String> = hosts
             .iter()
             .filter(|host| !state.excluded.contains(&host.name))
             .map(|host| host.name.clone())
             .collect();
-        let mut stats: HashMap<String, HostStats> = hosts
+        let stats: HashMap<String, HostStats> = hosts
             .iter()
             .map(|host| {
                 (
@@ -333,12 +391,33 @@ impl Play {
                 )
             })
             .collect();
-        let mut failures = Vec::new();
-        let mut notified_handlers: HashSet<(String, String)> = HashSet::new();
+        let failures = HashMap::new();
+        let notified_handlers: HashSet<(String, String)> = HashSet::new();
 
+        let mut status = PlayStatus {
+            hosts,
+            definitions,
+            flushing: 0,
+            ran_handlers: HashSet::new(),
+            active_hosts,
+            stats,
+            failures,
+            ended: HashSet::new(),
+            notified_handlers,
+        };
+        let limits = crate::playbook::ExecutionOptions {
+            check_mode,
+            forks,
+            ..Default::default()
+        };
+
+        let mut sequence = Vec::new();
         if self.gather_facts {
-            println!("\nTASK [Gathering Facts] {}", "*".repeat(56).dimmed());
             let gather_task = Task {
+                group: None,
+                parent: None,
+                original: None,
+                scope: crate::playbook::TaskScope::default(),
                 name: "Gathering Facts".to_string(),
                 module: "setup".to_string(),
                 args: [
@@ -360,7 +439,7 @@ impl Play {
                 connection: None,
                 check_mode: None,
                 register: None,
-                when: None,
+                when: self.import_condition.clone(),
                 changed_when: None,
                 failed_when: None,
                 until: None,
@@ -369,83 +448,266 @@ impl Play {
                 timeout: None,
                 environment: Mapping::new(),
                 notify: Vec::new(),
-                ignore_errors: false,
-                no_log: false,
+                ignore_errors: None,
+                ignore_unreachable: None,
+                no_log: None,
                 vars: Mapping::new(),
                 tags: Vec::new(),
                 loop_items: None,
                 loop_var_name: None,
                 index_var_name: None,
             };
-            let gathering_results = Self::execute_task_on_hosts(
-                self,
-                &gather_task,
-                hosts
-                    .iter()
-                    .filter(|host| active_hosts.contains(&host.name))
-                    .collect(),
-                state,
-                &definitions,
-                check_mode,
-                forks,
-            );
-            for (host, _, gathering_result) in gathering_results {
-                let mut result = match gathering_result {
-                    Ok(result) => result,
-                    Err(error) => {
-                        let mut result = TaskResult::new(&host.name);
-                        result.failed = true;
-                        result.msg = format!("Fact gathering failed: {error}");
-                        crate::playbook::task::print_task_result(
-                            &host.name,
-                            "Gathering Facts",
-                            &result,
-                            "0.00s",
-                        );
-                        result
-                    }
-                };
-
-                if !result.failed {
-                    let merge_result = state.merge_result(&host.name, &gather_task, &result);
-                    if let Err(error) = merge_result {
-                        result.failed = true;
-                        result.msg = error.to_string();
-                    }
-                }
-
-                let host_stats = stats
-                    .get_mut(&host.name)
-                    .context("Internal play state lost fact-gathering statistics")?;
-                if result.failed {
-                    if result.uncertain {
-                        host_stats.uncertain += 1;
-                    } else if result.unreachable {
-                        host_stats.unreachable += 1;
-                    } else {
-                        host_stats.failed += 1;
-                    }
-                    active_hosts.remove(&host.name);
-                    state.excluded.insert(host.name.clone());
-                    failures.push(format!(
-                        "Task 'Gathering Facts' failed on host '{}': {}",
-                        host.name, result.msg
-                    ));
-                } else {
-                    host_stats.ok += 1;
-                }
-            }
+            sequence.push(gather_task);
         }
 
-        // Execute all tasks in order
-        for (task_index, task) in self.tasks.iter().enumerate() {
-            if active_hosts.is_empty() {
+        let all_hosts = hosts
+            .iter()
+            .map(|host| host.name.clone())
+            .collect::<HashSet<_>>();
+        sequence.extend(self.pre_tasks.clone());
+        sequence.push(crate::playbook::parser::flush_task());
+        sequence.extend(self.tasks.clone());
+        sequence.push(crate::playbook::parser::flush_task());
+        sequence.extend(self.post_tasks.clone());
+        sequence.push(crate::playbook::parser::flush_task());
+        let executed = self.execute_sequence(sequence, all_hosts, state, &limits, &mut status);
+        let elapsed = start_time.elapsed();
+        let execution_time = format!("{:.2}s", elapsed.as_secs_f64());
+
+        info!("Play '{}' completed in {}", self.name, execution_time);
+
+        state.stats.extend(status.stats);
+        println!("\nPlay execution completed in {}", execution_time);
+
+        executed?;
+        if status.failures.is_empty() {
+            Ok(())
+        } else {
+            Err(anyhow::anyhow!(status
+                .failures
+                .iter()
+                .flat_map(
+                    |(host, failures)| failures.iter().map(move |failure| format!(
+                        "Task '{}' failed on host '{}': {}",
+                        failure.task.name,
+                        host,
+                        if failure.result.no_log {
+                            "output censored because no_log is enabled"
+                        } else {
+                            &failure.result.msg
+                        }
+                    ))
+                )
+                .collect::<Vec<_>>()
+                .join("; ")))
+        }
+    }
+
+    fn execute_sequence(
+        &mut self,
+        tasks: Vec<Task>,
+        members: HashSet<String>,
+        state: &mut RunState,
+        options: &crate::playbook::ExecutionOptions,
+        status: &mut PlayStatus<'_>,
+    ) -> Result<()> {
+        let hosts = status.hosts;
+        let check_mode = options.check_mode;
+        let forks = options.forks;
+        let mut pending = tasks
+            .into_iter()
+            .map(|task| Scheduled::Task(Box::new(task), members.clone()))
+            .collect::<std::collections::VecDeque<_>>();
+        let mut task_index = 0;
+        while let Some(scheduled) = pending.pop_front() {
+            let (task, selected_hosts) = match scheduled {
+                Scheduled::Task(task, members) => (*task, members),
+                Scheduled::Rescue(frame) => {
+                    let frame = frame.borrow();
+                    if !frame.rescue.is_empty() {
+                        let mut rescued = HashSet::new();
+                        for host in &frame.members {
+                            if status.active_hosts.contains(host) {
+                                continue;
+                            }
+                            let Some(errors) = status.failures.get(host) else {
+                                continue;
+                            };
+                            if errors
+                                .iter()
+                                .any(|error| error.result.unreachable || error.result.uncertain)
+                            {
+                                continue;
+                            }
+                            let errors = status.failures.remove(host).expect("Observed failure");
+                            let last = errors.last().expect("Nonempty failures");
+                            let scope = state.contexts.entry(host.clone()).or_default();
+                            scope.registered.insert(
+                                "ansible_failed_result".into(),
+                                last.result.registered_value(),
+                            );
+                            scope.registered.insert(
+                                "ansible_failed_task".into(),
+                                Value::Mapping(Mapping::from_iter([
+                                    (
+                                        Value::String("name".into()),
+                                        Value::String(last.task.name.clone()),
+                                    ),
+                                    (
+                                        Value::String("action".into()),
+                                        Value::String(last.task.module.clone()),
+                                    ),
+                                    (
+                                        Value::String("args".into()),
+                                        Value::Mapping(last.task.args.clone()),
+                                    ),
+                                ])),
+                            );
+                            let stats = status
+                                .stats
+                                .get_mut(host)
+                                .context("Missing rescue statistics")?;
+                            stats.failed = stats.failed.saturating_sub(errors.len());
+                            stats.rescued += errors.len();
+                            status.active_hosts.insert(host.clone());
+                            state.excluded.remove(host);
+                            rescued.insert(host.clone());
+                        }
+                        for task in frame.rescue.iter().rev() {
+                            pending.push_front(Scheduled::Task(
+                                Box::new(task.clone()),
+                                rescued.clone(),
+                            ));
+                        }
+                    }
+                    continue;
+                }
+                Scheduled::Always(frame) => {
+                    let mut frame = frame.borrow_mut();
+                    let mut eligible = HashSet::new();
+                    for host in frame.members.clone() {
+                        if status.ended.contains(&host) {
+                            continue;
+                        }
+                        if status.failures.get(&host).is_some_and(|errors| {
+                            errors
+                                .iter()
+                                .any(|error| error.result.unreachable || error.result.uncertain)
+                        }) {
+                            continue;
+                        }
+                        if let Some(errors) = status.failures.remove(&host) {
+                            frame.pending.insert(host.clone(), errors);
+                        }
+                        status.active_hosts.insert(host.clone());
+                        state.excluded.remove(&host);
+                        eligible.insert(host);
+                    }
+                    for task in frame.always.iter().rev() {
+                        pending
+                            .push_front(Scheduled::Task(Box::new(task.clone()), eligible.clone()));
+                    }
+                    continue;
+                }
+                Scheduled::End(frame) => {
+                    for (host, mut errors) in std::mem::take(&mut frame.borrow_mut().pending) {
+                        if let Some(mut cleanup) = status.failures.remove(&host) {
+                            errors.append(&mut cleanup);
+                        }
+                        status.failures.insert(host.clone(), errors);
+                        status.active_hosts.remove(&host);
+                        state.excluded.insert(host);
+                    }
+                    continue;
+                }
+            };
+            let task = &task;
+            if let Some(group) = &task.group {
+                let members = selected_hosts
+                    .iter()
+                    .filter(|host| status.active_hosts.contains(*host))
+                    .cloned()
+                    .collect::<HashSet<_>>();
+                let bind = |tasks: &[Task]| {
+                    tasks
+                        .iter()
+                        .cloned()
+                        .map(|mut child| {
+                            if let Some(parent) = &task.raw().parent {
+                                child.inherit(parent);
+                            }
+                            child
+                        })
+                        .collect::<Vec<_>>()
+                };
+                let frame = std::rc::Rc::new(std::cell::RefCell::new(BlockFrame {
+                    members: members.clone(),
+                    rescue: bind(&group.rescue),
+                    always: bind(&group.always),
+                    pending: HashMap::new(),
+                }));
+                pending.push_front(Scheduled::End(frame.clone()));
+                pending.push_front(Scheduled::Always(frame.clone()));
+                pending.push_front(Scheduled::Rescue(frame));
+                for child in bind(&group.tasks).into_iter().rev() {
+                    pending.push_front(Scheduled::Task(Box::new(child), members.clone()));
+                }
+                continue;
+            }
+            if task.scope.boundary == Some(crate::playbook::task::Boundary::Flush) {
+                self.flush_handlers(state, options, status)?;
+                continue;
+            }
+            if let (Some(boundary), Some(role)) = (task.scope.boundary, task.scope.role_id.as_ref())
+            {
+                let eligible = selected_hosts
+                    .iter()
+                    .filter(|host| {
+                        status.active_hosts.contains(*host)
+                            && (task.scope.allow_duplicates
+                                || !state.seen_roles.contains(&((*host).clone(), role.clone())))
+                    })
+                    .cloned()
+                    .collect::<HashSet<_>>();
+                match boundary {
+                    crate::playbook::task::Boundary::Start => {
+                        for scheduled in &mut pending {
+                            let Scheduled::Task(child, members) = scheduled else {
+                                continue;
+                            };
+                            members.retain(|host| eligible.contains(host));
+                            if child.scope.boundary == Some(crate::playbook::task::Boundary::End)
+                                && child.scope.role_id.as_ref() == Some(role)
+                            {
+                                break;
+                            }
+                        }
+                    }
+                    crate::playbook::task::Boundary::Flush => {
+                        unreachable!("Flush handled before role boundaries")
+                    }
+                    crate::playbook::task::Boundary::End => {
+                        for host in selected_hosts
+                            .iter()
+                            .filter(|host| status.active_hosts.contains(*host))
+                        {
+                            if state.ran_roles.contains(&(host.clone(), role.clone())) {
+                                state.seen_roles.insert((host.clone(), role.clone()));
+                            }
+                        }
+                    }
+                }
+                continue;
+            }
+            let mut expansions = Vec::<(Vec<Task>, Vec<Handler>, HashSet<String>)>::new();
+            let mut expansion_keys = HashMap::<String, usize>::new();
+            if status.active_hosts.is_empty() {
                 debug!(
                     "Stopping play '{}' before task {} because no active hosts remain",
                     self.name,
                     task_index + 1
                 );
-                break;
+                continue;
             }
             debug!(
                 "Executing task {} of {}: {}",
@@ -464,31 +726,33 @@ impl Play {
 
             let runnable_hosts: Vec<&Host> = hosts
                 .iter()
-                .filter(|host| active_hosts.contains(&host.name))
+                .filter(|host| {
+                    status.active_hosts.contains(&host.name) && selected_hosts.contains(&host.name)
+                })
                 .collect();
             let task_results = Self::execute_task_on_hosts(
                 self,
                 task,
                 runnable_hosts,
                 state,
-                &definitions,
+                &status.definitions,
                 check_mode,
                 forks,
             );
 
             for (host, effective_task, task_result) in task_results {
-                let result = match task_result {
+                let mut result = match task_result {
                     Ok(result) => result,
                     Err(error) => {
-                        if effective_task.no_log {
+                        if effective_task.no_log.unwrap_or(false) {
                             error!("A no_log task failed on host {}", host.name);
                         } else {
                             error!("Task execution failed on host {}: {}", host.name, error);
                         }
                         let mut result = TaskResult::new(&host.name);
                         result.failed = true;
-                        result.no_log = effective_task.no_log;
-                        result.msg = if effective_task.no_log {
+                        result.no_log = effective_task.no_log.unwrap_or(false);
+                        result.msg = if effective_task.no_log.unwrap_or(false) {
                             "output censored because no_log is enabled".to_string()
                         } else {
                             format!("Task execution error: {}", error)
@@ -503,19 +767,125 @@ impl Play {
                     }
                 };
 
+                if !result.failed && !result.skipped {
+                    for request in std::mem::take(&mut result.includes) {
+                        let compiled = (|| -> Result<()> {
+                            let key = serde_json::to_vec(&serde_json::to_value((
+                                request.kind as u8,
+                                request.iteration,
+                                &request.args,
+                                &request.parent.vars,
+                                &request.parent.scope,
+                                &request.parent.source_file,
+                            ))?)?;
+                            let key = rustsible_protocol::sha256(&mut key.as_slice())?;
+                            let index = if let Some(index) = expansion_keys.get(&key) {
+                                *index
+                            } else {
+                                let tasks = crate::playbook::parser::expand_tasks(
+                                    &request,
+                                    &crate::playbook::parser::ParseOptions {
+                                        variables: (*state.extra).clone(),
+                                        role_paths: self.role_paths.clone(),
+                                        playbook_dir: self
+                                            .source_file
+                                            .as_ref()
+                                            .and_then(|source| source.parent())
+                                            .map(std::path::Path::to_path_buf),
+                                        ..Default::default()
+                                    },
+                                )?;
+                                let index = expansions.len();
+                                expansion_keys.insert(key, index);
+                                crate::vars::merge(&mut self.role_defaults, tasks.defaults);
+                                crate::vars::merge(&mut self.role_vars, tasks.variables);
+                                expansions.push((tasks.tasks, tasks.handlers, HashSet::new()));
+                                index
+                            };
+                            expansions[index].2.insert(host.name.clone());
+                            Ok(())
+                        })();
+                        if let Err(error) = compiled {
+                            result.failed = true;
+                            result.notifications.clear();
+                            result.msg = if result.no_log {
+                                "output censored because no_log is enabled".into()
+                            } else {
+                                format!("Cannot load selected include: {error:#}")
+                            };
+                            crate::playbook::task::print_task_result(
+                                &host.name,
+                                &effective_task.name,
+                                &result,
+                                "0.00s",
+                            );
+                            break;
+                        }
+                    }
+                }
+                if result
+                    .notifications
+                    .iter()
+                    .any(|notice| self.handler_targets(&host.name, notice, state).is_empty())
+                {
+                    result.failed = true;
+                    result.notifications.clear();
+                    result.msg =
+                        "Handler notification has no matching definition; check task notify names"
+                            .into();
+                    crate::playbook::task::print_task_result(
+                        &host.name,
+                        &effective_task.name,
+                        &result,
+                        "0.00s",
+                    );
+                }
                 state.merge_result(&host.name, &effective_task, &result)?;
+                if let Some(action) = &result.meta {
+                    match action.as_str() {
+                        "reset_connection" => state.workers.reset(&host.name)?,
+                        "flush_handlers" => self.flush_handlers(state, options, status)?,
+                        "clear_host_errors" => {
+                            for host in hosts {
+                                state.excluded.remove(&host.name);
+                            }
+                        }
+                        "end_host" => {
+                            status.active_hosts.remove(&host.name);
+                            status.ended.insert(host.name.clone());
+                        }
+                        "end_play" => {
+                            status.active_hosts.clear();
+                            status
+                                .ended
+                                .extend(hosts.iter().map(|host| host.name.clone()));
+                            pending.clear();
+                            status.notified_handlers.clear();
+                        }
+                        _ => unreachable!("Meta action validated before selection"),
+                    }
+                    continue;
+                }
 
-                if result.changed && !result.failed {
-                    for handler_name in &effective_task.notify {
+                if !result.skipped {
+                    if let Some(role) = &effective_task.scope.role_id {
+                        state.ran_roles.insert((host.name.clone(), role.clone()));
+                    }
+                }
+
+                if !result.notifications.is_empty() {
+                    for handler_name in &result.notifications {
                         debug!(
                             "Handler '{}' notified on host '{}' by task '{}'",
                             handler_name, host.name, effective_task.name
                         );
-                        notified_handlers.insert((host.name.clone(), handler_name.clone()));
+                        status
+                            .notified_handlers
+                            .insert((host.name.clone(), handler_name.clone()));
                     }
                 }
 
-                let host_stats = stats
+                let host_stats = status.stats
                     .get_mut(&host.name)
                     .with_context(|| {
                         format!(
@@ -524,7 +894,12 @@ impl Play {
                         )
                     })?;
                 if result.failed {
-                    if effective_task.ignore_errors && !result.unreachable && !result.uncertain {
+                    if !result.uncertain
+                        && ((result.unreachable
+                            && effective_task.ignore_unreachable.unwrap_or(false))
+                            || (!result.unreachable
+                                && effective_task.ignore_errors.unwrap_or(false)))
+                    {
                         host_stats.ignored += 1;
                     } else {
                         if result.uncertain {
@@ -534,17 +909,16 @@ impl Play {
                         } else {
                             host_stats.failed += 1;
                         }
-                        active_hosts.remove(&host.name);
+                        status.active_hosts.remove(&host.name);
                         state.excluded.insert(host.name.clone());
-                        let failure_message = if effective_task.no_log {
-                            "output censored because no_log is enabled"
-                        } else {
-                            result.msg.as_str()
-                        };
-                        failures.push(format!(
-                            "Task '{}' failed on host '{}': {}",
-                            effective_task.name, host.name, failure_message
-                        ));
+                        status
+                            .failures
+                            .entry(host.name.clone())
+                            .or_default()
+                            .push(TaskFailure {
+                                task: effective_task.clone(),
+                                result: result.clone(),
+                            });
                     }
                 } else if result.skipped {
                     host_stats.skipped += 1;
@@ -555,137 +929,191 @@ impl Play {
                     }
                 }
             }
-        }
-
-        if !notified_handlers.is_empty() {
-            info!("Running notified handlers");
-            println!("\n{}", "RUNNING HANDLERS".bold());
-            println!(
-                "{}\n",
-                format!("{} host/handler notifications", notified_handlers.len()).dimmed()
-            );
-
-            let known_handlers: HashSet<&str> = self
-                .handlers
-                .iter()
-                .map(|handler| handler.task.name.as_str())
-                .collect();
-            for (host_name, handler_name) in &notified_handlers {
-                if !known_handlers.contains(handler_name.as_str()) {
-                    failures.push(format!(
-                        "Handler '{}' notified on host '{}' but was not defined",
-                        handler_name, host_name
-                    ));
+            for (_, handlers, members) in &mut expansions {
+                for mut handler in handlers.drain(..) {
+                    handler.hosts = Some(members.clone());
+                    self.handlers.push(handler);
                 }
             }
+            for (tasks, _, members) in expansions.into_iter().rev() {
+                for task in tasks.into_iter().rev() {
+                    pending.push_front(Scheduled::Task(Box::new(task), members.clone()));
+                }
+            }
+            task_index += 1;
+        }
 
-            for handler in &self.handlers {
-                let handler_name = &handler.task.name;
-                let handler_hosts: Vec<&Host> = hosts
-                    .iter()
-                    .filter(|host| {
-                        active_hosts.contains(&host.name)
-                            && notified_handlers
-                                .contains(&(host.name.clone(), handler_name.clone()))
-                    })
-                    .collect();
-                let handler_results = Self::execute_task_on_hosts(
-                    self,
-                    &handler.task,
-                    handler_hosts,
-                    state,
-                    &definitions,
-                    check_mode,
-                    forks,
-                );
+        Ok(())
+    }
 
-                for (host, effective_handler, handler_result) in handler_results {
-                    debug!("Running handler '{}' on host '{}'", handler_name, host.name);
+    fn handler_name(&self, handler: &Handler, state: &RunState) -> Result<String> {
+        if !handler.task.name.contains("{{") && !handler.task.name.contains("{%") {
+            return Ok(handler.task.name.clone());
+        }
+        let task = handler.task.effective();
+        // Handler names are evaluated without a host, as in the reference.
+        // Role/include parameters and loop bindings remain lexical context.
+        let runtime = RuntimeVariables {
+            extra: state.extra.clone(),
+            globals: state.variable_globals()?,
+            ..Default::default()
+        };
+        let mut defaults = self.role_defaults.clone();
+        crate::vars::merge(&mut defaults, task.scope.defaults.clone());
+        let definitions = defaults
+            .into_iter()
+            .map(|(name, value)| (name.as_str().expect("Validated default").to_owned(), value))
+            .collect();
+        let mut params = task.scope.role_params.clone();
+        crate::vars::merge(&mut params, task.scope.params.clone());
+        let (definitions, mut data) = runtime.layers(
+            &definitions,
+            &[
+                &self.vars,
+                &self.role_vars,
+                &task.scope.role_vars,
+                &task.vars,
+            ],
+            None,
+            Some(&params),
+        )?;
+        data.extend(task.scope.locals.clone());
+        let variables = crate::playbook::templar::resolve_definitions(&definitions, &data)?;
+        let context = crate::playbook::templar::create_context(&variables)?;
+        crate::playbook::templar::render_value(
+            &task.name,
+            &mut crate::playbook::templar::environment(),
+            &context,
+            true,
+        )?
+        .as_str()
+        .map(str::to_owned)
+        .context("Handler name must be a string")
+    }
+    fn handler_targets(&mut self, host: &str, notice: &str, state: &RunState) -> Vec<usize> {
+        for index in 0..self.handlers.len() {
+            if self.handlers[index].cached_name.is_none() {
+                if let Ok(name) = self.handler_name(&self.handlers[index], state) {
+                    self.handlers[index].cached_name = Some(name);
+                }
+            }
+        }
+        let eligible = |handler: &Handler| {
+            handler
+                .hosts
+                .as_ref()
+                .is_none_or(|hosts| hosts.contains(host))
+        };
+        let qualified = |handler: &Handler, name: &str| {
+            handler
+                .task
+                .scope
+                .role_name
+                .as_ref()
+                .map(|role| format!("{role} : {name}"))
+                .is_some_and(|name| name == notice)
+        };
+        let mut selected = Vec::new();
+        for (index, handler) in self
+            .handlers
+            .iter()
+            .enumerate()
+            .rev()
+            .filter(|(_, handler)| eligible(handler))
+        {
+            if let Some(name) = &handler.cached_name {
+                if name == notice || qualified(handler, name) {
+                    selected.push(index);
+                    break;
+                }
+            }
+        }
+        let mut seen = HashSet::new();
+        for (index, handler) in self
+            .handlers
+            .iter()
+            .enumerate()
+            .rev()
+            .filter(|(_, handler)| eligible(handler))
+        {
+            let name = handler.cached_name.as_ref().unwrap_or(&handler.task.name);
+            if handler
+                .listen
+                .iter()
+                .any(|topic| topic == notice || qualified(handler, topic))
+                && seen.insert(name.clone())
+            {
+                selected.push(index);
+            }
+        }
+        selected.sort_unstable();
+        selected.dedup();
+        selected
+    }
 
-                    let failed_message = match handler_result {
-                        Ok(result) if result.failed => {
-                            let counters = stats
-                                .get_mut(&host.name)
-                                .context("Missing handler statistics")?;
-                            if result.uncertain {
-                                counters.uncertain += 1;
-                            } else if result.unreachable {
-                                counters.unreachable += 1;
-                            } else {
-                                counters.failed += 1;
-                            }
-                            Some(result.msg)
-                        }
-                        Ok(result) => {
-                            state.merge_result(&host.name, &effective_handler, &result)?;
-                            let host_stats = stats
-                                .get_mut(&host.name)
-                                .with_context(|| {
-                                    format!(
-                                        "Internal play state error: statistics for host '{}' are missing after handler '{}'",
-                                        host.name, handler_name
-                                    )
-                                })?;
-                            if result.skipped {
-                                host_stats.skipped += 1;
-                            } else {
-                                host_stats.ok += 1;
-                                if result.changed {
-                                    host_stats.changed += 1;
-                                }
-                            }
-                            None
-                        }
-                        Err(error) => {
-                            stats
-                                .get_mut(&host.name)
-                                .context("Missing handler statistics")?
-                                .failed += 1;
-                            Some(error.to_string())
-                        }
-                    };
-
-                    if let Some(message) = failed_message {
-                        if effective_handler.no_log {
-                            error!(
-                                "A no_log handler '{}' failed on host {}",
-                                handler_name, host.name
-                            );
-                        } else {
-                            error!(
-                                "Handler '{}' failed on host {}: {}",
-                                handler_name, host.name, message
-                            );
-                        }
-                        active_hosts.remove(&host.name);
-                        state.excluded.insert(host.name.clone());
-                        let failure_message = if effective_handler.no_log {
-                            "output censored because no_log is enabled"
-                        } else {
-                            message.as_str()
-                        };
-                        failures.push(format!(
-                            "Handler '{}' failed on host '{}': {}",
-                            handler_name, host.name, failure_message
-                        ));
+    fn flush_handlers(
+        &mut self,
+        state: &mut RunState,
+        options: &crate::playbook::ExecutionOptions,
+        status: &mut PlayStatus<'_>,
+    ) -> Result<()> {
+        status.flushing += 1;
+        loop {
+            let mut selected = HashMap::<usize, HashSet<String>>::new();
+            for (host, notice) in status.notified_handlers.clone() {
+                if status.ended.contains(&host) {
+                    continue;
+                }
+                let terminal = status.failures.get(&host).is_some_and(|errors| {
+                    errors
+                        .iter()
+                        .any(|error| error.result.unreachable || error.result.uncertain)
+                });
+                if !status.active_hosts.contains(&host) && (!self.force_handlers || terminal) {
+                    continue;
+                }
+                for index in self.handler_targets(&host, &notice, state) {
+                    if !status.ran_handlers.contains(&(host.clone(), index)) {
+                        selected.entry(index).or_default().insert(host.clone());
                     }
                 }
             }
+            let Some(index) = selected.keys().min().copied() else {
+                break;
+            };
+            let members = selected.remove(&index).expect("Selected handler");
+            for host in &members {
+                status.ran_handlers.insert((host.clone(), index));
+            }
+            let mut task = self.handlers[index].task.clone();
+            if let Some(name) = &self.handlers[index].cached_name {
+                task.name = name.clone();
+            }
+            println!("\n{}", format!("RUNNING HANDLER [{}]", task.name).bold());
+            let mut restore = HashMap::new();
+            for host in &members {
+                if let Some(errors) = status.failures.remove(host) {
+                    restore.insert(host.clone(), errors);
+                }
+                status.active_hosts.insert(host.clone());
+                state.excluded.remove(host);
+            }
+            self.execute_sequence(vec![task], members, state, options, status)?;
+            for (host, mut errors) in restore {
+                if let Some(mut extra) = status.failures.remove(&host) {
+                    errors.append(&mut extra);
+                }
+                status.failures.insert(host.clone(), errors);
+                status.active_hosts.remove(&host);
+                state.excluded.insert(host);
+            }
         }
-
-        let elapsed = start_time.elapsed();
-        let execution_time = format!("{:.2}s", elapsed.as_secs_f64());
-
-        info!("Play '{}' completed in {}", self.name, execution_time);
-
-        state.stats.extend(stats);
-        println!("\nPlay execution completed in {}", execution_time);
-
-        if failures.is_empty() {
-            Ok(())
-        } else {
-            Err(anyhow::anyhow!(failures.join("; ")))
+        status.flushing -= 1;
+        if status.flushing == 0 {
+            status.notified_handlers.clear();
+            status.ran_handlers.clear();
         }
+        Ok(())
     }
 
     /// Execute one task concurrently across hosts, while keeping the task
@@ -754,21 +1182,29 @@ impl Play {
     }
 
     fn apply_play_settings(&self, task: &Task, host: &Host) -> Task {
-        let mut effective_task = task.clone();
-        effective_task.become_override = task.become_override.or(self.become_override);
-        effective_task.become_user_override = task
+        let mut effective_task = task.effective();
+        effective_task.ignore_errors = effective_task.ignore_errors.or(self.ignore_errors);
+        effective_task.ignore_unreachable = effective_task
+            .ignore_unreachable
+            .or(self.ignore_unreachable);
+        effective_task.no_log = effective_task.no_log.or(self.no_log);
+        let mut defaults = self.role_defaults.clone();
+        crate::vars::merge(&mut defaults, effective_task.scope.defaults.clone());
+        effective_task.scope.defaults = defaults;
+        effective_task.become_override = effective_task.become_override.or(self.become_override);
+        effective_task.become_user_override = effective_task
             .become_user_override
             .clone()
             .or_else(|| self.become_user_override.clone());
         let mut environment = self.environment.clone();
-        environment.extend(task.environment.clone());
+        environment.extend(effective_task.environment.clone());
         effective_task.environment = environment;
-        effective_task.is_become = task
+        effective_task.is_become = effective_task
             .become_override
             .or(self.become_override)
             .or_else(|| host.get_become())
             .unwrap_or(false);
-        effective_task.become_user = task
+        effective_task.become_user = effective_task
             .become_user_override
             .clone()
             .or_else(|| self.become_user_override.clone())
@@ -803,7 +1239,7 @@ impl Play {
                 keywords.insert("ansible_become_user".into(), Value::String(value.clone()));
             }
             let (definitions, data) =
-                runtime.layers(definitions, &[&variables], Some(&keywords))?;
+                runtime.layers(definitions, &[&variables], Some(&keywords), None)?;
             let resolved = crate::playbook::templar::resolve_definitions(&definitions, &data)?;
             let context = crate::playbook::templar::create_context(&resolved)?;
             let candidates = entry
@@ -851,10 +1287,11 @@ impl Play {
             let selected = selected.context("No vars_files candidate exists")?;
             crate::vars::merge(&mut variables, crate::vars::load(&selected)?);
         }
+        crate::vars::merge(&mut variables, self.role_vars.clone());
         Ok(variables)
     }
 
-    fn merge_facts(context: &mut HashMap<String, Value>, facts: &Mapping) -> Result<()> {
+    pub(crate) fn merge_facts(context: &mut HashMap<String, Value>, facts: &Mapping) -> Result<()> {
         let mut merged = context
             .get("ansible_facts")
             .and_then(Value::as_mapping)
@@ -896,8 +1333,13 @@ mod tests {
             name: "Test Play".to_string(),
             hosts: "localhost".to_string(),
             tasks: Vec::new(),
+            pre_tasks: Vec::new(),
+            post_tasks: Vec::new(),
             handlers: Vec::new(),
             vars: Mapping::new(),
+            role_defaults: Mapping::new(),
+            role_vars: Mapping::new(),
+            role_paths: Vec::new(),
             environment: Mapping::new(),
             vars_files: Vec::new(),
             source_file: None,
@@ -906,8 +1348,13 @@ mod tests {
             become_user: "root".to_string(),
             become_user_override: None,
             fail_fast: false,
+            force_handlers: false,
+            ignore_errors: None,
+            ignore_unreachable: None,
+            no_log: None,
             connection: None,
             gather_facts: false,
+            import_condition: None,
             gather_subset: None,
             gather_timeout: None,
             tags: Vec::new(),
@@ -922,6 +1369,10 @@ mod tests {
         );
 
         Task {
+            group: None,
+            parent: None,
+            original: None,
+            scope: crate::playbook::TaskScope::default(),
             name: name.to_string(),
             module: "command".to_string(),
             args,
@@ -942,8 +1393,9 @@ mod tests {
             timeout: None,
             environment: Mapping::new(),
             notify: Vec::new(),
-            ignore_errors: false,
-            no_log: false,
+            ignore_errors: None,
+            ignore_unreachable: None,
+            no_log: None,
             vars: Mapping::new(),
             tags: Vec::new(),
             loop_items: None,
@@ -1095,7 +1547,7 @@ esac
     fn test_play_execute_ignore_errors() {
         let mut play = create_test_play();
         let mut task = create_command_task("Fail Task", "false");
-        task.ignore_errors = true;
+        task.ignore_errors = Some(true);
         play.tasks.push(task);
         play.tasks
             .push(create_command_task("Success Task", "echo success"));
@@ -1170,6 +1622,27 @@ esac
     }
 
     #[test]
+    fn lexical_become_settings_survive_play_defaults_and_child_false() {
+        let host = create_local_host();
+        let mut play = create_test_play();
+        play.become_override = Some(true);
+        play.become_user_override = Some("root".into());
+        let mut parent = create_command_task("Block", "true");
+        parent.become_override = Some(true);
+        parent.become_user_override = Some("app".into());
+        let mut child = create_command_task("Child", "true");
+        child.inherit(&parent);
+        let inherited = play.apply_play_settings(&child, &host);
+        assert_eq!(inherited.become_user_override.as_deref(), Some("app"));
+        assert_eq!(inherited.become_user, "app");
+        assert!(inherited.is_become);
+        child.become_override = Some(false);
+        let disabled = play.apply_play_settings(&child, &host);
+        assert!(!disabled.is_become);
+        assert_eq!(disabled.become_override, Some(false));
+    }
+
+    #[test]
     fn test_registered_result_persists_between_tasks() {
         let mut play = create_test_play();
         let mut capture = create_command_task("Capture", "printf registered");
@@ -1193,6 +1666,9 @@ esac
         trigger.notify.push("record handler".to_string());
         play.tasks.push(trigger);
         play.handlers.push(Handler {
+            listen: Vec::new(),
+            hosts: None,
+            cached_name: None,
             task: create_shell_task(
                 "record handler",
                 &format!(
