@@ -81,6 +81,7 @@ impl Runtime {
             .context("Controller executable has no parent directory")?
             .join("workers"))
     }
+    #[cfg(test)]
     pub fn execute(
         &self,
         config: &ConnectionConfig,
@@ -88,22 +89,22 @@ impl Runtime {
         args: Value,
         check: bool,
     ) -> Result<ModuleResult> {
-        self.execute_with_source(config, module, args, check, None)
-    }
-    pub fn execute_with_source(
-        &self,
-        config: &ConnectionConfig,
-        module: &str,
-        args: Value,
-        check: bool,
-        mut source: Option<&mut Source>,
-    ) -> Result<ModuleResult> {
-        let mut request = Request::new(
+        let request = Request::new(
             module,
             args,
             check,
             command_timeout(config)?.as_millis().try_into()?,
         );
+        self.execute_request(config, request, None)
+    }
+    pub(crate) fn execute_request(
+        &self,
+        config: &ConnectionConfig,
+        mut request: Request,
+        mut source: Option<&mut Source>,
+    ) -> Result<ModuleResult> {
+        let module = request.module.clone();
+        let check = request.check;
         if let Some(source) = source.as_mut() {
             let size = source.seek(SeekFrom::End(0))?;
             source.rewind()?;
@@ -136,10 +137,10 @@ impl Runtime {
             }
         }
         if slot.is_none() {
-            *slot = Some(Client::start(config, &self.directory()?, module, key)?);
+            *slot = Some(Client::start(config, &self.directory()?, &module, key)?);
         }
         let client = slot.as_mut().context("Missing worker lease")?;
-        client.hello.validate(&client.arch, client.uid, module)?;
+        client.hello.validate(&client.arch, client.uid, &module)?;
         // Commands are normalized into one native parameter form before wire
         // encoding, so the worker never repeats controller CLI parsing.
         if let Value::String(command) = request.args {
@@ -249,7 +250,7 @@ impl Runtime {
                 slot.take();
                 Ok(crate::modules::result::from_error(
                     error.context("Native worker exchange failed; invocation was not replayed"),
-                    !check && !matches!(module, "setup" | "stat"),
+                    !check && !matches!(module.as_str(), "setup" | "stat"),
                 ))
             }
         }

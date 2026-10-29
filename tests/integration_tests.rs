@@ -35,6 +35,199 @@ fn local_inventory() -> NamedTempFile {
 }
 
 #[test]
+fn task_attempts_conditions_environment_and_loop_results_follow_real_execution() -> Result<()> {
+    let directory = TempDir::new()?;
+    let root = directory.path().display();
+    let file = fixture_file(&format!(
+        r#"
+- hosts: localhost
+  gather_facts: false
+  environment:
+    RUSTSIBLE_TEST_LEVEL: play
+    RUSTSIBLE_TEST_INHERITED: inherited
+  tasks:
+    - shell: 'printf "%s|%s" "$RUSTSIBLE_TEST_LEVEL" "$RUSTSIBLE_TEST_INHERITED"'
+      environment:
+        RUSTSIBLE_TEST_LEVEL: task
+      register: environment_result
+    - copy:
+        content: '{{{{ environment_result.stdout }}}}'
+        dest: {root}/environment
+    - shell: 'n=$(cat {root}/count-{{{{ item }}}} 2>/dev/null || echo 0); n=$((n+1)); printf %s "$n" > {root}/count-{{{{ item }}}}; printf %s "$n"; test "$n" -ge 3'
+      register: step
+      loop: [one, two]
+      retries: 3
+      delay: 0
+      until: step.rc == 0
+      changed_when: step.stdout == '3'
+      notify: mark
+    - copy:
+        content: '{{{{ step.results[0].attempts }}}}|{{{{ step.results[1].attempts }}}}|{{{{ step.results[0].item }}}}|{{{{ step.results[1].item }}}}'
+        dest: {root}/attempts
+    - command: /bin/false
+      failed_when: false
+      changed_when: false
+      register: accepted
+      notify: suppressed
+    - copy:
+        content: '{{{{ accepted.rc }}}}|{{{{ accepted.failed }}}}|{{{{ accepted.changed }}}}'
+        dest: {root}/accepted
+    - shell: 'printf x >> {root}/exhausted'
+      register: exhausted
+      retries: 1
+      delay: 0
+      until: false
+      ignore_errors: true
+    - copy:
+        content: '{{{{ exhausted.attempts }}}}|{{{{ exhausted.failed }}}}'
+        dest: {root}/exhaustion
+    - shell: 'test "$RUSTSIBLE_TEST_LEVEL" = play'
+      changed_when: false
+    - shell: 'n=$(cat {root}/retry-success 2>/dev/null || echo 0); n=$((n+1)); printf %s "$n" > {root}/retry-success; test "$n" -ge 2'
+      retries: 2
+      delay: 0
+      until: []
+      register: retry_success
+    - copy:
+        content: '{{{{ retry_success.attempts | string }}}}'
+        dest: {root}/retry-attempts
+    - debug:
+        msg: safe
+      changed_when: []
+      failed_when: []
+      register: empty_conditions
+    - copy:
+        content: '{{{{ empty_conditions.changed }}}}|{{{{ empty_conditions.failed }}}}'
+        dest: {root}/empty-conditions
+  handlers:
+    - name: mark
+      shell: 'printf x >> {root}/handler'
+    - name: suppressed
+      shell: 'touch {root}/suppressed-handler'
+"#
+    ));
+    let inventory = local_inventory();
+    let output = controller()
+        .args([
+            "playbook",
+            file.path().to_str().unwrap(),
+            "-i",
+            inventory.path().to_str().unwrap(),
+        ])
+        .output()?;
+    assert!(
+        output.status.success(),
+        "{}\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    for (name, expected) in [
+        ("environment", "task|inherited"),
+        ("attempts", "3|3|one|two"),
+        ("accepted", "1|False|False"),
+        ("exhausted", "xx"),
+        ("exhaustion", "1|True"),
+        ("handler", "x"),
+        ("retry-success", "2"),
+        ("retry-attempts", "2"),
+        ("empty-conditions", "False|False"),
+    ] {
+        assert_eq!(
+            std::fs::read_to_string(directory.path().join(name))?,
+            expected,
+            "{name}"
+        );
+    }
+    assert!(!directory.path().join("suppressed-handler").exists());
+    Ok(())
+}
+
+#[test]
+fn task_timeout_reaps_descendants_and_never_retries_an_uncertain_modification() -> Result<()> {
+    let directory = TempDir::new()?;
+    let root = directory.path().display();
+    let file = fixture_file(&format!(
+        r#"
+- hosts: localhost
+  gather_facts: false
+  tasks:
+    - shell: |
+        printf x >> {root}/invocations
+        setsid sh -c 'echo $$ > {root}/child; sleep 30' &
+        wait
+      timeout: 1
+      retries: 3
+      delay: 0
+      ignore_errors: true
+    - command: touch {root}/later
+"#
+    ));
+    let inventory = local_inventory();
+    let output = controller()
+        .args([
+            "playbook",
+            file.path().to_str().unwrap(),
+            "-i",
+            inventory.path().to_str().unwrap(),
+        ])
+        .output()?;
+    assert!(!output.status.success());
+    assert_eq!(
+        std::fs::read_to_string(directory.path().join("invocations"))?,
+        "x"
+    );
+    assert!(!directory.path().join("later").exists());
+    let pid = std::fs::read_to_string(directory.path().join("child"))?
+        .trim()
+        .parse::<i32>()?;
+    assert_eq!(
+        unsafe { libc::kill(pid, 0) },
+        -1,
+        "timed-out descendant survived"
+    );
+    assert_eq!(
+        std::io::Error::last_os_error().raw_os_error(),
+        Some(libc::ESRCH)
+    );
+    Ok(())
+}
+
+#[test]
+fn global_check_with_command_prediction_cannot_be_cancelled_by_task_setting() -> Result<()> {
+    let directory = TempDir::new()?;
+    let file = fixture_file(&format!(
+        r#"
+- hosts: localhost
+  gather_facts: false
+  tasks:
+    - command:
+        argv: [/usr/bin/touch, would-change]
+        chdir: {}
+        creates: would-change
+      check_mode: false
+"#,
+        directory.path().display()
+    ));
+    let inventory = local_inventory();
+    let output = controller()
+        .args([
+            "playbook",
+            file.path().to_str().unwrap(),
+            "-i",
+            inventory.path().to_str().unwrap(),
+            "--check",
+        ])
+        .output()?;
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(std::fs::read_dir(directory.path())?.count(), 0);
+    Ok(())
+}
+
+#[test]
 fn sources_follow_playbook_directory_and_runtime_output_is_not_retemplated() -> Result<()> {
     let project = TempDir::new()?;
     let unrelated = TempDir::new()?;
@@ -744,7 +937,7 @@ fn both_frontends_reject_unknown_arguments_even_in_check_mode() -> Result<()> {
             String::from_utf8_lossy(&output.stdout),
             String::from_utf8_lossy(&output.stderr)
         );
-        assert!(text.contains("only the 'cmd' parameter"), "{text}");
+        assert!(text.contains("unknown field `unknown`"), "{text}");
         assert!(!text.contains("Failed to connect"));
     }
     Ok(())

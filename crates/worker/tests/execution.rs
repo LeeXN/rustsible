@@ -48,6 +48,92 @@ fn finish(mut child: Child, input: ChildStdin) -> ModuleResult {
 fn request(module: &str, args: serde_json::Value) -> Request {
     Request::new(module, serde_yaml::to_value(args).unwrap(), false, 30000)
 }
+
+#[test]
+fn command_argv_stdin_working_directory_and_glob_guards_are_native() {
+    let temp = tempfile::tempdir().unwrap();
+    fs::write(temp.path().join("already.flag"), "original").unwrap();
+    let run = |args, check| {
+        let mut request = request("command", args);
+        request.check = check;
+        let (child, input) = start(request);
+        finish(child, input)
+    };
+    let result = run(
+        serde_json::json!({"argv":["/bin/cat"],"stdin":"a\nb","stdin_add_newline":false,"chdir":temp.path()}),
+        false,
+    );
+    assert!(!result.failed && result.changed, "{}", result.msg);
+    assert_eq!(result.stdout, "a\nb");
+    let result = run(
+        serde_json::json!({"argv":["/usr/bin/printf","%s|%s","a b","; touch injected"],"chdir":temp.path()}),
+        false,
+    );
+    assert_eq!(result.stdout, "a b|; touch injected");
+    assert!(!temp.path().join("injected").exists());
+    for check in [false, true] {
+        for args in [
+            serde_json::json!({"cmd":"touch changed","chdir":temp.path(),"creates":"*.flag"}),
+            serde_json::json!({"cmd":"touch changed","chdir":temp.path(),"removes":"missing.*"}),
+        ] {
+            let result = run(args, check);
+            assert!(
+                !result.failed && !result.changed && !result.skipped,
+                "{}",
+                result.msg
+            );
+        }
+    }
+    let result = run(
+        serde_json::json!({"cmd":"touch changed","chdir":temp.path(),"creates":"changed"}),
+        true,
+    );
+    assert!(!result.failed && result.changed && !result.skipped);
+    assert!(!temp.path().join("changed").exists());
+    let result = run(
+        serde_json::json!({"cmd":"touch changed","chdir":temp.path(),"creates":"missing-parent/child"}),
+        true,
+    );
+    assert!(!result.failed && result.changed, "{}", result.msg);
+    for args in [
+        serde_json::json!({"cmd":"touch changed","argv":["true"]}),
+        serde_json::json!({"argv":[]}),
+        serde_json::json!({"cmd":"touch changed","stdin_add_newline":"no"}),
+        serde_json::json!({"cmd":"touch changed","chdir":temp.path().join("missing")}),
+    ] {
+        let result = run(args, false);
+        assert!(result.failed && !result.changed, "{}", result.msg);
+    }
+    assert!(!temp.path().join("changed").exists());
+}
+
+#[test]
+fn task_environment_is_private_to_one_request_and_arguments_expand_without_a_shell() {
+    let mut first = request(
+        "command",
+        serde_json::json!({"argv":["/usr/bin/printf", "%s|%s|%s\n", "$RUSTSIBLE_ENV_TEST", "${RUSTSIBLE_ENV_TEST}", "$RUSTSIBLE_MISSING_ENV_TEST"]}),
+    );
+    first
+        .environment
+        .insert("RUSTSIBLE_ENV_TEST".into(), "one word; literal".into());
+    let (mut child, mut input) = start(first);
+    let response: Response =
+        read_frame(child.stdout.as_mut().unwrap(), MAX_RESPONSE_BYTES).unwrap();
+    assert_eq!(
+        response.validate().unwrap().stdout,
+        "one word; literal|one word; literal|$RUSTSIBLE_MISSING_ENV_TEST"
+    );
+    let mut second = request(
+        "shell",
+        serde_json::json!({"cmd":"printf %s \"${RUSTSIBLE_ENV_TEST-unset}\""}),
+    );
+    second.managed = false;
+    input
+        .write_all(&encode(&second, MAX_REQUEST_BYTES).unwrap())
+        .unwrap();
+    input.flush().unwrap();
+    assert_eq!(finish(child, input).stdout, "unset");
+}
 fn quote(path: &std::path::Path) -> String {
     format!("'{}'", path.to_str().unwrap().replace('\'', "'\"'\"'"))
 }

@@ -11,6 +11,8 @@ pub struct Invocation {
     pub module: Builtin,
     args: Value,
     check: bool,
+    environment: std::collections::BTreeMap<String, String>,
+    timeout_ms: Option<u64>,
 }
 
 impl Invocation {
@@ -18,10 +20,16 @@ impl Invocation {
         let module = Builtin::lookup(name)?;
         let args = if matches!(module, Builtin::Command | Builtin::Shell) {
             if let Some(raw) = args.get("_raw_params") {
-                if args.as_mapping().is_none_or(|map| map.len() != 1) {
-                    bail!("Raw command cannot be combined with other parameters");
+                let mut mapping = args
+                    .as_mapping()
+                    .context("Command requires a mapping")?
+                    .clone();
+                if mapping.contains_key(Value::String("cmd".into())) {
+                    bail!("Command cannot specify raw text and cmd");
                 }
-                raw.clone()
+                mapping.remove(Value::String("_raw_params".into()));
+                mapping.insert(Value::String("cmd".into()), raw.clone());
+                Value::Mapping(mapping)
             } else {
                 args.clone()
             }
@@ -34,11 +42,27 @@ impl Invocation {
             module,
             args,
             check,
+            environment: Default::default(),
+            timeout_ms: None,
         })
     }
+    pub(crate) fn with_execution(
+        mut self,
+        environment: std::collections::BTreeMap<String, String>,
+        timeout_ms: Option<u64>,
+    ) -> Self {
+        self.environment = environment;
+        self.timeout_ms = timeout_ms;
+        self
+    }
+    fn skip_check(&self) -> bool {
+        self.check
+            && matches!(self.module, Builtin::Command | Builtin::Shell)
+            && self.args.get("creates").is_none()
+            && self.args.get("removes").is_none()
+    }
     pub fn needs_connection(&self) -> bool {
-        self.module != Builtin::Debug
-            && !(self.check && self.module.check_support() == CheckSupport::Skip)
+        self.module != Builtin::Debug && !self.skip_check()
     }
     pub(crate) fn execute(
         mut self,
@@ -48,7 +72,7 @@ impl Invocation {
     ) -> ModuleResult {
         self.check |= super::result::is_check_active();
         let _changes = super::result::ChangeScope::enter(self.check);
-        if self.check && self.module.check_support() == CheckSupport::Skip {
+        if self.skip_check() {
             return ModuleResult {
                 skipped: true,
                 msg: format!(
@@ -70,6 +94,18 @@ impl Invocation {
                     ..ModuleResult::default()
                 });
             }
+            let timeout_ms = self.timeout_ms.unwrap_or(
+                crate::ssh::connection::command_timeout(config)?
+                    .as_millis()
+                    .try_into()?,
+            );
+            let mut request = rustsible_protocol::Request::new(
+                self.module.name(),
+                self.args.clone(),
+                self.check,
+                timeout_ms,
+            );
+            request.environment = self.environment.clone();
             if matches!(self.module, Builtin::Copy | Builtin::Template) {
                 let mut args = self.args.clone();
                 let mut source = if self.module == Builtin::Template {
@@ -90,15 +126,10 @@ impl Invocation {
                         mapping.remove(Value::String(name.into()));
                     }
                 }
-                return runtime.execute_with_source(
-                    config,
-                    self.module.name(),
-                    args,
-                    self.check,
-                    Some(&mut source),
-                );
+                request.args = args;
+                return runtime.execute_request(config, request, Some(&mut source));
             }
-            runtime.execute(config, self.module.name(), self.args.clone(), self.check)
+            runtime.execute_request(config, request, None)
         })();
         match result {
             Ok(mut result) => {

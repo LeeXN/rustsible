@@ -35,6 +35,14 @@ mkdir "$fixture_dir/file-output"
 (cd "$fixture_dir/file-output" && find . -exec stat -c '%n:%a:%u:%g' {} \; | sort) > "$fixture_dir/native-metadata"
 diff -u "$fixture_dir/reference-metadata" "$fixture_dir/native-metadata"
 diff -r "$fixture_dir/reference-files" "$fixture_dir/file-output"
+mkdir "$fixture_dir/execution-output"
+sed "s|@OUTPUT@|$fixture_dir/execution-output|g" "$repo_dir/tests/reference/execution.yml" > "$fixture_dir/execution.yml"
+uv tool run --from ansible-core==2.21.0 ansible-playbook -i "$fixture_dir/inventory" "$fixture_dir/execution.yml" > "$fixture_dir/reference-execution.log" 2>&1
+mv "$fixture_dir/execution-output" "$fixture_dir/reference-execution"
+mkdir "$fixture_dir/execution-output"
+"$binary" playbook -i "$fixture_dir/inventory" "$fixture_dir/execution.yml" > "$fixture_dir/native-execution.log" 2>&1
+diff -r "$fixture_dir/reference-execution" "$fixture_dir/execution-output"
+[[ ! -e $fixture_dir/execution-output/should-not-exist ]]
 if uv tool run --from ansible-core==2.21.0 ansible-playbook \
     -i "$fixture_dir/inventory" "$fixture_dir/non_boolean.yml" > "$fixture_dir/reference-condition.log" 2>&1; then
     echo 'Reference unexpectedly accepted a string condition' >&2; exit 1
@@ -43,4 +51,4 @@ if "$binary" playbook -i "$fixture_dir/inventory" "$fixture_dir/non_boolean.yml"
     echo 'Rustsible unexpectedly accepted a string condition' >&2; exit 1
 fi
 [[ ! -e $fixture_dir/result/unsafe-condition ]]
-printf 'Ansible 2.21.0 comparison passed: string types, defaults/omit, loops, conditions, template source, literal runtime output; native file bytes/modes, last-match line insertion/replacement, newline handling and links\n'
+printf 'Ansible 2.21.0 comparison passed: templates/types, native files, retry counts/exhaustion, loop registration, result conditions, handler deduplication, environment, command stdin/chdir and check prediction\n'

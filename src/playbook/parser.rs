@@ -106,6 +106,7 @@ pub fn parse_playbook(playbook_path: &str) -> Result<Playbook> {
 
 const SUPPORTED_PLAY_KEYWORDS: &[&str] = &[
     "name",
+    "environment",
     "hosts",
     "tasks",
     "handlers",
@@ -126,7 +127,6 @@ const UNSUPPORTED_PLAY_KEYWORDS: &[&str] = &[
     "collections",
     "debugger",
     "diff",
-    "environment",
     "fact_path",
     "force_handlers",
     "gather_subset",
@@ -153,6 +153,14 @@ const UNSUPPORTED_PLAY_KEYWORDS: &[&str] = &[
 
 const SUPPORTED_TASK_KEYWORDS: &[&str] = &[
     "name",
+    "args",
+    "environment",
+    "timeout",
+    "delay",
+    "retries",
+    "until",
+    "failed_when",
+    "changed_when",
     "become",
     "become_user",
     "check_mode",
@@ -172,21 +180,16 @@ const UNSUPPORTED_TASK_KEYWORDS: &[&str] = &[
     "action",
     "always",
     "any_errors_fatal",
-    "args",
     "async",
     "become_exe",
     "become_flags",
     "become_method",
     "block",
-    "changed_when",
     "collections",
     "debugger",
-    "delay",
     "delegate_facts",
     "delegate_to",
     "diff",
-    "environment",
-    "failed_when",
     "ignore_unreachable",
     "listen",
     "module_defaults",
@@ -194,12 +197,9 @@ const UNSUPPORTED_TASK_KEYWORDS: &[&str] = &[
     "port",
     "remote_user",
     "rescue",
-    "retries",
     "run_once",
     "tags",
     "throttle",
-    "timeout",
-    "until",
 ];
 
 #[derive(Clone, Copy)]
@@ -272,6 +272,7 @@ fn parse_play(play_map: Mapping, ordinal: usize) -> Result<Play> {
         tasks,
         handlers,
         vars,
+        environment: parse_environment(&play_map)?,
         become_override,
         is_become,
         become_user,
@@ -330,7 +331,30 @@ fn parse_task_list(value: Option<&Value>, kind: TaskKind) -> Result<Vec<Handler>
 fn parse_task(task_map: Mapping, index: usize, kind: TaskKind) -> Result<Task> {
     debug!("Parsing {} definition at index {}", kind.label(), index);
 
-    let (module, args) = parse_module(&task_map, kind)?;
+    let (module, mut args) = parse_module(&task_map, kind)?;
+    if let Some(extra) = task_map.get(Value::String("args".into())) {
+        let extra = extra.as_mapping().context("Task args must be a mapping")?;
+        for (key, value) in extra {
+            if !key.is_string() {
+                bail!("Task args keys must be strings");
+            }
+            if args.insert(key.clone(), value.clone()).is_some() {
+                bail!("Duplicate module argument");
+            }
+        }
+    }
+    for keyword in ["changed_when", "failed_when", "until"] {
+        if let Some(value) = task_map.get(Value::String(keyword.into())) {
+            validate_condition(value, keyword)?;
+        }
+    }
+    for keyword in ["retries", "delay", "timeout"] {
+        if let Some(value) = task_map.get(Value::String(keyword.into())) {
+            if !matches!(value, Value::Number(_) | Value::String(_)) {
+                bail!("Task {keyword} must be a number or template expression");
+            }
+        }
+    }
     let name = match task_map.get(Value::String("name".to_string())) {
         Some(Value::String(name)) if !name.trim().is_empty() => name.clone(),
         Some(Value::String(_)) => bail!("{} name cannot be empty", kind.label()),
@@ -409,6 +433,13 @@ fn parse_task(task_map: Mapping, index: usize, kind: TaskKind) -> Result<Task> {
         check_mode,
         register,
         when,
+        changed_when: task_map.get(Value::String("changed_when".into())).cloned(),
+        failed_when: task_map.get(Value::String("failed_when".into())).cloned(),
+        until: task_map.get(Value::String("until".into())).cloned(),
+        retries: task_map.get(Value::String("retries".into())).cloned(),
+        delay: task_map.get(Value::String("delay".into())).cloned(),
+        timeout: task_map.get(Value::String("timeout".into())).cloned(),
+        environment: parse_environment(&task_map)?,
         notify,
         ignore_errors,
         no_log,
@@ -488,6 +519,28 @@ fn parse_module_args(module: &str, value: &Value) -> Result<(String, Mapping)> {
         ),
     }
     Ok((module.to_string(), args))
+}
+
+fn parse_environment(map: &Mapping) -> Result<Mapping> {
+    let Some(value) = map.get(Value::String("environment".into())) else {
+        return Ok(Mapping::new());
+    };
+    let variables = value
+        .as_mapping()
+        .context("Environment must be a mapping")?;
+    for key in variables.keys() {
+        let name = key.as_str().context("Environment names must be strings")?;
+        if name.is_empty()
+            || name.bytes().enumerate().any(|(index, byte)| {
+                !(byte.is_ascii_alphabetic()
+                    || byte == b'_'
+                    || (index > 0 && byte.is_ascii_digit()))
+            })
+        {
+            bail!("Invalid environment name");
+        }
+    }
+    Ok(variables.clone())
 }
 
 fn parse_variables(value: Option<&Value>, label: &str) -> Result<Mapping> {
@@ -993,16 +1046,7 @@ mod tests {
 
     #[test]
     fn recognized_but_unsupported_task_keywords_are_not_modules() {
-        for keyword in [
-            "changed_when",
-            "failed_when",
-            "delegate_to",
-            "environment",
-            "retries",
-            "delay",
-            "until",
-            "run_once",
-        ] {
+        for keyword in ["delegate_to", "run_once", "async", "poll"] {
             let content = format!(
                 "---\n- hosts: all\n  tasks:\n    - command: echo\n      {keyword}: true\n"
             );

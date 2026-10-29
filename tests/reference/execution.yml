@@ -1,0 +1,63 @@
+- hosts: localhost
+  gather_facts: false
+  environment:
+    RUSTSIBLE_TEST_LEVEL: play
+    RUSTSIBLE_TEST_INHERITED: inherited
+  tasks:
+    - shell: 'printf "%s|%s" "$RUSTSIBLE_TEST_LEVEL" "$RUSTSIBLE_TEST_INHERITED"'
+      environment:
+        RUSTSIBLE_TEST_LEVEL: task
+      register: environment_result
+    - copy:
+        content: '{{ environment_result.stdout }}'
+        dest: '@OUTPUT@/environment'
+    - command:
+        argv: [/bin/cat]
+        stdin: "a\nb"
+        stdin_add_newline: false
+        chdir: '@OUTPUT@'
+      register: stdin_result
+    - copy:
+        content: '{{ stdin_result.stdout }}'
+        dest: '@OUTPUT@/stdin'
+    - shell: 'n=$(cat @OUTPUT@/count-{{ item }} 2>/dev/null || echo 0); n=$((n+1)); printf %s "$n" > @OUTPUT@/count-{{ item }}; printf %s "$n"; test "$n" -ge 3'
+      register: step
+      loop: [one, two]
+      retries: 3
+      delay: 0
+      until: step.rc == 0
+      changed_when: step.stdout == '3'
+      notify: mark
+    - copy:
+        content: '{{ step.results[0].attempts }}|{{ step.results[1].attempts }}|{{ step.results[0].item }}|{{ step.results[1].item }}'
+        dest: '@OUTPUT@/attempts'
+    - command: /bin/false
+      failed_when: false
+      changed_when: false
+      register: accepted
+    - copy:
+        content: '{{ accepted.rc }}|{{ accepted.failed }}|{{ accepted.changed }}'
+        dest: '@OUTPUT@/accepted'
+    - shell: 'printf x >> @OUTPUT@/exhausted'
+      register: exhausted
+      retries: 1
+      delay: 0
+      until: false
+      ignore_errors: true
+    - copy:
+        content: '{{ exhausted.attempts }}|{{ exhausted.failed }}'
+        dest: '@OUTPUT@/exhaustion'
+    - shell: 'test "$RUSTSIBLE_TEST_LEVEL" = play'
+      changed_when: false
+    - command: touch should-not-exist
+      args:
+        creates: should-not-exist
+        chdir: '@OUTPUT@'
+      check_mode: true
+      register: prediction
+    - copy:
+        content: '{{ prediction.changed }}|{{ prediction.rc }}'
+        dest: '@OUTPUT@/prediction'
+  handlers:
+    - name: mark
+      shell: 'printf x >> @OUTPUT@/handler'

@@ -4,7 +4,6 @@ use serde_yaml::Value;
 pub enum CheckSupport {
     ReadOnly,
     Predict,
-    Skip,
 }
 
 /// One registry owns public names, schemas and capabilities for both the
@@ -81,7 +80,6 @@ impl Builtin {
     pub fn check_support(self) -> CheckSupport {
         match self {
             Self::Debug | Self::Meta | Self::Setup | Self::Stat => CheckSupport::ReadOnly,
-            Self::Command | Self::Shell => CheckSupport::Skip,
             _ => CheckSupport::Predict,
         }
     }
@@ -96,7 +94,17 @@ impl Builtin {
     }
     pub fn parameters(self) -> &'static [&'static str] {
         match self {
-            Self::Command | Self::Shell => &["cmd"],
+            Self::Command | Self::Shell => &[
+                "cmd",
+                "argv",
+                "chdir",
+                "creates",
+                "removes",
+                "stdin",
+                "stdin_add_newline",
+                "strip_empty_ends",
+                "expand_argument_vars",
+            ],
             Self::Debug => &["msg", "var", "_var_value"],
             Self::Meta => &["action"],
             Self::Copy => &["src", "content", "dest", "mode", "owner", "group", "force"],
@@ -144,16 +152,7 @@ impl Builtin {
     /// before an implementation can perform its first state change.
     pub fn validate_parameters(self, args: &Value) -> Result<()> {
         if matches!(self, Self::Command | Self::Shell) {
-            let command = crate::extract_command_arg(args)?;
-            if command.trim().is_empty() || command.contains('\0') {
-                bail!("Command must be non-empty without NUL bytes");
-            }
-            if self == Self::Command {
-                let argv = crate::tokenize_args(&command)?;
-                if argv.is_empty() {
-                    bail!("Command must be non-empty");
-                }
-            }
+            crate::CommandArgs::parse(args, self == Self::Shell)?;
             return Ok(());
         }
         crate::param::validate_params(args, self.parameters())?;

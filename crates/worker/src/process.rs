@@ -13,8 +13,46 @@ use std::{
 };
 const MAX_OUTPUT: usize = 16 * 1024 * 1024;
 
-pub fn execute(program: &str, shell: bool, scratch: &Path) -> Result<ModuleResult> {
-    let command = if shell {
+pub fn execute(
+    args: &rustsible_protocol::CommandArgs,
+    shell: bool,
+    check: bool,
+    scratch: &Path,
+) -> Result<ModuleResult> {
+    let base = args
+        .chdir
+        .as_deref()
+        .map(Path::new)
+        .unwrap_or(Path::new("."));
+    if !base.is_dir() {
+        bail!("Command chdir is not an accessible directory");
+    }
+    let blocked = if let Some(path) = &args.creates {
+        matches_path(&base.join(path))?
+    } else {
+        false
+    };
+    let blocked = blocked
+        || if let Some(path) = &args.removes {
+            !matches_path(&base.join(path))?
+        } else {
+            false
+        };
+    if blocked || check {
+        return Ok(ModuleResult {
+            changed: !blocked && args.has_prediction(),
+            skipped: check && !args.has_prediction(),
+            rc: Some(0),
+            msg: if blocked {
+                "Command guard prevented execution"
+            } else {
+                "Check mode: command was not executed"
+            }
+            .into(),
+            ..ModuleResult::default()
+        });
+    }
+    let mut command = if shell {
         // The user's program is sensitive request data, not a worker argv
         // parameter. A private file also leaves stdin available for module IO.
         let path = scratch.join("program.sh");
@@ -23,12 +61,23 @@ pub fn execute(program: &str, shell: bool, scratch: &Path) -> Result<ModuleResul
             .create_new(true)
             .mode(0o600)
             .open(&path)?;
-        file.write_all(program.as_bytes())?;
+        file.write_all(
+            args.cmd
+                .as_deref()
+                .context("Shell requires cmd")?
+                .as_bytes(),
+        )?;
         let mut command = Command::new("sh");
         command.arg(path);
         command
     } else {
-        let argv = rustsible_protocol::tokenize_args(program)?;
+        let mut argv = args.arguments()?;
+        if args.expand_argument_vars {
+            let variables = regex::Regex::new(r"\$(\w+|\{[^}]+\})")?;
+            for argument in &mut argv {
+                *argument = expand_argument(argument, &variables)?;
+            }
+        }
         if argv.is_empty() {
             bail!("Command requires an executable");
         }
@@ -36,7 +85,82 @@ pub fn execute(program: &str, shell: bool, scratch: &Path) -> Result<ModuleResul
         command.args(&argv[1..]);
         command
     };
-    run(command, None, true, false)
+    command.current_dir(base);
+    let input = args.stdin.as_ref().map(|input| {
+        if args.stdin_add_newline {
+            format!("{input}\n").into_bytes()
+        } else {
+            input.as_bytes().to_vec()
+        }
+    });
+    let mut result = run(command, input.as_deref(), true, false)?;
+    if args.strip_empty_ends {
+        result.stdout = result.stdout.trim_end_matches(['\r', '\n']).to_owned();
+        result.stderr = result.stderr.trim_end_matches(['\r', '\n']).to_owned();
+    }
+    Ok(result)
+}
+
+fn expand_argument(argument: &str, variables: &regex::Regex) -> Result<String> {
+    let mut argument = argument.to_owned();
+    if let Some(rest) = argument.strip_prefix('~') {
+        let (user, tail) = rest
+            .split_once('/')
+            .map_or((rest, ""), |(user, _)| (user, &rest[user.len()..]));
+        let home = if user.is_empty() {
+            std::env::var("HOME").ok()
+        } else {
+            let name = std::ffi::CString::new(user)?;
+            // Module execution is a single request process. Copy libc's NSS
+            // record before another call can replace its static storage.
+            let record = unsafe { libc::getpwnam(name.as_ptr()) };
+            if record.is_null() {
+                None
+            } else {
+                Some(
+                    unsafe { std::ffi::CStr::from_ptr((*record).pw_dir) }
+                        .to_string_lossy()
+                        .into_owned(),
+                )
+            }
+        };
+        if let Some(home) = home {
+            argument = format!("{home}{tail}");
+        }
+    }
+    Ok(variables
+        .replace_all(&argument, |captures: &regex::Captures<'_>| {
+            let name = captures[1].trim_start_matches('{').trim_end_matches('}');
+            std::env::var(name).unwrap_or_else(|_| captures[0].to_owned())
+        })
+        .into_owned())
+}
+
+fn matches_path(path: &Path) -> Result<bool> {
+    use std::{ffi::CString, os::unix::ffi::OsStrExt};
+    let path = CString::new(path.as_os_str().as_bytes())?;
+    // POSIX glob supplies the platform's path matching without a shell. The
+    // zero-initialized result is released even after a partial allocation.
+    let mut matches: libc::glob_t = unsafe { std::mem::zeroed() };
+    extern "C" fn on_error(_: *const libc::c_char, error: libc::c_int) -> libc::c_int {
+        // A missing parent is a non-match; permission and IO failures must not
+        // be mistaken for permission to execute a modifying command.
+        i32::from(!matches!(error, libc::ENOENT | libc::ENOTDIR))
+    }
+    let rc = unsafe {
+        libc::glob(
+            path.as_ptr(),
+            libc::GLOB_NOSORT,
+            Some(on_error),
+            &mut matches,
+        )
+    };
+    let found = matches.gl_pathc != 0;
+    unsafe { libc::globfree(&mut matches) };
+    match rc {
+        0 | libc::GLOB_NOMATCH => Ok(found),
+        _ => bail!("Cannot inspect command guard pattern"),
+    }
 }
 
 /// All system tools and user commands share bounded duplex IO. A tool's input
