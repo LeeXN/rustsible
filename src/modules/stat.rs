@@ -3,7 +3,7 @@ use serde_yaml::Value;
 use std::collections::HashMap;
 
 use crate::inventory::Host;
-use crate::modules::param::{get_optional_param, get_param, validate_params};
+use crate::modules::param::{get_optional_param, get_param};
 use crate::modules::python::execute_json_mapping;
 use crate::modules::ModuleResult;
 use crate::ssh::connection::{Connection, SshConnection};
@@ -43,7 +43,7 @@ pub fn execute(
     become_user: &str,
     _check_mode: bool,
 ) -> Result<ModuleResult> {
-    validate_params(args, &["path", "checksum_algorithm"])?;
+    crate::modules::registry::Builtin::Stat.validate_parameters(args)?;
     let path = get_param::<String>(args, "path")?;
     if path.is_empty() {
         anyhow::bail!("Stat path cannot be empty");

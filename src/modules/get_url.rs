@@ -1,9 +1,9 @@
-use anyhow::{bail, Context, Result};
+use anyhow::{bail, Result};
 use serde_yaml::Value;
 use std::collections::HashMap;
 
 use crate::inventory::Host;
-use crate::modules::param::{get_optional_param, get_param, validate_params};
+use crate::modules::param::{get_optional_param, get_param};
 use crate::modules::python::execute_json_mapping;
 use crate::modules::ModuleResult;
 use crate::ssh::connection::{Connection, SshConnection};
@@ -169,10 +169,7 @@ pub fn execute(
     become_user: &str,
     check_mode: bool,
 ) -> Result<ModuleResult> {
-    validate_params(
-        args,
-        &["url", "dest", "owner", "group", "mode", "force", "checksum"],
-    )?;
+    crate::modules::registry::Builtin::GetUrl.validate_parameters(args)?;
     let url = get_param::<String>(args, "url")?;
     let dest = get_param::<String>(args, "dest")?;
     if url.is_empty() || dest.is_empty() {
@@ -198,7 +195,11 @@ pub fn execute(
     let changed = output
         .get(Value::String("changed".to_string()))
         .and_then(Value::as_bool)
-        .context("Get_url module did not return changed")?;
+        .ok_or_else(|| {
+            crate::ssh::connection::result_unavailable(anyhow::anyhow!(
+                "Get_url module did not return changed"
+            ))
+        })?;
     let values = output
         .into_iter()
         .filter_map(|(key, value)| match key {
@@ -379,6 +380,7 @@ mod tests {
                 assert!(execute(&connection, &args, false, "root", check)
                     .unwrap_err()
                     .to_string()
+                    .to_ascii_lowercase()
                     .contains(error));
             }
         }

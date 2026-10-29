@@ -59,6 +59,47 @@ pub fn validate_params(args: &Value, allowed: &[&str]) -> Result<()> {
     Ok(())
 }
 
+/// Matches the fixed ansible-core 2.21 stat checksum choices. Keeping the
+/// length table here also validates inline download digests before any IO.
+pub(crate) fn digest_hex_length(algorithm: &str) -> Result<usize> {
+    match algorithm {
+        "md5" => Ok(32),
+        "sha1" => Ok(40),
+        "sha224" => Ok(56),
+        "sha256" => Ok(64),
+        "sha384" => Ok(96),
+        "sha512" => Ok(128),
+        _ => anyhow::bail!("Unsupported checksum algorithm: {algorithm}"),
+    }
+}
+
+pub(crate) fn parse_mode(mode: &str) -> Result<u32> {
+    if mode.is_empty() || !mode.bytes().all(|byte| matches!(byte, b'0'..=b'7')) {
+        anyhow::bail!("File mode must be a non-empty octal string");
+    }
+    let mode = u32::from_str_radix(mode, 8).map_err(|_| anyhow::anyhow!("Invalid file mode"))?;
+    if mode > 0o7777 {
+        anyhow::bail!("File mode is outside the supported range");
+    }
+    Ok(mode)
+}
+
+/// Linux uid/gid use an unsigned 32-bit ID; all-ones is chown's "unchanged"
+/// sentinel and must not be accepted as a requested identity.
+pub(crate) fn validate_identity(value: &str) -> Result<()> {
+    if value.is_empty() || value.contains(':') || value.chars().any(char::is_control) {
+        anyhow::bail!(
+            "File identity must be a non-empty name or ID without colons or control characters"
+        );
+    }
+    if value.bytes().all(|byte| byte.is_ascii_digit())
+        && value.parse::<u32>().map_or(true, |id| id == u32::MAX)
+    {
+        anyhow::bail!("Numeric file identity must be between 0 and 4294967294");
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

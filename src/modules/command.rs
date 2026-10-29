@@ -41,6 +41,9 @@ impl ModuleExecutor for CommandModule {
                 rc: Some(0),
                 changed: false,
                 failed: false,
+                skipped: false,
+                unreachable: false,
+                uncertain: false,
                 msg:
                     "Check mode: command was not executed because it has no safe change prediction"
                         .to_string(),

@@ -135,4 +135,30 @@ docker exec "$container" sh -eu -c '
     done
     [ -z "$(find /srv/rustsible -name ".rustsible-*")" ]
 '
-printf 'SSH acceptance passed (%s -> %s): deploy, root become, app become; check, idempotency, facts/register, bytes/mode/owner, cleanup\n' "$controller_arch" "$target_arch"
+cat > "$fixture_dir/interrupted.yml" <<'EOF'
+- hosts: plain
+  gather_facts: false
+  vars:
+    ansible_host: 127.0.0.1
+    rustsible_command_timeout: 1
+  tasks:
+    - shell: printf x >> /srv/rustsible/plain/interrupted; sleep 3
+      ignore_errors: true
+- hosts: plain
+  gather_facts: false
+  vars:
+    ansible_host: 127.0.0.1
+  tasks:
+    - copy:
+        content: must-not-run
+        dest: /srv/rustsible/plain/after-interruption
+EOF
+if "$binary" playbook "$fixture_dir/interrupted.yml" -i "$fixture_dir/inventory" > "$fixture_dir/interrupted.log" 2>&1; then
+    echo 'Interrupted mutation unexpectedly succeeded' >&2; exit 1
+fi
+grep -q 'uncertain=1' "$fixture_dir/interrupted.log"
+docker exec "$container" sh -eu -c '
+    [ "$(cat /srv/rustsible/plain/interrupted)" = x ]
+    [ ! -e /srv/rustsible/plain/after-interruption ]
+'
+printf 'SSH acceptance passed (%s -> %s): deploy, root become, app become; check, idempotency, facts/register, bytes/mode/owner, cleanup, uncertain/no replay\n' "$controller_arch" "$target_arch"

@@ -455,30 +455,7 @@ fn parse_module(task_map: &Mapping, kind: TaskKind) -> Result<(String, Mapping)>
 }
 
 fn parse_module_args(module: &str, value: &Value) -> Result<(String, Mapping)> {
-    let normalized = module
-        .strip_prefix("ansible.builtin.")
-        .or_else(|| module.strip_prefix("ansible.legacy."))
-        .unwrap_or(module);
-    if !matches!(
-        normalized,
-        "command"
-            | "shell"
-            | "debug"
-            | "copy"
-            | "file"
-            | "get_url"
-            | "template"
-            | "package"
-            | "service"
-            | "setup"
-            | "stat"
-            | "systemd"
-            | "systemd_service"
-            | "lineinfile"
-            | "user"
-    ) {
-        bail!("Unsupported module: {}", module);
-    }
+    let normalized = crate::modules::registry::Builtin::lookup(module)?.name();
     let mut args = Mapping::new();
     match value {
         Value::Null => {}

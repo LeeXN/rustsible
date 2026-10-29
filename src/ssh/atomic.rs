@@ -39,24 +39,10 @@ pub(crate) fn install_command(
         .to_str()
         .context("File destination must be UTF-8")?;
     if let Some(mode) = metadata.mode {
-        if mode.is_empty()
-            || !mode.bytes().all(|byte| matches!(byte, b'0'..=b'7'))
-            || u32::from_str_radix(mode, 8).map_or(true, |mode| mode > 0o7777)
-        {
-            bail!("File mode must be an octal string between 0000 and 7777");
-        }
+        crate::modules::param::parse_mode(mode)?;
     }
-    for (kind, value) in [("owner", metadata.owner), ("group", metadata.group)] {
-        if value.is_some_and(|value| {
-            value.is_empty() || value.contains(':') || value.chars().any(char::is_control)
-        }) {
-            bail!("File {kind} must be a non-empty name or numeric ID without colons or control characters");
-        }
-        if let Some(value) = value.filter(|value| value.bytes().all(|byte| byte.is_ascii_digit())) {
-            if value.parse::<u32>().map_or(true, |id| id == u32::MAX) {
-                bail!("Numeric file {kind} must be between 0 and 4294967294");
-            }
-        }
+    for value in [metadata.owner, metadata.group].into_iter().flatten() {
+        crate::modules::param::validate_identity(value)?;
     }
     let mut command = format!(
         r#"set -eu
@@ -150,6 +136,7 @@ pub(crate) fn install(
     become_user: Option<&str>,
     metadata: FileMetadata<'_>,
 ) -> Result<()> {
+    crate::modules::result::ensure_mutation_allowed()?;
     let command = install_command(path, metadata, content.len())?;
     let (code, _, stderr) = if let Some(user) = become_user {
         connection.execute_sudo_command_with_input(&command, user, content)?
@@ -162,6 +149,7 @@ pub(crate) fn install(
             stderr.trim()
         );
     }
+    crate::modules::result::record_change();
     Ok(())
 }
 

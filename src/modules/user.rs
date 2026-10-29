@@ -34,36 +34,8 @@ struct DesiredAccount {
     system: bool,
 }
 
-const SUPPORTED_PARAMETERS: &[&str] = &[
-    "name",
-    "state",
-    "uid",
-    "gid",
-    "group",
-    "groups",
-    "append",
-    "home",
-    "shell",
-    "comment",
-    "password",
-    "create_home",
-    "system",
-    "remove",
-];
-
 fn validate_parameters(args: &Value) -> Result<()> {
-    let map = args
-        .as_mapping()
-        .context("User arguments must be a mapping")?;
-    for key in map.keys() {
-        let Value::String(key) = key else {
-            bail!("User parameter names must be strings");
-        };
-        if !SUPPORTED_PARAMETERS.contains(&key.as_str()) {
-            bail!("Unsupported user parameter: {key}");
-        }
-    }
-    Ok(())
+    crate::modules::registry::Builtin::User.validate_parameters(args)
 }
 
 fn optional<T: DeserializeOwned>(args: &Value, name: &str) -> Result<Option<T>> {
@@ -103,7 +75,10 @@ fn parse_groups(args: &Value) -> Result<Option<Vec<String>>> {
         _ => bail!("User 'groups' must be a string or a list of strings"),
     };
     for group in &groups {
-        if group.is_empty() || group.contains([',', '\n', '\r', '\0']) || group.starts_with('-') {
+        if group.is_empty()
+            || group.contains([',', ':', '\n', '\r', '\0'])
+            || group.starts_with('-')
+        {
             bail!("Invalid group name");
         }
     }
@@ -130,10 +105,17 @@ fn run_mutation(
     become_user: &str,
     operation: &str,
 ) -> Result<()> {
-    let (code, _, stderr) = run(connection, command, use_become, become_user)?;
+    crate::modules::result::ensure_mutation_allowed()?;
+    let (code, stdout, stderr) = run(connection, command, use_become, become_user)?;
     if code != 0 {
-        bail!("Failed to {operation} (exit {code}): {}", stderr.trim());
+        return Err(crate::modules::result::command_error(
+            anyhow::anyhow!("Failed to {operation} (exit {code}): {}", stderr.trim()),
+            code,
+            stdout,
+            stderr,
+        ));
     }
+    crate::modules::result::record_change();
     Ok(())
 }
 
@@ -169,12 +151,17 @@ fn account_state(
     match code {
         0 => Ok(Some(parse_passwd_line(&stdout, name)?)),
         2 => Ok(None),
-        code => bail!(
-            "Failed to query user {} (exit {}): {}",
-            name,
+        code => Err(crate::modules::result::command_error(
+            anyhow::anyhow!(
+                "Failed to query user {} (exit {}): {}",
+                name,
+                code,
+                stderr.trim()
+            ),
             code,
-            stderr.trim()
-        ),
+            stdout,
+            stderr,
+        )),
     }
 }
 
@@ -187,12 +174,17 @@ fn primary_group_name(
     let command = format!("getent group {}", quote_posix_shell_arg(&gid.to_string())?);
     let (code, stdout, stderr) = run(connection, &command, use_become, become_user)?;
     if code != 0 {
-        bail!(
-            "Failed to resolve primary group {} (exit {}): {}",
-            gid,
+        return Err(crate::modules::result::command_error(
+            anyhow::anyhow!(
+                "Failed to resolve primary group {} (exit {}): {}",
+                gid,
+                code,
+                stderr.trim()
+            ),
             code,
-            stderr.trim()
-        );
+            stdout,
+            stderr,
+        ));
     }
     stdout
         .split(':')
@@ -214,12 +206,17 @@ fn resolve_group_gid(
     let command = format!("getent group {}", quote_posix_shell_arg(group)?);
     let (code, stdout, stderr) = run(connection, &command, use_become, become_user)?;
     if code != 0 {
-        bail!(
-            "Failed to resolve primary group '{}' (exit {}): {}",
-            group,
+        return Err(crate::modules::result::command_error(
+            anyhow::anyhow!(
+                "Failed to resolve primary group '{}' (exit {}): {}",
+                group,
+                code,
+                stderr.trim()
+            ),
             code,
-            stderr.trim()
-        );
+            stdout,
+            stderr,
+        ));
     }
     let fields = stdout
         .trim_end_matches(['\r', '\n'])
@@ -243,12 +240,17 @@ fn supplementary_groups(
     let command = format!("id -nG -- {}", quote_posix_shell_arg(name)?);
     let (code, stdout, stderr) = run(connection, &command, use_become, become_user)?;
     if code != 0 {
-        bail!(
-            "Failed to query groups for {} (exit {}): {}",
-            name,
+        return Err(crate::modules::result::command_error(
+            anyhow::anyhow!(
+                "Failed to query groups for {} (exit {}): {}",
+                name,
+                code,
+                stderr.trim()
+            ),
             code,
-            stderr.trim()
-        );
+            stdout,
+            stderr,
+        ));
     }
     let primary = primary_group_name(connection, primary_gid, use_become, become_user)?;
     let mut groups = stdout
@@ -268,12 +270,12 @@ fn shadow_hash(
     let command = format!("getent shadow {}", quote_posix_shell_arg(name)?);
     let (code, stdout, stderr) = run(connection, &command, use_become, become_user)?;
     if code != 0 {
-        bail!(
+        return Err(crate::modules::result::command_error(anyhow::anyhow!(
             "Cannot compare the password hash for user {} (exit {}): {}. Use become with an account allowed to read the shadow database",
             name,
             code,
             stderr.trim()
-        );
+        ), code, stdout, stderr));
     }
     let mut fields = stdout.trim_end_matches(['\r', '\n']).split(':');
     let returned_name = fields.next().unwrap_or_default();
@@ -373,6 +375,9 @@ fn create_command(
             command.extend([flag.to_string(), quote_posix_shell_arg(value)?]);
         }
     }
+    if let Some(groups) = &desired.groups {
+        command.extend(group_arguments(groups, false)?);
+    }
     command.push(
         if desired.create_home {
             "--create-home"
@@ -388,18 +393,13 @@ fn create_command(
     Ok(command.join(" "))
 }
 
-fn groups_command(name: &str, groups: &[String], append: bool) -> Result<String> {
-    let mut command = vec!["usermod".to_string()];
+fn group_arguments(groups: &[String], append: bool) -> Result<Vec<String>> {
+    let mut arguments = Vec::new();
     if append {
-        command.push("--append".to_string());
+        arguments.push("--append".into());
     }
-    command.extend([
-        "--groups".to_string(),
-        quote_posix_shell_arg(&groups.join(","))?,
-        "--".to_string(),
-        quote_posix_shell_arg(name)?,
-    ]);
-    Ok(command.join(" "))
+    arguments.extend(["--groups".into(), quote_posix_shell_arg(&groups.join(","))?]);
+    Ok(arguments)
 }
 
 fn chpasswd_record(name: &str, password_hash: &str) -> Result<Vec<u8>> {
@@ -418,15 +418,22 @@ fn set_password(
     use_become: bool,
     become_user: &str,
 ) -> Result<()> {
+    crate::modules::result::ensure_mutation_allowed()?;
     let record = chpasswd_record(name, password)?;
-    let (code, _, stderr) = if use_become {
+    let (code, stdout, stderr) = if use_become {
         connection.execute_sudo_command_with_input("chpasswd -e", become_user, &record)?
     } else {
         connection.execute_command_with_input("chpasswd -e", &record)?
     };
     if code != 0 {
-        bail!("Failed to set password for {}: {}", name, stderr.trim());
+        return Err(crate::modules::result::command_error(
+            anyhow::anyhow!("Failed to set password for {}: {}", name, stderr.trim()),
+            code,
+            stdout,
+            stderr,
+        ));
     }
+    crate::modules::result::record_change();
     Ok(())
 }
 
@@ -466,6 +473,9 @@ pub fn execute(
         system: optional::<bool>(args, "system")?.unwrap_or(false),
     };
 
+    if let Some(password) = desired.password.as_deref() {
+        chpasswd_record(&name, password)?;
+    }
     info!("Managing a user account");
     let current = account_state(connection, &name, use_become, become_user)?;
     if state == "absent" {
@@ -484,6 +494,9 @@ pub fn execute(
             rc: None,
             changed,
             failed: false,
+            skipped: false,
+            unreachable: false,
+            uncertain: false,
             msg: if changed {
                 format!(
                     "User {} {}",
@@ -515,7 +528,7 @@ pub fn execute(
         None => desired.gid,
     };
     let creating = current.is_none();
-    let attribute_arguments = current
+    let mut attribute_arguments = current
         .as_ref()
         .map(|current| {
             attribute_changes(
@@ -545,6 +558,16 @@ pub fn execute(
     };
     let changed = creating || !attribute_arguments.is_empty() || groups_changed || password_changed;
 
+    if !creating && groups_changed {
+        attribute_arguments.extend(group_arguments(
+            desired
+                .groups
+                .as_deref()
+                .context("Missing user group plan")?,
+            desired.append,
+        )?);
+    }
+
     if changed && !check_mode {
         if creating {
             let command = create_command(&name, &desired, primary_group_argument.as_deref())?;
@@ -556,20 +579,6 @@ pub fn execute(
                 quote_posix_shell_arg(&name)?
             );
             run_mutation(connection, &command, use_become, become_user, "modify user")?;
-        }
-        if groups_changed {
-            let groups = desired
-                .groups
-                .as_deref()
-                .context("Internal user group plan error")?;
-            let command = groups_command(&name, groups, desired.append)?;
-            run_mutation(
-                connection,
-                &command,
-                use_become,
-                become_user,
-                "change user groups",
-            )?;
         }
         if password_changed {
             set_password(
@@ -591,6 +600,9 @@ pub fn execute(
         rc: None,
         changed,
         failed: false,
+        skipped: false,
+        unreachable: false,
+        uncertain: false,
         msg: if changed {
             format!(
                 "User {} {}",
@@ -688,6 +700,18 @@ mod tests {
             &["wheel".to_string(), "adm".to_string()],
             false
         ));
+    }
+
+    #[test]
+    fn malformed_password_never_creates_or_updates_an_account() {
+        let mut connection = MockSshConnection::new();
+        connection
+            .expect_execute_command()
+            .withf(|command| command.starts_with("getent passwd"))
+            .times(0..=1)
+            .returning(|_| Ok((2, String::new(), String::new())));
+        let args = serde_yaml::from_str("name: alice\npassword: \"hash\\nroot:hash\"").unwrap();
+        assert!(execute(&connection, &args, false, "root", false).is_err());
     }
 
     #[test]
@@ -809,7 +833,12 @@ mod tests {
             assert!(create.contains(fragment), "missing {fragment}: {create}");
         }
         assert_eq!(
-            groups_command("alice", desired_config.groups.as_deref().unwrap(), true).unwrap(),
+            format!(
+                "usermod {} -- 'alice'",
+                group_arguments(desired_config.groups.as_deref().unwrap(), true)
+                    .unwrap()
+                    .join(" ")
+            ),
             "usermod --append --groups 'adm,wheel' -- 'alice'"
         );
 
@@ -876,13 +905,14 @@ mod tests {
         let mut connection = MockSshConnection::new();
         connection
             .expect_execute_sudo_command()
-            .times(3)
+            .times(2)
             .returning(|command, user| {
                 assert_eq!(user, "root");
                 if command.starts_with("getent passwd") {
                     Ok((2, String::new(), String::new()))
                 } else {
-                    assert!(command.starts_with("useradd") || command.starts_with("usermod"));
+                    assert!(command.starts_with("useradd"));
+                    assert!(command.contains("--groups 'adm'"));
                     Ok((0, String::new(), String::new()))
                 }
             });

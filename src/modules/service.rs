@@ -4,7 +4,6 @@ use serde_yaml::Value;
 
 use crate::inventory::Host;
 use crate::modules::file::quote_posix_shell_arg;
-use crate::modules::param::validate_params;
 use crate::modules::ModuleResult;
 use crate::ssh::connection::{Connection, SshConnection};
 
@@ -70,17 +69,24 @@ fn detect_init_system(connection: &dyn SshConnection) -> Result<InitSystem> {
         ("command -v -- service >/dev/null 2>&1", InitSystem::SysV),
     ];
     for (command, system) in checks {
-        let (code, _, stderr) = connection
+        let (code, stdout, stderr) = connection
             .execute_command(command)
             .context("Failed while detecting the init system")?;
         match code {
             0 => return Ok(system),
             1 | 127 => {}
-            code => bail!(
-                "Failed while detecting the init system (exit {}): {}",
-                code,
-                stderr.trim()
-            ),
+            code => {
+                return Err(crate::modules::result::command_error(
+                    anyhow::anyhow!(
+                        "Failed while detecting the init system (exit {}): {}",
+                        code,
+                        stderr.trim()
+                    ),
+                    code,
+                    stdout,
+                    stderr,
+                ))
+            }
         }
     }
     bail!("No supported init system was detected")
@@ -104,28 +110,43 @@ fn active_state(
         InitSystem::Systemd => match code {
             0 => Ok(true),
             3 => Ok(false),
-            code => bail!(
-                "Failed to query service state (exit {}): {}",
+            code => Err(crate::modules::result::command_error(
+                anyhow::anyhow!(
+                    "Failed to query service state (exit {}): {}",
+                    code,
+                    stderr.trim()
+                ),
                 code,
-                stderr.trim()
-            ),
+                stdout,
+                stderr,
+            )),
         },
         InitSystem::SysV => match code {
             0 => Ok(true),
             1 | 3 => Ok(false),
-            code => bail!(
-                "Failed to query service state (exit {}): {}",
-                code,
-                stderr.trim()
-            ),
-        },
-        InitSystem::Upstart => {
-            if code != 0 {
-                bail!(
+            code => Err(crate::modules::result::command_error(
+                anyhow::anyhow!(
                     "Failed to query service state (exit {}): {}",
                     code,
                     stderr.trim()
-                );
+                ),
+                code,
+                stdout,
+                stderr,
+            )),
+        },
+        InitSystem::Upstart => {
+            if code != 0 {
+                return Err(crate::modules::result::command_error(
+                    anyhow::anyhow!(
+                        "Failed to query service state (exit {}): {}",
+                        code,
+                        stderr.trim()
+                    ),
+                    code,
+                    stdout,
+                    stderr,
+                ));
             }
             if stdout.contains("start/running") {
                 Ok(true)
@@ -156,15 +177,20 @@ fn enabled_state(
         (0, "enabled" | "enabled-runtime" | "linked" | "linked-runtime" | "alias") => Ok(true),
         (0, "static" | "indirect" | "generated" | "transient") => Ok(false),
         (1, "disabled" | "masked" | "masked-runtime" | "static" | "indirect") => Ok(false),
-        _ => bail!(
-            "Failed to query whether the service is enabled (exit {}): {}",
+        _ => Err(crate::modules::result::command_error(
+            anyhow::anyhow!(
+                "Failed to query whether the service is enabled (exit {}): {}",
+                code,
+                if stderr.trim().is_empty() {
+                    state
+                } else {
+                    stderr.trim()
+                }
+            ),
             code,
-            if stderr.trim().is_empty() {
-                state
-            } else {
-                stderr.trim()
-            }
-        ),
+            stdout,
+            stderr,
+        )),
     }
 }
 
@@ -211,7 +237,7 @@ pub fn execute(
     become_user: &str,
     check_mode: bool,
 ) -> Result<ModuleResult> {
-    validate_params(args, &["name", "state", "enabled"])?;
+    crate::modules::registry::Builtin::Service.validate_parameters(args)?;
     let map = args
         .as_mapping()
         .context("Service module requires a mapping of arguments")?;
@@ -251,6 +277,7 @@ pub fn execute(
 
     if !check_mode {
         if enable_change {
+            crate::modules::result::ensure_mutation_allowed()?;
             let desired = enabled.context("Internal service enablement plan error")?;
             let name_arg = quote_posix_shell_arg(name)?;
             let command = format!(
@@ -258,21 +285,34 @@ pub fn execute(
                 if desired { "enable" } else { "disable" },
                 name_arg
             );
-            let (code, _, stderr) = run(connection, &command, use_become, become_user)?;
+            let (code, stdout, stderr) = run(connection, &command, use_become, become_user)?;
             if code != 0 {
-                bail!("Failed to change service enablement: {}", stderr.trim());
+                return Err(crate::modules::result::command_error(
+                    anyhow::anyhow!("Failed to change service enablement: {}", stderr.trim()),
+                    code,
+                    stdout,
+                    stderr,
+                ));
             }
+            crate::modules::result::record_change();
         }
         if plan.state_change {
+            crate::modules::result::ensure_mutation_allowed()?;
             let command = state_command(
                 init,
                 name,
                 state.context("Internal service state plan error")?,
             )?;
-            let (code, _, stderr) = run(connection, &command, use_become, become_user)?;
+            let (code, stdout, stderr) = run(connection, &command, use_become, become_user)?;
             if code != 0 {
-                bail!("Failed to change service state: {}", stderr.trim());
+                return Err(crate::modules::result::command_error(
+                    anyhow::anyhow!("Failed to change service state: {}", stderr.trim()),
+                    code,
+                    stdout,
+                    stderr,
+                ));
             }
+            crate::modules::result::record_change();
         }
     }
 
@@ -282,6 +322,9 @@ pub fn execute(
         rc: None,
         changed: plan.changed(),
         failed: false,
+        skipped: false,
+        unreachable: false,
+        uncertain: false,
         msg: if plan.changed() {
             format!(
                 "Service {} {}",
@@ -306,7 +349,7 @@ pub fn execute_systemd(
     become_user: &str,
     check_mode: bool,
 ) -> Result<ModuleResult> {
-    validate_params(args, &["name", "state", "enabled", "daemon_reload"])?;
+    crate::modules::registry::Builtin::Systemd.validate_parameters(args)?;
     let daemon_reload = args
         .as_mapping()
         .and_then(|mapping| mapping.get(Value::String("daemon_reload".to_string())))
@@ -326,15 +369,22 @@ pub fn execute_systemd(
         ),
     }
     if daemon_reload && !check_mode {
-        let (code, _, stderr) = run(
+        crate::modules::result::ensure_mutation_allowed()?;
+        let (code, stdout, stderr) = run(
             connection,
             "systemctl daemon-reload",
             use_become,
             become_user,
         )?;
         if code != 0 {
-            bail!("Failed to reload the systemd manager: {}", stderr.trim());
+            return Err(crate::modules::result::command_error(
+                anyhow::anyhow!("Failed to reload the systemd manager: {}", stderr.trim()),
+                code,
+                stdout,
+                stderr,
+            ));
         }
+        crate::modules::result::record_change();
     }
 
     let mut service_args = args
@@ -342,13 +392,32 @@ pub fn execute_systemd(
         .cloned()
         .context("Systemd module requires a mapping of arguments")?;
     service_args.remove(Value::String("daemon_reload".to_string()));
-    let mut result = execute(
-        connection,
-        &Value::Mapping(service_args),
-        use_become,
-        become_user,
-        check_mode,
-    )?;
+    let mut result = if service_args.contains_key(Value::String("state".into()))
+        || service_args.contains_key(Value::String("enabled".into()))
+    {
+        match execute(
+            connection,
+            &Value::Mapping(service_args),
+            use_become,
+            become_user,
+            check_mode,
+        ) {
+            Ok(result) => result,
+            Err(error) => {
+                let mut result = ModuleResult::from_error(error, !check_mode);
+                result.changed |= daemon_reload && !check_mode;
+                if result.changed {
+                    result.msg = format!("systemd daemon reloaded; {}", result.msg);
+                }
+                return Ok(result);
+            }
+        }
+    } else {
+        ModuleResult {
+            msg: "Systemd manager inspected".into(),
+            ..ModuleResult::default()
+        }
+    };
     result.changed |= daemon_reload;
     if daemon_reload && !result.msg.contains("daemon") {
         result.msg.push_str(if check_mode {
@@ -400,6 +469,52 @@ pub fn execute_systemd_adhoc(
 mod tests {
     use super::*;
     use crate::ssh::connection::MockSshConnection;
+
+    #[test]
+    fn invalid_systemd_parameters_never_reload_the_manager() {
+        for input in [
+            "name: demo\nstate: invalid\ndaemon_reload: true",
+            "name: demo\nenabled: invalid\ndaemon_reload: true",
+            "name: ''\nstate: started\ndaemon_reload: true",
+        ] {
+            let mut connection = MockSshConnection::new();
+            connection
+                .expect_execute_command()
+                .withf(|command| command.contains("/run/systemd/system"))
+                .times(0..=1)
+                .returning(|_| Ok((0, String::new(), String::new())));
+            let args = serde_yaml::from_str(input).unwrap();
+            assert!(execute_systemd(&connection, &args, false, "root", false).is_err());
+        }
+    }
+
+    #[test]
+    fn reload_only_and_partial_failure_preserve_confirmed_changes() {
+        let mut connection = MockSshConnection::new();
+        connection.expect_execute_command().returning(|command| {
+            if command.contains("/run/systemd/system") || command == "systemctl daemon-reload" {
+                Ok((0, String::new(), String::new()))
+            } else if command.starts_with("systemctl is-active") {
+                Ok((3, String::new(), String::new()))
+            } else {
+                assert!(command.starts_with("systemctl start"));
+                Ok((7, "available output".into(), "start failed".into()))
+            }
+        });
+        let reload = serde_yaml::from_str("daemon_reload: true").unwrap();
+        assert!(
+            execute_systemd(&connection, &reload, false, "root", false)
+                .unwrap()
+                .changed
+        );
+        let _scope = crate::modules::result::ChangeScope::enter(false);
+        let args = serde_yaml::from_str("name: demo\nstate: started\ndaemon_reload: true").unwrap();
+        let result = execute_systemd(&connection, &args, false, "root", false).unwrap();
+        assert!(result.changed && result.failed);
+        assert_eq!(result.rc, Some(7));
+        assert_eq!(result.stdout, "available output");
+        assert_eq!(result.stderr, "start failed");
+    }
 
     #[test]
     fn started_and_stopped_are_idempotent() {

@@ -3,7 +3,6 @@ use log::debug;
 use serde_yaml::Value;
 
 use crate::inventory::Host;
-use crate::modules::param::validate_params;
 use crate::modules::ModuleResult;
 use crate::ssh::connection::SshConnection;
 
@@ -22,7 +21,7 @@ pub fn execute(
 /// Debug is a controller-side action and must not require an SSH connection
 /// merely to display an already-resolved value.
 pub fn execute_without_connection(args: &Value) -> Result<ModuleResult> {
-    validate_params(args, &["msg", "var", "_var_value"])?;
+    crate::modules::registry::Builtin::Debug.validate_parameters(args)?;
     debug!("Executing debug module");
 
     match args {
@@ -38,6 +37,9 @@ pub fn execute_without_connection(args: &Value) -> Result<ModuleResult> {
                         rc: None,
                         changed: false,
                         failed: false,
+                        skipped: false,
+                        unreachable: false,
+                        uncertain: false,
                         msg: msg.clone(),
                         values: Default::default(),
                     });
@@ -49,6 +51,9 @@ pub fn execute_without_connection(args: &Value) -> Result<ModuleResult> {
                         rc: None,
                         changed: false,
                         failed: false,
+                        skipped: false,
+                        unreachable: false,
+                        uncertain: false,
                         msg: msg_str.clone(),
                         values: Default::default(),
                     });
@@ -74,6 +79,9 @@ pub fn execute_without_connection(args: &Value) -> Result<ModuleResult> {
                         rc: None,
                         changed: false,
                         failed: false,
+                        skipped: false,
+                        unreachable: false,
+                        uncertain: false,
                         msg: format!("{} = {}", var_name, value_str),
                         values: Default::default(),
                     })
@@ -86,6 +94,9 @@ pub fn execute_without_connection(args: &Value) -> Result<ModuleResult> {
                         rc: None,
                         changed: false,
                         failed: false,
+                        skipped: false,
+                        unreachable: false,
+                        uncertain: false,
                         msg: rendered_string.clone(),
                         values: Default::default(),
                     })
@@ -99,6 +110,9 @@ pub fn execute_without_connection(args: &Value) -> Result<ModuleResult> {
                         rc: None,
                         changed: false,
                         failed: false,
+                        skipped: false,
+                        unreachable: false,
+                        uncertain: false,
                         msg: var_content_str.clone(),
                         values: Default::default(),
                     })

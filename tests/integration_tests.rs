@@ -647,3 +647,87 @@ fn ad_hoc_invalid_json_fails_before_opening_a_connection() -> Result<()> {
     assert!(String::from_utf8(output.stderr)?.contains("Invalid JSON module arguments"));
     Ok(())
 }
+
+#[test]
+fn interrupted_mutation_is_uncertain_not_ignored_or_replayed() -> Result<()> {
+    let directory = TempDir::new()?;
+    let marker = directory.path().join("executed");
+    let later = directory.path().join("must-not-exist");
+    let inventory =
+        fixture_file("[all]\nlocalhost ansible_connection=local rustsible_command_timeout=1\n");
+    let playbook = fixture_file(&format!(
+        r#"- hosts: all
+  gather_facts: false
+  tasks:
+    - shell: printf '{{{{ item }}}}' >> {}; printf private-timeout-payload >&2; sleep 3
+      loop: [first, second]
+      ignore_errors: true
+      no_log: true
+- hosts: all
+  gather_facts: false
+  tasks:
+    - command: touch {}
+"#,
+        marker.display(),
+        later.display()
+    ));
+    let output = Command::new(env!("CARGO_BIN_EXE_rustsible"))
+        .args([
+            "playbook",
+            playbook.path().to_str().unwrap(),
+            "-i",
+            inventory.path().to_str().unwrap(),
+            "-vv",
+        ])
+        .output()?;
+    assert!(!output.status.success());
+    let stdout = String::from_utf8(output.stdout)?;
+    let stderr = String::from_utf8(output.stderr)?;
+    assert!(stdout.contains("uncertain=1"), "{stdout}");
+    assert!(!stdout.contains("private-timeout-payload"));
+    assert!(!stderr.contains("private-timeout-payload"));
+    assert_eq!(std::fs::read(marker)?, b"first");
+    assert!(!later.exists());
+    Ok(())
+}
+
+#[test]
+fn both_frontends_reject_unknown_arguments_even_in_check_mode() -> Result<()> {
+    let inventory =
+        fixture_file("[all]\nnode ansible_connection=ssh ansible_host=must-not-connect.invalid\n");
+    let playbook = fixture_file("- hosts: all\n  gather_facts: false\n  tasks:\n    - ansible.builtin.command:\n        cmd: echo x\n        unknown: true\n");
+    let binary = env!("CARGO_BIN_EXE_rustsible");
+    let adhoc = Command::new(binary)
+        .args([
+            "ad-hoc",
+            "all",
+            "-i",
+            inventory.path().to_str().unwrap(),
+            "-m",
+            "ansible.builtin.command",
+            "-a",
+            r#"{"cmd":"echo x","unknown":true}"#,
+            "--check",
+        ])
+        .output()?;
+    let book = Command::new(binary)
+        .args([
+            "playbook",
+            playbook.path().to_str().unwrap(),
+            "-i",
+            inventory.path().to_str().unwrap(),
+            "--check",
+        ])
+        .output()?;
+    for output in [adhoc, book] {
+        assert!(!output.status.success());
+        let text = format!(
+            "{}{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(text.contains("only the 'cmd' parameter"), "{text}");
+        assert!(!text.contains("Failed to connect"));
+    }
+    Ok(())
+}

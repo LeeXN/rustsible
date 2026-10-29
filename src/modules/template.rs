@@ -8,7 +8,7 @@ use std::path::Path;
 
 use crate::inventory::Host;
 use crate::modules::file::{inspect_path, plan_metadata_changes, PathKind};
-use crate::modules::param::{get_optional_param, get_param, validate_params};
+use crate::modules::param::{get_optional_param, get_param};
 use crate::modules::ModuleResult;
 use crate::playbook::templar;
 use crate::ssh::atomic::{install, FileMetadata};
@@ -40,10 +40,7 @@ pub(crate) fn execute_with_context(
     check_mode: bool,
     data: &HashMap<String, Value>,
 ) -> Result<ModuleResult> {
-    validate_params(
-        template_args,
-        &["src", "content", "dest", "mode", "owner", "group", "vars"],
-    )?;
+    crate::modules::registry::Builtin::Template.validate_parameters(template_args)?;
     let dest = get_param::<String>(template_args, "dest")?;
     if dest.is_empty() {
         return Err(anyhow::anyhow!("Template destination cannot be empty"));
@@ -163,6 +160,9 @@ pub(crate) fn execute_with_context(
         rc: None,
         changed,
         failed: false,
+        skipped: false,
+        unreachable: false,
+        uncertain: false,
         msg: if changed {
             format!("Template applied to {}", dest)
         } else {

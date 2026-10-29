@@ -1,4 +1,4 @@
-use anyhow::{bail, Context, Result};
+use anyhow::{Context, Result};
 use serde_yaml::Mapping;
 
 use crate::modules::file::quote_posix_shell_arg;
@@ -28,22 +28,32 @@ pub(crate) fn execute_json_mapping(
     } else {
         connection.execute_command_with_input(&command, script.as_bytes())?
     };
-    if code == 127 {
-        bail!("Python 3 is required on the managed host");
-    }
     if code != 0 {
-        bail!(
-            "Remote Python module failed (exit {}): {}",
-            code,
-            stderr.trim()
-        );
+        let error = if code == 127 {
+            anyhow::anyhow!("Python 3 is required on the managed host")
+        } else {
+            anyhow::anyhow!(
+                "Remote Python module failed (exit {code}): {}",
+                stderr.trim()
+            )
+        };
+        return Err(crate::modules::result::command_error(
+            error, code, stdout, stderr,
+        ));
     }
 
-    let value: serde_json::Value =
-        serde_json::from_str(&stdout).context("Remote Python module returned invalid JSON")?;
-    let value = serde_yaml::to_value(value).context("Failed to decode remote module result")?;
-    value
-        .as_mapping()
-        .cloned()
-        .context("Remote Python module result must be an object")
+    let decode = (|| {
+        let value: serde_json::Value =
+            serde_json::from_str(&stdout).context("Remote Python module returned invalid JSON")?;
+        let value = serde_yaml::to_value(value).context("Failed to decode remote module result")?;
+        value
+            .as_mapping()
+            .cloned()
+            .context("Remote Python module result must be an object")
+    })();
+    decode.map_err(|error| {
+        crate::ssh::connection::result_unavailable(crate::modules::result::command_error(
+            error, code, stdout, stderr,
+        ))
+    })
 }
