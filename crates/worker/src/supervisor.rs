@@ -6,7 +6,10 @@ use rustsible_protocol::{decode, write_frame, ModuleResult, Response, MAX_RESPON
 use std::{
     fs::{self, File},
     io::{self, Read},
-    os::fd::{AsRawFd, FromRawFd},
+    os::{
+        fd::{AsRawFd, FromRawFd},
+        unix::net::UnixDatagram,
+    },
     sync::atomic::{AtomicBool, Ordering},
     time::{Duration, Instant},
 };
@@ -68,6 +71,8 @@ pub fn run(
     } else {
         builder.tempdir()?
     };
+    let (staging_parent, staging_child) = UnixDatagram::pair()?;
+    let mut staging = crate::staging::Registry::new();
     let parent = unsafe { libc::getpid() };
     let mut descriptors = [0; 2];
     // SAFETY: descriptors points to storage for exactly two descriptors.
@@ -96,6 +101,8 @@ pub fn run(
                 libc::_exit(125);
             }
         }
+        drop(staging_parent);
+        crate::staging::configure(staging_child.as_raw_fd());
         // Module tools must not consume the control/cancellation channel.
         let null = File::open("/dev/null");
         if let Ok(null) = null {
@@ -126,6 +133,7 @@ pub fn run(
         libc::close(descriptors[1]);
         libc::setpgid(child, child);
     }
+    drop(staging_child);
     let mut pipe = unsafe { File::from_raw_fd(descriptors[0]) };
     let flags = unsafe { libc::fcntl(pipe.as_raw_fd(), libc::F_GETFL) };
     if flags < 0
@@ -157,6 +165,11 @@ pub fn run(
                     revents: 0,
                 },
                 libc::pollfd {
+                    fd: staging_parent.as_raw_fd(),
+                    events: libc::POLLIN,
+                    revents: 0,
+                },
+                libc::pollfd {
                     fd: 0,
                     events: libc::POLLIN,
                     revents: 0,
@@ -169,6 +182,9 @@ pub fn run(
                     continue;
                 }
                 return Err(error).context("Cannot monitor worker execution");
+            }
+            if poll[1].revents & libc::POLLIN != 0 {
+                staging.serve(&staging_parent)?;
             }
             if poll[0].revents != 0 {
                 let mut chunk = [0; 64 * 1024];
@@ -193,7 +209,7 @@ pub fn run(
                     }
                 }
             }
-            if poll[1].revents != 0 {
+            if poll[2].revents != 0 {
                 return Ok(cancelled(
                     may_modify,
                     "Worker cancelled: control channel closed or received unexpected input",
@@ -204,6 +220,7 @@ pub fn run(
     // Cleanup is mandatory after both success and failure: synchronous shell
     // tools may otherwise leave background descendants even after returning.
     terminate_tree(child)?;
+    staging.cleanup()?;
     result
 }
 fn cancelled(may_modify: bool, message: &str) -> Supervised {

@@ -749,3 +749,32 @@ fn both_frontends_reject_unknown_arguments_even_in_check_mode() -> Result<()> {
     }
     Ok(())
 }
+
+#[test]
+fn native_copy_inline_content_keeps_nul_and_literal_template_bytes() -> Result<()> {
+    let temporary = TempDir::new()?;
+    let inventory = local_inventory();
+    let path = temporary.path().join("binary");
+    let content = "literal {{ do_not_evaluate }}\0data";
+    let args = serde_json::json!({"dest":path,"content":content,"mode":"0600"}).to_string();
+    let output = controller()
+        .args([
+            "ad-hoc",
+            "localhost",
+            "-i",
+            inventory.path().to_str().unwrap(),
+            "-m",
+            "copy",
+            "-a",
+            &args,
+        ])
+        .output()?;
+    assert!(
+        output.status.success(),
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(std::fs::read(path)?, content.as_bytes());
+    Ok(())
+}

@@ -1,5 +1,10 @@
+mod files;
+mod filesystem;
+mod http;
+mod lines;
 mod modules;
 mod process;
+mod staging;
 mod supervisor;
 use anyhow::{bail, Result};
 use rustsible_protocol::{
@@ -8,7 +13,7 @@ use rustsible_protocol::{
 };
 use std::{
     fs,
-    io::{self, Read},
+    io::{self, Read, Write},
     os::{
         fd::FromRawFd,
         unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt},
@@ -106,11 +111,53 @@ fn run() -> Result<()> {
             )?;
             return Ok(());
         }
+        let payload = if let Some(payload) = &request.payload {
+            let executable = std::env::current_exe()?;
+            let mut builder = tempfile::Builder::new();
+            builder.prefix(".rustsible-payload-");
+            let prepared = if request.managed {
+                builder.tempfile_in(
+                    executable
+                        .parent()
+                        .ok_or_else(|| anyhow::anyhow!("Worker has no parent"))?,
+                )
+            } else {
+                builder.tempfile()
+            };
+            let mut file = match prepared {
+                Ok(file) => file,
+                Err(error) => {
+                    rustsible_protocol::write_frame(
+                        &mut output,
+                        &Response::new(ModuleResult {
+                            failed: true,
+                            msg: format!("Cannot prepare private input staging: {error}"),
+                            ..ModuleResult::default()
+                        }),
+                        MAX_RESPONSE_BYTES,
+                    )?;
+                    return Ok(());
+                }
+            };
+            rustsible_protocol::write_frame(
+                &mut output,
+                &rustsible_protocol::PayloadReady::new(),
+                MAX_RESPONSE_BYTES,
+            )?;
+            let received = receive_payload(&mut input, file.as_file_mut(), payload);
+            if let Err(error) = received {
+                rustsible_protocol::write_frame(&mut output, &Response::new(ModuleResult { failed: true, msg: format!("Cannot stage complete file input; business files were not modified: {error}"), ..ModuleResult::default() }), MAX_RESPONSE_BYTES)?;
+                return Ok(());
+            }
+            Some(file)
+        } else {
+            None
+        };
         let execution = supervisor::run(
             Duration::from_millis(request.timeout_ms),
             request.managed,
-            matches!(request.module.as_str(), "command" | "shell") && !request.check,
-            |scratch| modules::execute(&request, scratch),
+            !matches!(request.module.as_str(), "setup" | "stat") && !request.check,
+            |scratch| modules::execute(&request, scratch, payload.as_ref().map(|file| file.path())),
         )?;
         rustsible_protocol::write_frame(
             &mut output,
@@ -201,4 +248,29 @@ impl Read for Input {
             }
         }
     }
+}
+
+fn receive_payload(
+    input: &mut impl Read,
+    file: &mut fs::File,
+    payload: &rustsible_protocol::Payload,
+) -> Result<()> {
+    use sha2::Digest;
+    let mut remaining = payload.size;
+    let mut digest = sha2::Sha256::new();
+    let mut buffer = [0; 65536];
+    while remaining != 0 {
+        let length = remaining.min(buffer.len() as u64) as usize;
+        let read = input.read(&mut buffer[..length])?;
+        if read == 0 {
+            bail!("Incomplete file payload");
+        }
+        file.write_all(&buffer[..read])?;
+        digest.update(&buffer[..read]);
+        remaining -= read as u64;
+    }
+    if format!("{:x}", digest.finalize()) != payload.sha256.to_ascii_lowercase() {
+        bail!("Payload SHA-256 mismatch");
+    }
+    Ok(())
 }

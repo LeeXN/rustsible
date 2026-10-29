@@ -8,17 +8,30 @@ use std::{
     os::unix::fs::{MetadataExt, OpenOptionsExt},
 };
 
-pub fn execute(request: &Request, scratch: &std::path::Path) -> ModuleResult {
-    match run(request, scratch) {
-        Ok(result) => result,
+pub fn execute(
+    request: &Request,
+    scratch: &std::path::Path,
+    payload: Option<&std::path::Path>,
+) -> ModuleResult {
+    let _changes = rustsible_protocol::change::ChangeScope::enter(request.check);
+    match run(request, scratch, payload) {
+        Ok(mut result) => {
+            result.changed |= rustsible_protocol::change::known_changed();
+            result
+        }
         Err(error) => ModuleResult {
             failed: true,
+            changed: rustsible_protocol::change::known_changed(),
             msg: format!("{error:#}"),
             ..ModuleResult::default()
         },
     }
 }
-fn run(request: &Request, scratch: &std::path::Path) -> Result<ModuleResult> {
+fn run(
+    request: &Request,
+    scratch: &std::path::Path,
+    payload: Option<&std::path::Path>,
+) -> Result<ModuleResult> {
     let args = request
         .args
         .as_mapping()
@@ -44,6 +57,19 @@ fn run(request: &Request, scratch: &std::path::Path) -> Result<ModuleResult> {
             });
         }
         return crate::process::execute(command, request.module == "shell", scratch);
+    }
+    match request.module.as_str() {
+        "copy" | "template" => {
+            return crate::files::copy(
+                &request.args,
+                payload.context("Missing streamed content")?,
+                request.check,
+            )
+        }
+        "get_url" => return crate::http::get_url(request),
+        "file" => return crate::files::file(&request.args, request.check),
+        "lineinfile" => return crate::files::lineinfile(&request.args, request.check),
+        _ => {}
     }
     let allowed = match request.module.as_str() {
         "setup" => &[][..],
@@ -134,7 +160,7 @@ fn run(request: &Request, scratch: &std::path::Path) -> Result<ModuleResult> {
     }
     Ok(result)
 }
-fn hash(file: &mut File, algorithm: &str) -> Result<String> {
+pub(crate) fn hash(file: &mut File, algorithm: &str) -> Result<String> {
     fn calculate<D: Digest>(file: &mut File) -> Result<String> {
         let mut digest = D::new();
         let mut buffer = [0; 64 * 1024];

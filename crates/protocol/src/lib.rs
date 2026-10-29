@@ -1,6 +1,8 @@
 //! Versioned, bounded stdin/stdout messages shared by controller, workers and
 //! native executable extensions. No transport or playbook implementation lives here.
 mod args;
+pub mod change;
+pub mod param;
 mod result;
 use anyhow::{bail, Context, Result};
 pub use args::tokenize_args;
@@ -9,12 +11,22 @@ use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::io::{Read, Write};
 
-pub const VERSION: u32 = 1;
+pub const VERSION: u32 = 2;
 pub const BUILD_ID: &str = env!("RUSTSIBLE_BUILD_ID");
 pub const MAX_REQUEST_BYTES: usize = 16 * 1024 * 1024;
 // JSON escaping can expand a bounded 16 MiB command response sixfold.
 pub const MAX_RESPONSE_BYTES: usize = 128 * 1024 * 1024;
-pub const NATIVE_MODULES: &[&str] = &["setup", "stat", "command", "shell"];
+pub const NATIVE_MODULES: &[&str] = &[
+    "setup",
+    "stat",
+    "command",
+    "shell",
+    "copy",
+    "template",
+    "file",
+    "lineinfile",
+    "get_url",
+];
 
 #[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -26,6 +38,7 @@ pub struct Request {
     pub check: bool,
     pub timeout_ms: u64,
     pub managed: bool,
+    pub payload: Option<Payload>,
 }
 impl Request {
     pub fn new(module: &str, args: serde_yaml::Value, check: bool, timeout_ms: u64) -> Self {
@@ -37,6 +50,7 @@ impl Request {
             check,
             timeout_ms,
             managed: true,
+            payload: None,
         }
     }
     pub fn validate(&self) -> Result<()> {
@@ -52,8 +66,59 @@ impl Request {
         if !NATIVE_MODULES.contains(&self.module.as_str()) {
             bail!("Unsupported native module: {}", self.module);
         }
+        if matches!(self.module.as_str(), "copy" | "template") != self.payload.is_some() {
+            bail!("Only copy/template requests require a streamed payload");
+        }
+        if let Some(payload) = &self.payload {
+            if payload.sha256.len() != 64
+                || !payload.sha256.bytes().all(|byte| byte.is_ascii_hexdigit())
+            {
+                bail!("Invalid payload SHA-256");
+            }
+        }
         Ok(())
     }
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Payload {
+    pub size: u64,
+    pub sha256: String,
+}
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PayloadReady {
+    pub version: u32,
+    pub build_id: String,
+}
+impl PayloadReady {
+    pub fn new() -> Self {
+        Self {
+            version: VERSION,
+            build_id: BUILD_ID.into(),
+        }
+    }
+    pub fn validate(&self) -> Result<()> {
+        if self.version != VERSION || self.build_id != BUILD_ID {
+            bail!("Payload handshake version/build mismatch");
+        }
+        Ok(())
+    }
+}
+impl Default for PayloadReady {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// Input staging can fail before the target is ready to accept a body. Such a
+/// module failure must not be misreported as an unreachable SSH host.
+#[derive(Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum PayloadAck {
+    Ready(PayloadReady),
+    Result(Response),
 }
 
 #[derive(Debug, Serialize, Deserialize)]

@@ -74,14 +74,16 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - run: sudo apt-get update && sudo apt-get install -y musl-tools
       - run: cargo build --workspace --release --target ${{ matrix.target }} --locked
+      - name: Build native HTTP acceptance fixture
+        run: cargo build -p rustsible-worker --example http_fixture --release --target ${{ matrix.target }} --locked
       - name: Assemble native worker directory
         run: cargo run --locked -p rustsible-protocol --example worker_manifest -- target/workers ${{ matrix.arch }}=target/${{ matrix.target }}/release/rustsible-worker
       - name: Existing SSH scenarios
         run: bash tests/ssh/run.sh target/${{ matrix.target }}/release/rustsible target/workers
       - name: Native execution without Python or curl (glibc)
-        run: bash tests/ssh/run.sh target/${{ matrix.target }}/release/rustsible target/workers native glibc
+        run: bash tests/ssh/run.sh target/${{ matrix.target }}/release/rustsible target/workers native glibc target/${{ matrix.target }}/release/examples/http_fixture
       - name: Native execution without Python or curl (musl)
-        run: bash tests/ssh/run.sh target/${{ matrix.target }}/release/rustsible target/workers native musl
+        run: bash tests/ssh/run.sh target/${{ matrix.target }}/release/rustsible target/workers native musl target/${{ matrix.target }}/release/examples/http_fixture
       - uses: actions/upload-artifact@v4
         with:
           name: native-${{ matrix.arch }}
@@ -127,3 +129,15 @@ jobs:
           name: offline-linux-packages
           path: ${{ runner.temp }}/rustsible-packages/*.tar.gz
           if-no-files-found: error
+
+  ansible-reference:
+    name: Pinned Ansible 2.21 file/template comparison
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - uses: astral-sh/setup-uv@v10.3.3
+      - run: cargo build --workspace --locked
+      - run: cargo run --locked -p rustsible-protocol --example worker_manifest -- target/debug/workers x86_64=target/debug/rustsible-worker
+      - run: bash tests/reference/run.sh target/debug/rustsible

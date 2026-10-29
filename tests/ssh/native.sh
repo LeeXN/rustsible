@@ -26,6 +26,7 @@ native_snapshot() {
     docker exec "$container" sh -eu -c '
         find /srv/rustsible -type f -exec sha256sum {} \;
         find /srv/rustsible -exec stat -c "%n:%a:%u:%g" {} \;
+        getcap -r /srv/rustsible
     '
 }
 native_snapshot > "$fixture_dir/before"

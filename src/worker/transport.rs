@@ -1,5 +1,6 @@
 use anyhow::{bail, Context, Result};
 use std::{
+    collections::VecDeque,
     io::{self, Read, Write},
     os::fd::AsRawFd,
     process::{Child, ChildStderr, ChildStdin, ChildStdout},
@@ -12,10 +13,12 @@ pub(crate) enum Session {
         input: Option<ChildStdin>,
         output: ChildStdout,
         diagnostic: ChildStderr,
+        pending: VecDeque<u8>,
     },
     Remote {
         channel: ssh2::Channel,
         _session: ssh2::Session,
+        pending: VecDeque<u8>,
     },
 }
 impl Session {
@@ -46,6 +49,7 @@ impl Session {
             input: Some(input),
             output,
             diagnostic,
+            pending: VecDeque::new(),
         })
     }
     fn write(&mut self, data: &[u8]) -> io::Result<usize> {
@@ -57,11 +61,57 @@ impl Session {
             Self::Remote { channel, .. } => channel.write(data),
         }
     }
-    fn read(&mut self, data: &mut [u8]) -> io::Result<usize> {
+    fn pending(&mut self) -> &mut VecDeque<u8> {
+        match self {
+            Self::Local { pending, .. } | Self::Remote { pending, .. } => pending,
+        }
+    }
+    fn read_raw(&mut self, data: &mut [u8]) -> io::Result<usize> {
         match self {
             Self::Local { output, .. } => output.read(data),
             Self::Remote { channel, .. } => channel.read(data),
         }
+    }
+    fn read(&mut self, data: &mut [u8]) -> io::Result<usize> {
+        let pending = self.pending();
+        if !pending.is_empty() {
+            let length = data.len().min(pending.len());
+            for byte in &mut data[..length] {
+                *byte = pending.pop_front().expect("Buffered worker byte");
+            }
+            return Ok(length);
+        }
+        self.read_raw(data)
+    }
+    fn prefetch(&mut self) -> Result<bool> {
+        // A peer can report disk-full while the sender is still writing. Pump
+        // stdout during upload so SSH windows cannot hide that structured error.
+        let mut bytes = [0; 8192];
+        match self.read_raw(&mut bytes) {
+            Ok(0) => bail!("Worker closed its output while accepting input"),
+            Ok(length) => {
+                let pending = self.pending();
+                if pending.len() + length > rustsible_protocol::MAX_RESPONSE_BYTES + 4 {
+                    bail!("Worker response exceeds its bound");
+                }
+                pending.extend(&bytes[..length]);
+            }
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    io::ErrorKind::WouldBlock | io::ErrorKind::Interrupted
+                ) => {}
+            Err(error) => return Err(error).context("Cannot pump worker upload response"),
+        }
+        let pending = self.pending();
+        if pending.len() < 4 {
+            return Ok(false);
+        }
+        let length = u32::from_be_bytes([pending[0], pending[1], pending[2], pending[3]]) as usize;
+        if length == 0 || length > rustsible_protocol::MAX_RESPONSE_BYTES {
+            bail!("Worker response exceeds its bound");
+        }
+        Ok(pending.len() >= length + 4)
     }
     pub fn diagnostics(&mut self, output: &mut Vec<u8>) -> Result<()> {
         let mut buffer = [0; 4096];
@@ -86,14 +136,34 @@ impl Session {
     }
     pub fn send(
         &mut self,
-        mut data: &[u8],
+        data: &[u8],
         deadline: Instant,
         diagnostics: &mut Vec<u8>,
     ) -> Result<()> {
+        self.send_inner(data, deadline, diagnostics, false)
+    }
+    pub fn send_payload(
+        &mut self,
+        data: &[u8],
+        deadline: Instant,
+        diagnostics: &mut Vec<u8>,
+    ) -> Result<()> {
+        self.send_inner(data, deadline, diagnostics, true)
+    }
+    fn send_inner(
+        &mut self,
+        mut data: &[u8],
+        deadline: Instant,
+        diagnostics: &mut Vec<u8>,
+        payload: bool,
+    ) -> Result<()> {
         while !data.is_empty() {
             self.diagnostics(diagnostics)?;
+            if self.prefetch()? && payload {
+                bail!("Worker returned a result before accepting the complete payload");
+            }
             match self.write(data) {
-                Ok(0) => {}
+                Ok(0) => bail!("Worker stopped accepting input"),
                 Ok(length) => data = &data[length..],
                 Err(error)
                     if matches!(
