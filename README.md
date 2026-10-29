@@ -329,6 +329,35 @@ Credential-bearing responses retain raw register data and a censored display
 policy. URLs in errors omit credential-bearing URL data. URI check skips the
 request. Client deadlines and task timeout also bound waits and HTTP operations.
 
+## Git and archives
+
+`git` requires target Git and accepts repo, absolute dest, version (HEAD by
+default, branch, tag, full ref or full commit), and update (default true).
+New clones install from a private sibling directory. Updates reject local
+changes; update=false retains an existing checkout. Check uses ls-remote and
+local queries without clone/fetch/checkout. Results include before/after commit
+IDs. Ambiguous branch/tag names require a full ref; missing tools fail directly.
+HTTP URL credentials and external remote helpers are rejected; use target SSH
+keys/known_hosts or credential helpers. Submodules and force/reset are outside
+this subset. Diff currently has no CLI entry; the common capability validator
+rejects a diff request until the CLI/diff delivery.
+
+`unarchive` supports tar, tar.gz and ZIP (stored/deflate), controller src by
+default or absolute target src with remote_src=true, absolute existing dest,
+owner/group/mode, and creates below dest. Controller paths use the task/role
+files source context. It fully decodes into private scratch before touching
+business files. Paths escaping dest, archive symlinks/hardlinks/devices,
+ambiguous duplicate files, existing link walks and file/directory conflicts
+fail before installation. Limits are 100,000 entries and 8 GiB compressed or
+expanded content; matching files are unchanged. Existing file protection
+metadata is retained unless specified; new entries use archive permission bits
+without set-id, limited by the original umask. Existing directory modes remain
+unless mode was specified. Archive ownership/timestamps are not imported.
+Each replacement is atomic; a later IO failure can leave earlier complete
+entries installed and reports those changes. Private staging is cleaned.
+Global check decodes and compares without changing the destination. Source
+streaming and archive operations do not support async.
+
 ## Assertions and groups
 
 `assert` and `fail` run on the controller and do not require a target connection.
@@ -608,6 +637,8 @@ The following built-in modules are registered for playbooks:
 | `group` | Manage Linux group names/GIDs/present/absent/system through account tools |
 | `wait_for` | Wait for target TCP/file/regular-text conditions |
 | `uri` | Call target HTTP APIs with bounded body/status/TLS/proxy handling |
+| `git` | Deploy pinned target Git checkouts without discarding local changes |
+| `unarchive` | Validate tar/gzip/ZIP before atomic per-file installation |
 | `meta` | Flush handlers, clear host errors, reset connections, or end host/play execution |
 | `copy` | Copy a controller file or literal content |
 | `file` | Manage files, directories, links, and permissions |

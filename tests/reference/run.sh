@@ -153,6 +153,22 @@ mv "$fixture_dir/network-output" "$fixture_dir/reference-network"
 mkdir "$fixture_dir/network-output"
 "$binary" playbook -i "$fixture_dir/inventory" "$fixture_dir/network.yml" > "$fixture_dir/native-network.log" 2>&1
 diff -r "$fixture_dir/reference-network" "$fixture_dir/network-output"
+mkdir "$fixture_dir/artifact-source" "$fixture_dir/archive-content" "$fixture_dir/artifact-output"
+printf pinned-version > "$fixture_dir/artifact-source/version"
+git -C "$fixture_dir/artifact-source" init -q
+git -C "$fixture_dir/artifact-source" add .
+git -C "$fixture_dir/artifact-source" -c user.name=Fixture -c user.email=fixture@example.invalid commit -qm initial
+git -C "$fixture_dir/artifact-source" tag v1
+printf archive-data > "$fixture_dir/archive-content/tool"
+chmod 0755 "$fixture_dir/archive-content/tool"
+tar -czf "$fixture_dir/artifact.tar.gz" -C "$fixture_dir/archive-content" tool
+sed "s|@OUTPUT@|$fixture_dir/artifact-output|g; s|@REPO@|$fixture_dir/artifact-source|g; s|@ARCHIVE@|$fixture_dir/artifact.tar.gz|g" "$repo_dir/tests/reference/artifacts.yml" > "$fixture_dir/artifacts.yml"
+uv tool run --from ansible-core==2.21.0 ansible-playbook -i "$fixture_dir/inventory" "$fixture_dir/artifacts.yml" > "$fixture_dir/reference-artifacts.log" 2>&1
+mv "$fixture_dir/artifact-output" "$fixture_dir/reference-artifacts"
+mkdir "$fixture_dir/artifact-output"
+"$binary" playbook -i "$fixture_dir/inventory" "$fixture_dir/artifacts.yml" > "$fixture_dir/native-artifacts.log" 2>&1
+diff -r --exclude=.git "$fixture_dir/reference-artifacts" "$fixture_dir/artifact-output"
+[[ $(stat -c %a "$fixture_dir/artifact-output/files/tool") == 755 ]]
 if uv tool run --from ansible-core==2.21.0 ansible-playbook \
     -i "$fixture_dir/inventory" "$fixture_dir/non_boolean.yml" > "$fixture_dir/reference-condition.log" 2>&1; then
     echo 'Reference unexpectedly accepted a string condition' >&2; exit 1
@@ -161,4 +177,4 @@ if "$binary" playbook -i "$fixture_dir/inventory" "$fixture_dir/non_boolean.yml"
     echo 'Rustsible unexpectedly accepted a string condition' >&2; exit 1
 fi
 [[ ! -e $fixture_dir/result/unsafe-condition ]]
-printf 'Ansible 2.21.0 comparison passed: templates/types, native files, retries/conditions, environment, command prediction, facts, variables, imports/roles, handlers/rescue, serial/run_once, failure thresholds, delegation, free strategy and native async/poll/status\n'
+printf 'Ansible 2.21.0 comparison passed: templates/types, native files, retries/conditions, environment, command prediction, facts, variables, imports/roles, handlers/rescue, serial/run_once, failure thresholds, delegation, free strategy native async/poll/status, assertions, target wait/HTTP readiness and Git/archive deployment\n'

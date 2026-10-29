@@ -1,0 +1,17 @@
+- hosts: localhost
+  gather_facts: false
+  tasks:
+    - git:
+        repo: '@REPO@'
+        dest: '@OUTPUT@/checkout'
+        version: v1
+    - file:
+        path: '@OUTPUT@/files'
+        state: directory
+        mode: '0755'
+    - unarchive:
+        src: '@ARCHIVE@'
+        dest: '@OUTPUT@/files'
+    - copy:
+        content: installed
+        dest: '@OUTPUT@/marker'

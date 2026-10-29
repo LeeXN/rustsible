@@ -226,6 +226,17 @@ impl Invocation {
                 .asynchronous
                 .as_ref()
                 .map(|(specification, _)| specification.clone());
+            if self.module == Builtin::Unarchive
+                && self.args.get("remote_src").and_then(Value::as_bool) != Some(true)
+            {
+                let mut source = crate::worker::Source::file(
+                    self.args
+                        .get("src")
+                        .and_then(Value::as_str)
+                        .context("Unarchive requires src")?,
+                )?;
+                return runtime.execute_request(config, request, Some(&mut source));
+            }
             if matches!(self.module, Builtin::Copy | Builtin::Template) {
                 let mut args = self.args.clone();
                 let mut source = if self.module == Builtin::Template {

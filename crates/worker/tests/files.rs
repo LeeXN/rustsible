@@ -892,3 +892,287 @@ fn corrupt_or_truncated_payloads_and_symbolic_destinations_never_modify_business
     assert_eq!(fs::metadata(&path).unwrap().ino(), before.ino());
     assert_eq!(fs::read_dir(temporary.path()).unwrap().count(), 2);
 }
+
+fn archive_bytes(entries: &[(&str, &[u8], u32)], compressed: bool) -> Vec<u8> {
+    let mut builder = tar::Builder::new(Vec::new());
+    for (name, bytes, mode) in entries {
+        let mut header = tar::Header::new_gnu();
+        header.set_size(bytes.len() as u64);
+        header.set_mode(*mode);
+        header.set_cksum();
+        builder.append_data(&mut header, name, *bytes).unwrap();
+    }
+    let bytes = builder.into_inner().unwrap();
+    if !compressed {
+        return bytes;
+    }
+    let mut encoder = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+    encoder.write_all(&bytes).unwrap();
+    encoder.finish().unwrap()
+}
+#[test]
+fn unarchive_streams_tar_gzip_zip_preserves_existing_metadata_and_predicts_without_changes() {
+    let temporary = tempfile::tempdir().unwrap();
+    let destination = temporary.path().join("dest");
+    fs::create_dir(&destination).unwrap();
+    for compressed in [false, true] {
+        let bytes = archive_bytes(
+            &[("nested/tool", b"v1", 0o755), ("plain", b"data", 0o644)],
+            compressed,
+        );
+        let args = json!({"src":"controller-relative.tar", "dest":destination});
+        let (child, input) = start(request("unarchive", args.clone(), true), Some(&bytes), None);
+        let prediction = finish(child, input);
+        assert!(
+            !prediction.failed && prediction.changed,
+            "{}",
+            prediction.msg
+        );
+        assert_eq!(fs::read_dir(&destination).unwrap().count(), 0);
+        let (child, input) = start(
+            request("unarchive", args.clone(), false),
+            Some(&bytes),
+            None,
+        );
+        let applied = finish(child, input);
+        assert!(!applied.failed && applied.changed, "{}", applied.msg);
+        assert_eq!(fs::read(destination.join("nested/tool")).unwrap(), b"v1");
+        assert_eq!(
+            fs::metadata(destination.join("nested/tool"))
+                .unwrap()
+                .mode()
+                & 0o777,
+            0o755
+        );
+        let (child, input) = start(request("unarchive", args, false), Some(&bytes), None);
+        let noop = finish(child, input);
+        assert!(!noop.failed && !noop.changed, "{}", noop.msg);
+        fs::remove_dir_all(destination.join("nested")).unwrap();
+        fs::remove_file(destination.join("plain")).unwrap();
+    }
+    let zip_path = temporary.path().join("archive.zip");
+    let mut zip = zip::ZipWriter::new(fs::File::create(&zip_path).unwrap());
+    zip.start_file(
+        "nested/tool",
+        zip::write::SimpleFileOptions::default().unix_permissions(0o755),
+    )
+    .unwrap();
+    zip.write_all(b"zip tool").unwrap();
+    zip.finish().unwrap();
+    let args = json!({"src":zip_path,"dest":destination,"remote_src":true});
+    let applied = run("unarchive", args.clone(), false);
+    assert!(!applied.failed && applied.changed, "{}", applied.msg);
+    let path = destination.join("nested/tool");
+    fs::set_permissions(&path, fs::Permissions::from_mode(0o750)).unwrap();
+    let bytes = archive_bytes(&[("nested/tool", b"new tar tool", 0o644)], false);
+    let archive = temporary.path().join("update.tar");
+    fs::write(&archive, bytes).unwrap();
+    let updated = run(
+        "unarchive",
+        json!({"src":archive,"dest":destination,"remote_src":true}),
+        false,
+    );
+    assert!(!updated.failed && updated.changed, "{}", updated.msg);
+    assert_eq!(fs::read(&path).unwrap(), b"new tar tool");
+    assert_eq!(fs::metadata(&path).unwrap().mode() & 0o777, 0o750);
+    let skipped = run(
+        "unarchive",
+        json!({"src":temporary.path().join("missing.tar"),"dest":destination,"remote_src":true,"creates":"nested/tool"}),
+        false,
+    );
+    assert!(!skipped.failed && !skipped.changed, "{}", skipped.msg);
+}
+#[test]
+fn unarchive_rejects_traversal_links_corruption_and_all_conflicts_before_modification() {
+    let temporary = tempfile::tempdir().unwrap();
+    let dest = temporary.path().join("dest");
+    fs::create_dir(&dest).unwrap();
+    fs::write(dest.join("kept"), b"original").unwrap();
+    fs::set_permissions(dest.join("kept"), fs::Permissions::from_mode(0o755)).unwrap();
+    let safe = archive_bytes(
+        &[("kept", b"replace", 0o644), ("other", b"new", 0o644)],
+        false,
+    );
+    let mut traversal = safe.clone();
+    traversal[0..100].fill(0);
+    traversal[..10].copy_from_slice(b"../escaped");
+    // Recompute the tar header checksum after deliberately bypassing Builder's
+    // own safe-path guard; the module must reject a valid malicious archive.
+    traversal[148..156].fill(b' ');
+    let checksum: u32 = traversal[..512].iter().map(|byte| *byte as u32).sum();
+    traversal[148..156].copy_from_slice(format!("{checksum:06o}\0 ").as_bytes());
+    let mut corrupt = archive_bytes(&[("kept", b"replace", 0o644)], true);
+    let end = corrupt.len();
+    corrupt[end - 8] ^= 1;
+    let mut truncated = safe.clone();
+    truncated.truncate(514);
+    let mut writer = zip::ZipWriter::new(std::io::Cursor::new(Vec::new()));
+    writer
+        .start_file(
+            "kept",
+            zip::write::SimpleFileOptions::default()
+                .compression_method(zip::CompressionMethod::Stored),
+        )
+        .unwrap();
+    writer.write_all(b"replace").unwrap();
+    let mut bad_crc = writer.finish().unwrap().into_inner();
+    let mut reader = zip::ZipArchive::new(std::io::Cursor::new(&bad_crc)).unwrap();
+    let offset = reader.by_index(0).unwrap().data_start().unwrap() as usize;
+    drop(reader);
+    bad_crc[offset] ^= 1;
+    let mut writer = zip::ZipWriter::new(std::io::Cursor::new(Vec::new()));
+    writer
+        .add_symlink(
+            "escaped",
+            "../outside",
+            zip::write::SimpleFileOptions::default(),
+        )
+        .unwrap();
+    let zip_link = writer.finish().unwrap().into_inner();
+    let mut linked = tar::Builder::new(Vec::new());
+    for kind in [tar::EntryType::Symlink, tar::EntryType::Link] {
+        let mut header = tar::Header::new_gnu();
+        header.set_entry_type(kind);
+        header.set_size(0);
+        header.set_mode(0o777);
+        header.set_link_name("../escaped").unwrap();
+        header.set_cksum();
+        linked
+            .append_data(
+                &mut header,
+                if kind.is_symlink() { "symbol" } else { "hard" },
+                &b""[..],
+            )
+            .unwrap();
+    }
+    for bytes in [
+        traversal,
+        corrupt,
+        truncated,
+        bad_crc,
+        zip_link,
+        linked.into_inner().unwrap(),
+    ] {
+        let (child, input) = start(
+            request("unarchive", json!({"src":"archive","dest":dest}), false),
+            Some(&bytes),
+            None,
+        );
+        let result = finish(child, input);
+        assert!(result.failed && !result.changed, "{}", result.msg);
+        assert_eq!(fs::read(dest.join("kept")).unwrap(), b"original");
+        assert_eq!(
+            fs::metadata(dest.join("kept")).unwrap().mode() & 0o777,
+            0o755
+        );
+        assert_eq!(fs::read_dir(&dest).unwrap().count(), 1);
+        assert!(!temporary.path().join("escaped").exists());
+    }
+    std::os::unix::fs::symlink(temporary.path(), dest.join("nested")).unwrap();
+    let bytes = archive_bytes(
+        &[
+            ("kept", b"replace", 0o644),
+            ("nested/escaped", b"danger", 0o644),
+        ],
+        false,
+    );
+    let (child, input) = start(
+        request("unarchive", json!({"src":"archive","dest":dest}), false),
+        Some(&bytes),
+        None,
+    );
+    let result = finish(child, input);
+    assert!(result.failed && !result.changed, "{}", result.msg);
+    assert_eq!(fs::read(dest.join("kept")).unwrap(), b"original");
+    assert!(!temporary.path().join("escaped").exists());
+}
+#[test]
+fn git_checkout_revision_update_dirty_rejection_and_check_are_observable() {
+    let temporary = tempfile::tempdir().unwrap();
+    let repo = temporary.path().join("source");
+    fs::create_dir(&repo).unwrap();
+    let git = |args: &[&str]| {
+        let output = Command::new("git")
+            .args(["-C", repo.to_str().unwrap()])
+            .args(args)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        String::from_utf8(output.stdout).unwrap().trim().to_owned()
+    };
+    git(&["init", "--initial-branch=main"]);
+    git(&["config", "user.email", "fixture@example.invalid"]);
+    git(&["config", "user.name", "Fixture"]);
+    fs::write(repo.join("version"), b"first").unwrap();
+    git(&["add", "."]);
+    git(&["commit", "-m", "first"]);
+    let first = git(&["rev-parse", "HEAD"]);
+    git(&["tag", "-a", "v1", "-m", "first release"]);
+    let dest = temporary.path().join("checkout");
+    let args = json!({"repo":repo,"dest":dest});
+    let prediction = run("git", args.clone(), true);
+    assert!(
+        !prediction.failed && prediction.changed,
+        "{}",
+        prediction.msg
+    );
+    assert!(!dest.exists());
+    let applied = run("git", args.clone(), false);
+    assert!(!applied.failed && applied.changed, "{}", applied.msg);
+    assert_eq!(fs::read(dest.join("version")).unwrap(), b"first");
+    assert!(!run("git", args.clone(), false).changed);
+    fs::write(repo.join("version"), b"second").unwrap();
+    git(&["add", "."]);
+    git(&["commit", "-m", "second"]);
+    let second = git(&["rev-parse", "HEAD"]);
+    let no_update = run(
+        "git",
+        json!({"repo":repo,"dest":dest,"update":false}),
+        false,
+    );
+    assert!(!no_update.failed && !no_update.changed);
+    assert_eq!(fs::read(dest.join("version")).unwrap(), b"first");
+    let before_refs = fs::read(dest.join(".git/HEAD")).unwrap();
+    let prediction = run("git", args.clone(), true);
+    assert!(!prediction.failed && prediction.changed);
+    assert_eq!(fs::read(dest.join(".git/HEAD")).unwrap(), before_refs);
+    fs::write(dest.join("version"), b"local changes").unwrap();
+    let refused = run("git", args.clone(), false);
+    assert!(refused.failed && !refused.changed, "{}", refused.msg);
+    assert_eq!(fs::read(dest.join("version")).unwrap(), b"local changes");
+    fs::write(dest.join("version"), b"first").unwrap();
+    let updated = run("git", args.clone(), false);
+    assert!(!updated.failed && updated.changed, "{}", updated.msg);
+    assert_eq!(updated.values["after"].as_str(), Some(second.as_str()));
+    assert_eq!(fs::read(dest.join("version")).unwrap(), b"second");
+    for version in [first.as_str(), "v1", "refs/tags/v1"] {
+        let pinned = run(
+            "git",
+            json!({"repo":repo,"dest":dest,"version":version}),
+            false,
+        );
+        assert!(!pinned.failed, "{}", pinned.msg);
+        assert_eq!(pinned.values["after"].as_str(), Some(first.as_str()));
+        assert_eq!(fs::read(dest.join("version")).unwrap(), b"first");
+    }
+    assert!(
+        run(
+            "git",
+            json!({"repo":"ext::touch /tmp/unsafe","dest":dest}),
+            false
+        )
+        .failed
+    );
+    assert!(
+        run(
+            "git",
+            json!({"repo":"https://user:secret@example.invalid/repo","dest":dest}),
+            false
+        )
+        .failed
+    );
+}

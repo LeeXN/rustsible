@@ -53,10 +53,12 @@ pub enum Builtin {
     Group,
     WaitFor,
     Uri,
+    Git,
+    Unarchive,
 }
 
 impl Builtin {
-    pub const ALL: [Self; 23] = [
+    pub const ALL: [Self; 25] = [
         Self::Command,
         Self::Shell,
         Self::Debug,
@@ -80,6 +82,8 @@ impl Builtin {
         Self::Group,
         Self::WaitFor,
         Self::Uri,
+        Self::Git,
+        Self::Unarchive,
     ];
 
     pub fn lookup(name: &str) -> Result<Self> {
@@ -119,6 +123,8 @@ impl Builtin {
             Self::Group => "group",
             Self::WaitFor => "wait_for",
             Self::Uri => "uri",
+            Self::Git => "git",
+            Self::Unarchive => "unarchive",
         }
     }
     pub fn check_support(self) -> CheckSupport {
@@ -245,6 +251,16 @@ impl Builtin {
                 "delay",
                 "sleep",
             ],
+            Self::Git => &["repo", "dest", "version", "update"],
+            Self::Unarchive => &[
+                "src",
+                "dest",
+                "remote_src",
+                "owner",
+                "group",
+                "mode",
+                "creates",
+            ],
             Self::Uri => &[
                 "url",
                 "method",
@@ -356,7 +372,8 @@ impl Builtin {
                 "vars" => value.is_mapping(),
                 "force" | "enabled" | "daemon_reload" | "backup" | "create" | "append"
                 | "return_content" | "validate_certs" | "use_proxy" | "force_basic_auth"
-                | "create_home" | "system" | "remove" | "update_cache" => value.is_bool(),
+                | "update" | "remote_src" | "create_home" | "system" | "remove"
+                | "update_cache" => value.is_bool(),
                 "uid" | "gid" if matches!(self, Self::User | Self::Group) => {
                     value.as_u64().is_some_and(|id| id < u32::MAX as u64)
                 }
@@ -390,6 +407,30 @@ impl Builtin {
             Ok(())
         };
         match self {
+            Self::Git => {
+                required("repo")?;
+                required("dest")?;
+                if !std::path::Path::new(string("dest").unwrap()).is_absolute() {
+                    bail!("Git dest must be an absolute target path");
+                }
+                if string("repo")
+                    .is_some_and(|value| value.starts_with('-') || value.contains("::"))
+                    || string("version")
+                        .is_some_and(|value| value.is_empty() || value.starts_with('-'))
+                {
+                    bail!("Invalid Git repository or revision");
+                }
+            }
+            Self::Unarchive => {
+                required("src")?;
+                required("dest")?;
+                if !std::path::Path::new(string("dest").unwrap()).is_absolute()
+                    || args.get("remote_src").and_then(Value::as_bool) == Some(true)
+                        && !std::path::Path::new(string("src").unwrap()).is_absolute()
+                {
+                    bail!("Unarchive dest and remote src must be absolute target paths");
+                }
+            }
             Self::WaitFor => {
                 if args.get("port").is_some() && args.get("path").is_some() {
                     bail!("wait_for path and port are mutually exclusive");
