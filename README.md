@@ -24,8 +24,9 @@ Tasks retain playbook order, while hosts within a task run concurrently with a b
 Module names and common parameters resemble Ansible, but their complete argument schemas, facts, plugin system, transports, strategy engine, Vault support, and all Ansible edge cases are not implemented. Idempotency and check-mode prediction can also differ from Ansible.
 
 Playbook fact gathering follows the ansible-core 2.21 default: facts are gathered
-unless a play sets `gather_facts: false`. Fact gathering, `stat`, and `get_url`
-require Python 3 on managed hosts.
+unless a play sets `gather_facts: false`. Fact gathering, `stat`, `command`, and
+`shell` use the native Rust worker and do not require Python or curl.
+`get_url` still requires target Python 3 until its native migration is complete.
 Registered results and gathered facts last for the complete playbook run;
 play and task variables remain scoped to their play or task. Explicit `setup: {}`
 merges facts just like automatic gathering, including time collected on the
@@ -81,10 +82,53 @@ Install a current stable Rust toolchain, then run:
 ```bash
 git clone https://github.com/LeeXN/rustsible.git
 cd rustsible
-cargo build --release --locked
+cargo build --workspace --release --locked
+cargo run --locked -p rustsible-protocol --example worker_manifest -- \
+  target/release/workers "$(uname -m)=target/release/rustsible-worker"
 ```
 
-The binary is written to `target/release/rustsible`.
+The controller is written to `target/release/rustsible`. The command above
+creates its adjacent `workers/manifest.json` and a worker for the build host.
+For portable Linux workers, build with the matching `*-unknown-linux-musl`
+Rust target and a musl C toolchain. Release packages include both x86_64 and
+aarch64 static workers and a SHA-256 manifest. Source archives without Git
+metadata require an explicit `RUSTSIBLE_BUILD_ID` when compiling.
+
+The controller selects a Linux worker with `uname`, verifies the local artifact,
+streams it into a private target directory, verifies its checksum again, then
+checks protocol version, build ID, architecture, execution UID and capabilities.
+Use `--worker-dir DIRECTORY` to select a different release worker directory and
+inventory `rustsible_remote_tmp: /absolute/executable/directory` to replace the
+remote `/tmp` default. The parent must exist; it and its ancestors must be owned
+by root or the execution identity, with the sticky bit wherever other users can
+write. Validation walks actual parent directories, and cleanup verifies the
+original directory inode even after an ancestor rename. `noexec`, missing
+or damaged artifacts, unsupported architectures and mismatched builds fail
+explicitly. No Python fallback is used.
+
+Workers are subprocesses held for one run and connection/identity combination;
+there is no service or listener. Directories and executable workers use `0700`,
+request scratch and shell programs use `0600`; credentials and module requests
+travel through stdin. The controller keeps stdin open to distinguish a complete
+request from cancellation. Closing it cancels synchronous subprocesses, including
+`setsid` descendants. Both the worker and bootstrap clean the private directory,
+so an abrupt disconnect does not rely solely on the shell's exit trap. Command
+processes retain the original working directory and execution identity's umask. Interrupted modifying
+requests are reported as uncertain and are never replayed.
+
+To assemble an offline package after building both static workers:
+
+```bash
+bash scripts/package.sh target/release/rustsible target/package-linux \
+  target/x86_64-unknown-linux-musl/release/rustsible-worker \
+  target/aarch64-unknown-linux-musl/release/rustsible-worker
+```
+
+Extract the resulting `.tar.gz`, verify `sha256sum -c SHA256SUMS` from its root,
+and run `./rustsible`. Packaging requires Cargo; running an extracted release
+does not. Workers need SSH for remote access, POSIX shell, `uname`, `id`, `stat`,
+`mktemp`, `head`, `wc`, `sha256sum`, `cut`, `chmod`, and `rm` for bootstrap.
+Sudo is required only for become.
 
 ## Usage
 
@@ -271,10 +315,11 @@ The CI-equivalent local checks are:
 
 ```bash
 cargo fmt --all -- --check
-cargo clippy --all-targets --all-features --locked -- -D warnings
-cargo test --all-targets --all-features --locked
-cargo llvm-cov --all-targets --all-features --locked --fail-under-lines 80
-cargo build --release --all-features --locked
+cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
+cargo build --workspace --locked
+cargo test --workspace --all-targets --all-features --locked
+cargo llvm-cov --workspace --all-targets --all-features --locked --fail-under-lines 80
+cargo build --workspace --release --all-features --locked
 ```
 
 To run a focused test, pass its name to Cargo, for example:
@@ -290,8 +335,15 @@ redaction, follow [`MANUAL_TEST_PLAN.md`](MANUAL_TEST_PLAN.md).
 `bash tests/ssh/run.sh target/debug/rustsible` runs an isolated Docker SSH target
 with strict host-key verification. It checks deploy/root/app execution identities,
 check-mode business-state equality, idempotency, cross-play facts/registers,
-file bytes and metadata, and temporary-file cleanup. The fixture installs Python
-for the current setup/get_url implementation; it is not a no-Python acceptance.
+file bytes and metadata, and temporary-file cleanup. The full fixture installs
+Python only for the transitional `get_url` implementation.
+`bash tests/ssh/run.sh CONTROLLER WORKER_DIRECTORY native glibc` and the same
+command ending in `native musl` use targets with neither Python nor curl. They
+verify native setup/stat/command/shell, password sudo, root/non-root execution,
+check invariance, noexec failures, and controller-interruption cleanup. The musl
+case also runs the static controller inside the target. CI runs these scenarios
+on native x86_64 and aarch64 runners and assembles offline bundles with both
+workers.
 CI runs the quality gates and real SSH fixture on native x86_64 and aarch64
 Linux runners. Results come from the individual CI jobs; configuring a runner
 is not itself evidence that an architecture passed.

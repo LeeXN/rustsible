@@ -6,6 +6,14 @@ pub fn build_cli() -> Command {
         .version(env!("CARGO_PKG_VERSION"))
         .subcommand_required(true)
         .arg_required_else_help(true)
+        .arg(
+            Arg::new("worker-dir")
+                .long("worker-dir")
+                .global(true)
+                .help("Directory containing the release worker manifest and binaries")
+                .value_name("DIRECTORY")
+                .value_parser(clap::value_parser!(std::path::PathBuf)),
+        )
         .subcommand(
             Command::new("playbook")
                 .about("Run a Rustsible playbook")

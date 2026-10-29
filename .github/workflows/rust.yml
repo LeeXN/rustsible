@@ -31,15 +31,17 @@ jobs:
       - name: Check formatting
         run: cargo fmt --all -- --check
       - name: Run Clippy
-        run: cargo clippy --all-targets --all-features --locked -- -D warnings
+        run: cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
+      - name: Build native test workers
+        run: cargo build --workspace --locked
       - name: Run tests
-        run: cargo test --all-targets --all-features --locked
+        run: cargo test --workspace --all-targets --all-features --locked
       - name: Install cargo-llvm-cov
         uses: taiki-e/install-action@cargo-llvm-cov
       - name: Enforce line coverage baseline
-        run: cargo llvm-cov --all-targets --all-features --locked --fail-under-lines 80
+        run: cargo llvm-cov --workspace --all-targets --all-features --locked --fail-under-lines 80
       - name: Build release binary
-        run: cargo build --release --all-features --locked
+        run: cargo build --workspace --release --all-features --locked
 
   security:
     name: Dependency audit
@@ -56,11 +58,72 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        runner: [ubuntu-24.04, ubuntu-24.04-arm]
+        include:
+          - runner: ubuntu-24.04
+            arch: x86_64
+            target: x86_64-unknown-linux-musl
+          - runner: ubuntu-24.04-arm
+            arch: aarch64
+            target: aarch64-unknown-linux-musl
     runs-on: ${{ matrix.runner }}
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
       - uses: Swatinem/rust-cache@v2
-      - run: cargo build --locked
-      - run: bash tests/ssh/run.sh target/debug/rustsible
+      - run: sudo apt-get update && sudo apt-get install -y musl-tools
+      - run: cargo build --workspace --release --target ${{ matrix.target }} --locked
+      - name: Assemble native worker directory
+        run: cargo run --locked -p rustsible-protocol --example worker_manifest -- target/workers ${{ matrix.arch }}=target/${{ matrix.target }}/release/rustsible-worker
+      - name: Existing SSH scenarios
+        run: bash tests/ssh/run.sh target/${{ matrix.target }}/release/rustsible target/workers
+      - name: Native execution without Python or curl (glibc)
+        run: bash tests/ssh/run.sh target/${{ matrix.target }}/release/rustsible target/workers native glibc
+      - name: Native execution without Python or curl (musl)
+        run: bash tests/ssh/run.sh target/${{ matrix.target }}/release/rustsible target/workers native musl
+      - uses: actions/upload-artifact@v4
+        with:
+          name: native-${{ matrix.arch }}
+          path: |
+            target/${{ matrix.target }}/release/rustsible
+            target/${{ matrix.target }}/release/rustsible-worker
+          if-no-files-found: error
+
+  offline-packages:
+    name: Dual architecture offline packages
+    needs: [quality, ssh]
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: native-*
+          path: target/native
+      - name: Package both controllers with both static workers
+        run: |
+          for arch in x86_64 aarch64; do
+            bash scripts/package.sh target/native/native-$arch/rustsible "$RUNNER_TEMP/rustsible-packages/$arch" target/native/native-x86_64/rustsible-worker target/native/native-aarch64/rustsible-worker
+          done
+      - name: Run the extracted package offline without Python or curl
+        run: |
+          mkdir "$RUNNER_TEMP/rustsible-extracted"
+          tar -xzf "$RUNNER_TEMP/rustsible-packages/x86_64.tar.gz" -C "$RUNNER_TEMP/rustsible-extracted"
+          docker pull alpine:3.22
+          docker run --rm --network none --mount type=bind,src="$RUNNER_TEMP/rustsible-extracted/x86_64",dst=/release,readonly alpine:3.22 sh -eu -c '
+            ! command -v python3
+            ! command -v curl
+            cd /release
+            sha256sum -c SHA256SUMS
+            printf "localhost ansible_connection=local\n" > /tmp/inventory
+            ./rustsible ad-hoc localhost -m setup -i /tmp/inventory
+            ./rustsible ad-hoc localhost -m stat -a "path=/etc/passwd checksum_algorithm=sha256" -i /tmp/inventory
+            [ -z "$(find /tmp -name ".rustsible-worker-*")" ]
+          '
+      - uses: actions/upload-artifact@v4
+        with:
+          name: offline-linux-packages
+          path: ${{ runner.temp }}/rustsible-packages/*.tar.gz
+          if-no-files-found: error

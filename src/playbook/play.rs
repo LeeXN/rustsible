@@ -46,8 +46,9 @@ struct HostStats {
 
 /// Only host runtime data survives plays. Scoped inventory/play/task overlays
 /// are rebuilt each time, so persisting a register never leaks play variables.
-#[derive(Debug, Default)]
+#[derive(Default)]
 pub(crate) struct RunState {
+    pub(crate) workers: crate::worker::Runtime,
     contexts: HashMap<String, RuntimeVariables>,
     excluded: HashSet<String>,
     stats: HashMap<String, HostStats>,
@@ -188,7 +189,7 @@ impl Play {
                     .iter()
                     .filter(|host| active_hosts.contains(&host.name))
                     .collect(),
-                &state.contexts,
+                state,
                 &definitions,
                 check_mode,
                 forks,
@@ -274,7 +275,7 @@ impl Play {
                 self,
                 task,
                 runnable_hosts,
-                &state.contexts,
+                state,
                 &definitions,
                 check_mode,
                 forks,
@@ -397,7 +398,7 @@ impl Play {
                     self,
                     &handler.task,
                     handler_hosts,
-                    &state.contexts,
+                    state,
                     &definitions,
                     check_mode,
                     forks,
@@ -499,17 +500,18 @@ impl Play {
         play: &Play,
         task: &Task,
         hosts: Vec<&'a Host>,
-        contexts: &HashMap<String, RuntimeVariables>,
+        state: &RunState,
         definitions: &HashMap<String, HashMap<String, Value>>,
         check_mode: bool,
         forks: usize,
     ) -> Vec<(&'a Host, Task, Result<TaskResult>)> {
+        let runtime = &state.workers;
         let mut results = Vec::with_capacity(hosts.len());
         for batch in hosts.chunks(forks) {
             let completed = std::thread::scope(|scope| {
                 let mut workers = Vec::with_capacity(batch.len());
                 for host in batch.iter().copied() {
-                    let host_vars = contexts.get(&host.name);
+                    let host_vars = state.contexts.get(&host.name);
                     let host_definitions = definitions.get(&host.name);
                     let effective_task = play.apply_play_settings(task, host);
                     let worker_task = effective_task.clone();
@@ -520,6 +522,7 @@ impl Play {
                             definitions,
                             &play.vars,
                             check_mode,
+                            runtime,
                         ),
                         _ => Err(anyhow::anyhow!(
                             "Internal error: no variable context for host '{}'",
@@ -694,6 +697,7 @@ mod tests {
                 &vars,
                 &play.vars,
                 false,
+                &crate::worker::Runtime::default(),
             )
             .unwrap();
         assert_eq!(result.msg, "play:one");

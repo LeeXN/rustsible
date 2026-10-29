@@ -107,6 +107,23 @@ impl ConnectionConfig {
         })
     }
 
+    pub(crate) fn worker_key(&self) -> Result<String> {
+        let variables: std::collections::BTreeMap<_, _> = self
+            .variables
+            .iter()
+            .filter(|(name, _)| is_connection_variable(name))
+            .collect();
+        let bytes = serde_json::to_vec(&(
+            &self.name,
+            &self.hostname,
+            self.port,
+            self.use_become,
+            &self.become_user,
+            variables,
+        ))?;
+        rustsible_protocol::sha256(&mut bytes.as_slice())
+    }
+
     pub fn get_variable(&self, key: &str) -> Option<Cow<'_, str>> {
         self.variables.get(key).and_then(scalar_text)
     }
@@ -142,7 +159,8 @@ fn scalar_text(value: &Value) -> Option<Cow<'_, str>> {
 fn is_connection_variable(name: &str) -> bool {
     matches!(
         name,
-        "ansible_host"
+        "rustsible_remote_tmp"
+            | "ansible_host"
             | "ansible_ssh_host"
             | "ansible_port"
             | "ansible_ssh_port"

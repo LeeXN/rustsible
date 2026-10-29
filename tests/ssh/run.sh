@@ -2,8 +2,13 @@
 set -euo pipefail
 
 repo_dir=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../.." && pwd)
-binary=$(realpath -- "${1:-$repo_dir/target/debug/rustsible}")
+controller_binary=$(realpath -- "${1:-$repo_dir/target/debug/rustsible}")
+worker_dir=$(realpath -- "${2:-$(dirname -- "$controller_binary")/workers}")
+rustsible() { "$controller_binary" --worker-dir "$worker_dir" "$@"; }
+mode=${3:-full}
+libc=${4:-glibc}
 fixture_dir=$(mktemp -d)
+chmod 0700 "$fixture_dir"
 container=''
 cleanup() {
     local result=$?
@@ -19,9 +24,13 @@ cleanup() {
 trap cleanup EXIT
 trap 'exit 1' HUP INT TERM
 
-docker build -q -t rustsible-ssh-fixture:local "$repo_dir/tests/ssh" >/dev/null
+python_packages=python3
+if [[ $mode == native ]]; then python_packages=''; fi
+fixture_dockerfile=$repo_dir/tests/ssh/Dockerfile
+if [[ $libc == musl ]]; then fixture_dockerfile=$repo_dir/tests/ssh/Dockerfile.musl; fi
+docker build -q -f "$fixture_dockerfile" --build-arg "PYTHON_PACKAGES=$python_packages" -t "rustsible-ssh-fixture:$mode-$libc" "$repo_dir/tests/ssh" >/dev/null
 ssh-keygen -q -t ed25519 -N '' -f "$fixture_dir/key"
-container=$(docker run -d --rm -p 127.0.0.1::22 rustsible-ssh-fixture:local)
+container=$(docker run -d --rm -p 127.0.0.1::22 --tmpfs /noexec:rw,noexec,mode=1777 "rustsible-ssh-fixture:$mode-$libc")
 docker cp "$fixture_dir/key.pub" "$container:/tmp/authorized_keys" >/dev/null
 docker exec "$container" sh -eu -c '
     install -d -m 0700 -o deploy -g deploy /home/deploy/.ssh
@@ -64,6 +73,10 @@ ansible_user=deploy
 ansible_ssh_private_key_file=$fixture_dir/key
 rustsible_known_hosts_file=$fixture_dir/known_hosts
 EOF
+if [[ $mode == native ]]; then
+    source "$repo_dir/tests/ssh/native.sh"
+    exit 0
+fi
 cat > "$fixture_dir/playbook.yml" <<'EOF'
 - hosts: all
   become: false
@@ -99,11 +112,11 @@ snapshot() {
     '
 }
 snapshot > "$fixture_dir/before"
-"$binary" playbook "$fixture_dir/playbook.yml" -i "$fixture_dir/inventory" --check > "$fixture_dir/check.log"
+rustsible playbook "$fixture_dir/playbook.yml" -i "$fixture_dir/inventory" --check > "$fixture_dir/check.log"
 snapshot > "$fixture_dir/after"
 diff -u "$fixture_dir/before" "$fixture_dir/after"
-"$binary" playbook "$fixture_dir/playbook.yml" -i "$fixture_dir/inventory" > "$fixture_dir/first.log"
-"$binary" playbook "$fixture_dir/playbook.yml" -i "$fixture_dir/inventory" > "$fixture_dir/second.log"
+rustsible playbook "$fixture_dir/playbook.yml" -i "$fixture_dir/inventory" > "$fixture_dir/first.log"
+rustsible playbook "$fixture_dir/playbook.yml" -i "$fixture_dir/inventory" > "$fixture_dir/second.log"
 # `id -un` is the sole command task and reports changed on each real execution.
 [[ $(grep -c 'ok=6 changed=1 unreachable=0 failed=0' "$fixture_dir/second.log") == 3 ]]
 cat > "$fixture_dir/unsafe-parent.yml" <<'EOF'
@@ -116,7 +129,7 @@ cat > "$fixture_dir/unsafe-parent.yml" <<'EOF'
         content: must-not-change
         dest: /srv/rustsible/app/executable
 EOF
-if "$binary" playbook "$fixture_dir/unsafe-parent.yml" -i "$fixture_dir/inventory" > "$fixture_dir/unsafe-parent.log" 2>&1; then
+if rustsible playbook "$fixture_dir/unsafe-parent.yml" -i "$fixture_dir/inventory" > "$fixture_dir/unsafe-parent.log" 2>&1; then
     echo 'Unsafe cross-owner staging unexpectedly succeeded' >&2; exit 1
 fi
 grep -q 'Unsafe destination directory owner' "$fixture_dir/unsafe-parent.log"
@@ -153,7 +166,7 @@ cat > "$fixture_dir/interrupted.yml" <<'EOF'
         content: must-not-run
         dest: /srv/rustsible/plain/after-interruption
 EOF
-if "$binary" playbook "$fixture_dir/interrupted.yml" -i "$fixture_dir/inventory" > "$fixture_dir/interrupted.log" 2>&1; then
+if rustsible playbook "$fixture_dir/interrupted.yml" -i "$fixture_dir/inventory" > "$fixture_dir/interrupted.log" 2>&1; then
     echo 'Interrupted mutation unexpectedly succeeded' >&2; exit 1
 fi
 grep -q 'uncertain=1' "$fixture_dir/interrupted.log"

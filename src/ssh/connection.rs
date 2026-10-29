@@ -169,7 +169,7 @@ fn ssh_timeout(host: &ConnectionConfig) -> Result<Duration> {
     Ok(Duration::from_millis(millis))
 }
 
-fn command_timeout(host: &ConnectionConfig) -> Result<Duration> {
+pub(crate) fn command_timeout(host: &ConnectionConfig) -> Result<Duration> {
     let timeout_value = host
         .get_variable("rustsible_command_timeout")
         .or_else(|| host.get_variable("ansible_command_timeout"));
@@ -304,7 +304,7 @@ fn connect_tcp(hostname: &str, port: u16, timeout: Duration) -> Result<TcpStream
 }
 
 #[cfg(unix)]
-fn spawn_local_shell(command: &str) -> io::Result<Child> {
+pub(crate) fn spawn_local_shell(command: &str) -> io::Result<Child> {
     use std::os::unix::process::CommandExt;
 
     let mut process = Command::new("sh");
@@ -318,7 +318,7 @@ fn spawn_local_shell(command: &str) -> io::Result<Child> {
 }
 
 #[cfg(windows)]
-fn spawn_local_shell(command: &str) -> io::Result<Child> {
+pub(crate) fn spawn_local_shell(command: &str) -> io::Result<Child> {
     Command::new("cmd")
         .args(["/C", command])
         .stdin(Stdio::piped())
@@ -328,7 +328,7 @@ fn spawn_local_shell(command: &str) -> io::Result<Child> {
 }
 
 #[cfg(not(any(unix, windows)))]
-fn spawn_local_shell(command: &str) -> io::Result<Child> {
+pub(crate) fn spawn_local_shell(command: &str) -> io::Result<Child> {
     Command::new("sh")
         .args(["-c", command])
         .stdin(Stdio::piped())
@@ -659,6 +659,50 @@ impl Connection {
         match connection_kind_config(config)? {
             ConnectionKind::Local => Ok(Self::Local(LocalConnection::from_config(config)?)),
             ConnectionKind::Ssh => Ok(Self::Ssh(SshClient::from_config(config)?)),
+        }
+    }
+
+    pub(crate) fn start_worker(&self, command: &str) -> Result<crate::worker::transport::Session> {
+        match self {
+            Self::Local(_) => crate::worker::transport::Session::local(command),
+            Self::Ssh(client) => {
+                client.session.set_blocking(false);
+                let deadline = Instant::now() + client.command_timeout;
+                let mut channel = loop {
+                    match client.session.channel_session() {
+                        Ok(channel) => break channel,
+                        Err(error) => {
+                            let error: io::Error = error.into();
+                            if error.kind() != io::ErrorKind::WouldBlock {
+                                return Err(error).context("Cannot open worker SSH channel");
+                            }
+                        }
+                    }
+                    if Instant::now() >= deadline {
+                        bail!("Opening worker SSH channel timed out");
+                    }
+                    std::thread::sleep(IO_POLL_INTERVAL);
+                };
+                loop {
+                    match channel.exec(command) {
+                        Ok(()) => break,
+                        Err(error) => {
+                            let error: io::Error = error.into();
+                            if error.kind() != io::ErrorKind::WouldBlock {
+                                return Err(error).context("Cannot start worker bootstrap");
+                            }
+                        }
+                    }
+                    if Instant::now() >= deadline {
+                        bail!("Starting worker bootstrap timed out");
+                    }
+                    std::thread::sleep(IO_POLL_INTERVAL);
+                }
+                Ok(crate::worker::transport::Session::Remote {
+                    channel,
+                    _session: client.session.clone(),
+                })
+            }
         }
     }
 

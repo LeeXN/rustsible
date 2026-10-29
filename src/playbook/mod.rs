@@ -23,6 +23,7 @@ pub struct ExecutionOptions {
     pub limit: Option<String>,
     pub check_mode: bool,
     pub forks: usize,
+    pub worker_dir: Option<std::path::PathBuf>,
 }
 
 impl Default for ExecutionOptions {
@@ -31,6 +32,7 @@ impl Default for ExecutionOptions {
             limit: None,
             check_mode: false,
             forks: 5,
+            worker_dir: None,
         }
     }
 }
@@ -68,6 +70,7 @@ pub fn execute_with_options(
 
     let mut failures = Vec::new();
     let mut state = play::RunState::default();
+    state.workers = crate::worker::Runtime::new(options.worker_dir.clone());
 
     for (index, play) in playbook.plays.iter().enumerate() {
         info!(

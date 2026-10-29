@@ -468,6 +468,16 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "13dc2df351e3202783a1fe0d44375f7295ffb4049267b0f3018346dc122a1d94"
 
 [[package]]
+name = "md-5"
+version = "0.10.6"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d89e7ee0cfbedfc4da3340218492196241d89eefb6dab27de5df917a6d2e78cf"
+dependencies = [
+ "cfg-if",
+ "digest",
+]
+
+[[package]]
 name = "memchr"
 version = "2.7.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -795,11 +805,39 @@ dependencies = [
  "mockall",
  "proptest",
  "regex",
+ "rustsible-protocol",
  "serde",
  "serde_json",
  "serde_yaml",
  "sha-crypt",
  "ssh2",
+ "tempfile",
+]
+
+[[package]]
+name = "rustsible-protocol"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "serde",
+ "serde_json",
+ "serde_yaml",
+ "sha2",
+]
+
+[[package]]
+name = "rustsible-worker"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "chrono",
+ "libc",
+ "md-5",
+ "rustsible-protocol",
+ "serde_json",
+ "serde_yaml",
+ "sha1",
+ "sha2",
  "tempfile",
 ]
 
@@ -888,6 +926,17 @@ dependencies = [
  "rand 0.8.6",
  "sha2",
  "subtle",
+]
+
+[[package]]
+name = "sha1"
+version = "0.10.7"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a978451301f4db1d02937a4ab3ccce137717b81826e79b7d49ffe3244a13c3b8"
+dependencies = [
+ "cfg-if",
+ "cpufeatures",
+ "digest",
 ]
 
 [[package]]

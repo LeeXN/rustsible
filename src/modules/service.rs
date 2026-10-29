@@ -404,7 +404,7 @@ pub fn execute_systemd(
         ) {
             Ok(result) => result,
             Err(error) => {
-                let mut result = ModuleResult::from_error(error, !check_mode);
+                let mut result = crate::modules::result::from_error(error, !check_mode);
                 result.changed |= daemon_reload && !check_mode;
                 if result.changed {
                     result.msg = format!("systemd daemon reloaded; {}", result.msg);

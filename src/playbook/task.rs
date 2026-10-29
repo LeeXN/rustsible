@@ -168,6 +168,7 @@ impl Task {
             &definitions,
             &Mapping::new(),
             check_mode,
+            &crate::worker::Runtime::default(),
         )
     }
 
@@ -178,6 +179,7 @@ impl Task {
         definitions: &HashMap<String, Value>,
         play_vars: &Mapping,
         check_mode: bool,
+        workers: &crate::worker::Runtime,
     ) -> Result<TaskResult> {
         let mut definitions = definitions.clone();
         let mut higher_definitions = HashMap::new();
@@ -291,6 +293,7 @@ impl Task {
                     &iter_context,
                     &iter_vars,
                     check_mode,
+                    workers,
                 ) {
                     Ok(result) => result,
                     Err(error) => {
@@ -349,7 +352,8 @@ impl Task {
             if self.normalized_module_name() != "debug" {
                 ConnectionConfig::require_resolved(&definitions, &vars)?;
             }
-            let mut result = self.execute_module(host, &mut engine, &context, &vars, check_mode)?;
+            let mut result =
+                self.execute_module(host, &mut engine, &context, &vars, check_mode, workers)?;
             result.no_log = self.no_log;
             results.push(result);
         }
@@ -437,6 +441,7 @@ impl Task {
         _context: &TemplateContext,
         vars: &HashMap<String, Value>,
         check_mode: bool,
+        workers: &crate::worker::Runtime,
     ) -> Result<TaskResult> {
         debug!(
             "Executing module '{}' for task '{}'",
@@ -478,7 +483,7 @@ impl Task {
         if !invocation.needs_connection() {
             return Ok(TaskResult::from_module_result(
                 &host.name,
-                invocation.execute(None, vars),
+                invocation.execute(None, vars, workers),
             ));
         }
         let mut connection_vars = vars.clone();
@@ -495,7 +500,7 @@ impl Task {
             .entry("ansible_become_user".into())
             .or_insert(Value::String(become_user));
         let config = ConnectionConfig::from_context(&host.name, connection_vars)?;
-        let result = invocation.execute(Some(&config), vars);
+        let result = invocation.execute(Some(&config), vars, workers);
         Ok(TaskResult::from_module_result(&host.name, result))
     }
 

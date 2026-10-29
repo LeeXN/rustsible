@@ -1,10 +1,8 @@
-pub mod command;
 pub mod copy;
 pub mod debug;
 pub mod file;
 pub mod get_url;
 pub mod lineinfile;
-pub mod local;
 pub mod package;
 pub mod param;
 mod python;
@@ -13,9 +11,6 @@ pub mod remote;
 pub(crate) mod result;
 pub use result::{ExecutionFailure, Outcome};
 pub mod service;
-pub mod setup;
-pub mod shell;
-pub mod stat;
 pub mod template;
 pub mod user;
 
@@ -29,21 +24,7 @@ use std::time::Instant;
 use crate::inventory::Host;
 use crate::ssh::connection::{Connection, SshConnection};
 
-/// Result structure for unified handling of module returns
-#[derive(Debug, Default)]
-pub struct ModuleResult {
-    pub stdout: String,
-    pub stderr: String,
-    pub rc: Option<i32>,
-    pub changed: bool,
-    pub failed: bool,
-    pub skipped: bool,
-    pub unreachable: bool,
-    pub uncertain: bool,
-    pub msg: String,
-    /// Module-specific return values exposed to `register`.
-    pub values: HashMap<String, Value>,
-}
+pub use rustsible_protocol::ModuleResult;
 
 /// Controls an ad-hoc run. `become_override` is optional so an explicit
 /// command-line request can override inventory while an omitted flag still
@@ -54,6 +35,7 @@ pub struct AdHocOptions {
     pub become_user: Option<String>,
     pub check_mode: bool,
     pub forks: usize,
+    pub worker_dir: Option<std::path::PathBuf>,
 }
 
 impl Default for AdHocOptions {
@@ -63,6 +45,7 @@ impl Default for AdHocOptions {
             become_user: None,
             check_mode: false,
             forks: 5,
+            worker_dir: None,
         }
     }
 }
@@ -153,25 +136,25 @@ pub trait ModuleExecutor {
         info!("{}", success_msg);
         Ok(module_result)
     }
+}
 
-    /// Helper to extract a string argument from Value, handling both String and Mapping with "cmd" key
-    fn extract_command_arg(args: &Value) -> Result<String> {
-        match args {
-            Value::String(cmd) => Ok(cmd.clone()),
-            Value::Mapping(map) => {
-                if map.len() != 1 {
-                    return Err(anyhow::anyhow!(
-                        "Command modules accept only the 'cmd' parameter"
-                    ));
-                }
-                if let Some(Value::String(cmd)) = map.get(Value::String("cmd".to_string())) {
-                    Ok(cmd.clone())
-                } else {
-                    Err(anyhow::anyhow!("Module requires a valid command string"))
-                }
+/// Helper to extract a string argument from Value, handling both String and Mapping with "cmd" key
+pub(crate) fn extract_command_arg(args: &Value) -> Result<String> {
+    match args {
+        Value::String(cmd) => Ok(cmd.clone()),
+        Value::Mapping(map) => {
+            if map.len() != 1 {
+                return Err(anyhow::anyhow!(
+                    "Command modules accept only the 'cmd' parameter"
+                ));
             }
-            _ => Err(anyhow::anyhow!("Module requires a valid command string")),
+            if let Some(Value::String(cmd)) = map.get(Value::String("cmd".to_string())) {
+                Ok(cmd.clone())
+            } else {
+                Err(anyhow::anyhow!("Module requires a valid command string"))
+            }
         }
+        _ => Err(anyhow::anyhow!("Module requires a valid command string")),
     }
 }
 
@@ -224,17 +207,25 @@ pub fn run_adhoc_with_options(
     // Keep the amount of simultaneous SSH/local work bounded. Chunks are
     // joined in their original order so user-visible output and recap remain
     // deterministic even though execution within each chunk is concurrent.
+    let runtime = crate::worker::Runtime::new(options.worker_dir.clone());
     let mut executions = Vec::with_capacity(hosts.len());
     for chunk in hosts.chunks(options.forks) {
         let chunk_executions = std::thread::scope(|scope| {
             let module_args = &module_args;
+            let runtime = &runtime;
             let handles = chunk
                 .iter()
                 .map(|host| {
                     scope.spawn(move || {
                         info!("Running module {} on host {}", module_name, host.name);
                         let start_time = Instant::now();
-                        let result = execute_adhoc_module(host, module_name, module_args, options);
+                        let result = execute_adhoc_with_runtime(
+                            host,
+                            module_name,
+                            module_args,
+                            options,
+                            runtime,
+                        );
                         HostExecution {
                             result,
                             duration: start_time.elapsed(),
@@ -445,18 +436,35 @@ fn structured_module_output(result: &ModuleResult) -> Result<Option<String>> {
         .map(Some)
 }
 
+#[cfg(test)]
 fn execute_adhoc_module(
     host: &Host,
     module_name: &str,
     args: &Value,
     options: &AdHocOptions,
 ) -> Result<ModuleResult> {
+    execute_adhoc_with_runtime(
+        host,
+        module_name,
+        args,
+        options,
+        &crate::worker::Runtime::new(options.worker_dir.clone()),
+    )
+}
+
+fn execute_adhoc_with_runtime(
+    host: &Host,
+    module_name: &str,
+    args: &Value,
+    options: &AdHocOptions,
+    runtime: &crate::worker::Runtime,
+) -> Result<ModuleResult> {
     let invocation = registry::Invocation::prepare(module_name, args, options.check_mode)?;
     let config = invocation
         .needs_connection()
         .then(|| adhoc_config(host, options))
         .transpose()?;
-    Ok(invocation.execute(config.as_ref(), &HashMap::new()))
+    Ok(invocation.execute(config.as_ref(), &HashMap::new(), runtime))
 }
 
 /// Parse command line arguments in format "key1=value1 key2=value2"
@@ -484,89 +492,6 @@ fn parse_args(args_str: &str) -> Result<serde_yaml::Mapping> {
 /// that are useful for `key=value` input: whitespace separation, adjacent
 /// quoted segments, and backslash escaping. No expansion or command execution
 /// is performed.
-pub(crate) fn tokenize_args(input: &str) -> Result<Vec<String>> {
-    #[derive(Clone, Copy)]
-    enum Quote {
-        Single,
-        Double,
-    }
-
-    let mut tokens = Vec::new();
-    let mut token = String::new();
-    let mut token_started = false;
-    let mut quote = None;
-    let mut chars = input.chars().peekable();
-
-    while let Some(ch) = chars.next() {
-        match quote {
-            Some(Quote::Single) => {
-                if ch == '\'' {
-                    quote = None;
-                } else {
-                    token.push(ch);
-                }
-            }
-            Some(Quote::Double) => match ch {
-                '"' => quote = None,
-                '\\' => {
-                    let escaped = chars
-                        .next()
-                        .ok_or_else(|| anyhow::anyhow!("Trailing escape in quoted argument"))?;
-                    match escaped {
-                        '$' | '`' | '"' | '\\' => token.push(escaped),
-                        '\n' => {}
-                        other => {
-                            // POSIX double quotes preserve a backslash unless
-                            // it precedes a character that can be escaped.
-                            token.push('\\');
-                            token.push(other);
-                        }
-                    }
-                }
-                _ => token.push(ch),
-            },
-            None => match ch {
-                ch if ch.is_whitespace() => {
-                    if token_started {
-                        tokens.push(std::mem::take(&mut token));
-                        token_started = false;
-                    }
-                }
-                '\'' => {
-                    token_started = true;
-                    quote = Some(Quote::Single);
-                }
-                '"' => {
-                    token_started = true;
-                    quote = Some(Quote::Double);
-                }
-                '\\' => {
-                    token_started = true;
-                    let escaped = chars
-                        .next()
-                        .ok_or_else(|| anyhow::anyhow!("Trailing escape in argument list"))?;
-                    if escaped != '\n' {
-                        token.push(escaped);
-                    }
-                }
-                _ => {
-                    token_started = true;
-                    token.push(ch);
-                }
-            },
-        }
-    }
-
-    if quote.is_some() {
-        return Err(anyhow::anyhow!("Unclosed quote in argument list"));
-    }
-    if token_started {
-        tokens.push(token);
-    }
-
-    Ok(tokens)
-}
-
 fn infer_arg_value(value: &str) -> Value {
     if value.eq_ignore_ascii_case("true") {
         return Value::Bool(true);
@@ -590,6 +515,8 @@ fn infer_arg_value(value: &str) -> Value {
 
     Value::String(value.to_string())
 }
+
+pub(crate) use rustsible_protocol::tokenize_args;
 
 #[cfg(test)]
 mod tests {
@@ -814,6 +741,7 @@ mod tests {
             become_user: None,
             check_mode: false,
             forks: 5,
+            ..AdHocOptions::default()
         };
 
         let facts = execute_adhoc_module(
@@ -847,6 +775,7 @@ mod tests {
             become_user: None,
             check_mode: true,
             forks: 5,
+            ..AdHocOptions::default()
         };
         let empty = Value::Mapping(Default::default());
 
@@ -892,6 +821,7 @@ mod tests {
             become_user: Some("cli-user".to_string()),
             check_mode: true,
             forks: 3,
+            ..AdHocOptions::default()
         };
         let config = adhoc_config(&host, &explicit).unwrap();
         assert!(!config.use_become);
