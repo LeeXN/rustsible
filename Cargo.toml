@@ -28,6 +28,7 @@ chrono = "0.4.41"
 colored = "3.0.0"
 sha-crypt = "0.5.0"
 minijinja = { version = "=3.0.4", features = ["serde", "unicode", "fuel", "unstable_machinery"] }
+rpassword = "7.5.4"
 
 [dev-dependencies]
 mockall = "0.12"

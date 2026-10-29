@@ -1,0 +1,2 @@
+- import_playbook: imported.yml
+  tags: alpha

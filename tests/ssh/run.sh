@@ -8,6 +8,8 @@ rustsible() { "$controller_binary" --worker-dir "$worker_dir" "$@"; }
 mode=${3:-full}
 libc=${4:-glibc}
 http_fixture=${5:-}
+prompt_fixture=${5:-}
+if [[ $mode == operator && ! -x $prompt_fixture ]]; then echo "Operator acceptance requires prompt_fixture as argument 5" >&2; exit 1; fi
 if [[ ( $mode == native || $mode == systems || $mode == network ) && ! -x $http_fixture ]]; then
     echo 'Native acceptance requires the static http_fixture example as argument 5' >&2; exit 1
 fi
@@ -95,6 +97,7 @@ ansible_user=deploy
 ansible_ssh_private_key_file=$fixture_dir/key
 rustsible_known_hosts_file=$fixture_dir/known_hosts
 EOF
+if [[ $mode == operator ]]; then source "$repo_dir/tests/ssh/operator.sh"; exit 0; fi
 if [[ $mode == artifacts ]]; then source "$repo_dir/tests/ssh/artifacts.sh"; exit 0; fi
 if [[ $mode == systems ]]; then
     if [[ $libc == musl ]]; then source "$repo_dir/tests/systems/alpine.sh"; elif [[ $libc == sysv ]]; then source "$repo_dir/tests/systems/sysv.sh"; else source "$repo_dir/tests/systems/cases.sh"; fi

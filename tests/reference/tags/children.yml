@@ -1,0 +1,3 @@
+- copy: {content: selected, dest: '{{ out }}/child'}
+  tags: alpha
+- copy: {content: selected, dest: '{{ out }}/untagged-child'}

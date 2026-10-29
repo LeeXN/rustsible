@@ -25,6 +25,8 @@ pub struct AdHocOptions {
     pub become_override: Option<bool>,
     pub become_user: Option<String>,
     pub check_mode: bool,
+    pub diff: bool,
+    pub credentials: crate::ssh::credentials::Credentials,
     pub background: u64,
     pub poll: u64,
     pub forks: usize,
@@ -40,6 +42,8 @@ impl Default for AdHocOptions {
             become_override: None,
             become_user: None,
             check_mode: false,
+            diff: false,
+            credentials: Default::default(),
             background: 0,
             poll: 15,
             forks: 5,
@@ -116,7 +120,11 @@ pub fn run_adhoc_with_options(
     };
     let mut state = crate::playbook::RunState::default();
     state.extra = std::sync::Arc::new(extra);
-    state.workers = std::sync::Arc::new(crate::worker::Runtime::new(options.worker_dir.clone()));
+    state.workers = std::sync::Arc::new(
+        crate::worker::Runtime::new(options.worker_dir.clone())
+            .with_credentials(options.credentials.clone())
+            .with_diff(options.diff),
+    );
     state.prepare(
         inventory,
         &std::env::current_dir()?,
@@ -364,7 +372,9 @@ fn execute_adhoc_module(
         module_name,
         args,
         options,
-        &crate::worker::Runtime::new(options.worker_dir.clone()),
+        &crate::worker::Runtime::new(options.worker_dir.clone())
+            .with_credentials(options.credentials.clone())
+            .with_diff(options.diff),
         &variables,
     )
 }
@@ -680,6 +690,8 @@ mod tests {
             become_override: None,
             become_user: None,
             check_mode: false,
+            diff: false,
+            credentials: Default::default(),
             forks: 5,
             ..AdHocOptions::default()
         };

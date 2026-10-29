@@ -1,0 +1,13 @@
+- hosts: localhost
+  gather_facts: false
+  tasks:
+    - block:
+        - fail: {msg: expected}
+          tags: alpha
+      rescue:
+        - copy: {content: unexpected, dest: '{{ out }}/rescued'}
+      always:
+        - copy: {content: selected, dest: '{{ out }}/always'}
+          tags: alpha
+    - copy: {content: unexpected, dest: '{{ out }}/after'}
+      tags: alpha

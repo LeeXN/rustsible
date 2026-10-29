@@ -75,6 +75,8 @@ jobs:
       - run: cargo build --workspace --release --target ${{ matrix.target }} --locked
       - name: Build native HTTP acceptance fixture
         run: cargo build -p rustsible-worker --example http_fixture --release --target ${{ matrix.target }} --locked
+      - name: Build controlling terminal acceptance fixture
+        run: cargo build --example prompt_fixture --release --target ${{ matrix.target }} --locked
       - name: Assemble native worker directory
         run: cargo run --locked -p rustsible-protocol --example worker_manifest -- target/workers ${{ matrix.arch }}=target/${{ matrix.target }}/release/rustsible-worker
       - name: Existing SSH scenarios
@@ -111,6 +113,10 @@ jobs:
         run: bash tests/ssh/run.sh target/${{ matrix.target }}/release/rustsible target/workers artifacts
       - name: Git and safe archive deployment on musl
         run: bash tests/ssh/run.sh target/${{ matrix.target }}/release/rustsible target/workers artifacts musl
+      - name: Tags, diff, private keys and hidden SSH/sudo prompts
+        run: bash tests/ssh/run.sh target/${{ matrix.target }}/release/rustsible target/workers operator glibc target/${{ matrix.target }}/release/examples/prompt_fixture
+      - name: Operator CLI on musl
+        run: bash tests/ssh/run.sh target/${{ matrix.target }}/release/rustsible target/workers operator musl target/${{ matrix.target }}/release/examples/prompt_fixture
       - name: Native execution without Python or curl (glibc)
         run: bash tests/ssh/run.sh target/${{ matrix.target }}/release/rustsible target/workers native glibc target/${{ matrix.target }}/release/examples/http_fixture
       - name: Native execution without Python or curl (musl)

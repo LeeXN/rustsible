@@ -1,0 +1,11 @@
+- hosts: all
+  gather_facts: false
+  tasks:
+    - name: Show selected deployment context
+      debug:
+        msg: '{{ inventory_hostname }} selected for deployment'
+      tags: deploy
+    - name: Explicit diagnostic task
+      debug:
+        msg: diagnostic only
+      tags: [never, diagnostics]

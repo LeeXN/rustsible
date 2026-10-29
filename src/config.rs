@@ -201,6 +201,16 @@ impl Config {
         }
         Ok(())
     }
+    /// CLI keys replace the shared configuration baseline, so typed connection
+    /// variables retain their higher precedence without another host table.
+    pub fn set_private_key(&mut self, path: &Path) -> Result<()> {
+        self.set(
+            "defaults",
+            "private_key_file",
+            path.to_str().context("Private key path must be UTF-8")?,
+            &std::env::current_dir()?,
+        )
+    }
     pub fn apply_inventory(&self, inventory: &mut Inventory) {
         inventory.defaults = Some(std::sync::Arc::new(self.defaults.clone()));
         inventory.apply_group_vars();

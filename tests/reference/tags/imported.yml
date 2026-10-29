@@ -1,0 +1,5 @@
+- hosts: localhost
+  gather_facts: false
+  tags: beta
+  tasks:
+    - copy: {content: imported, dest: '{{ out }}/imported'}

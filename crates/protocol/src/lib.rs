@@ -12,7 +12,7 @@ use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::io::{Read, Write};
 
-pub const VERSION: u32 = 4;
+pub const VERSION: u32 = 5;
 pub const BUILD_ID: &str = env!("RUSTSIBLE_BUILD_ID");
 pub const MAX_REQUEST_BYTES: usize = 16 * 1024 * 1024;
 // JSON escaping can expand a bounded 16 MiB command response sixfold.
@@ -47,6 +47,7 @@ pub struct Request {
     pub module: String,
     pub args: serde_yaml::Value,
     pub check: bool,
+    pub diff: bool,
     pub timeout_ms: u64,
     pub environment: std::collections::BTreeMap<String, String>,
     pub managed: bool,
@@ -102,6 +103,7 @@ impl Request {
             module: module.into(),
             args,
             check,
+            diff: false,
             timeout_ms,
             environment: Default::default(),
             managed: true,
@@ -134,6 +136,11 @@ impl Request {
         if !NATIVE_MODULES.contains(&self.module.as_str()) {
             bail!("Unsupported native module: {}", self.module);
         }
+        registry::Builtin::lookup(&self.module)?.validate_capabilities(
+            self.check,
+            self.diff,
+            self.asynchronous.is_some(),
+        )?;
         if let Some(asynchronous) = &self.asynchronous {
             asynchronous.validate()?;
             if self.check {

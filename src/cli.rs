@@ -25,6 +25,13 @@ pub fn build_cli() -> Command {
         .subcommand(
             Command::new("playbook")
                 .arg(extra_vars_arg())
+                .args(connection_args())
+                .arg(Arg::new("diff").long("diff").action(ArgAction::SetTrue).help("Show bounded structured differences from supported modules"))
+                .arg(Arg::new("tags").long("tags").action(ArgAction::Append).value_name("TAGS").help("Run tasks matching comma-separated tags"))
+                .arg(Arg::new("skip-tags").long("skip-tags").action(ArgAction::Append).value_name("TAGS").help("Skip tasks matching comma-separated tags"))
+                .arg(Arg::new("syntax-check").long("syntax-check").action(ArgAction::SetTrue).conflicts_with_all(["list-hosts", "list-tasks"]).help("Validate static playbook structure without connecting"))
+                .arg(Arg::new("list-hosts").long("list-hosts").action(ArgAction::SetTrue).conflicts_with("list-tasks").help("List selected hosts as JSON without connecting"))
+                .arg(Arg::new("list-tasks").long("list-tasks").action(ArgAction::SetTrue).help("List selected static tasks as JSON without connecting"))
                 .about("Run a Rustsible playbook")
                 .arg(
                     Arg::new("playbook")
@@ -71,6 +78,8 @@ pub fn build_cli() -> Command {
         .subcommand(
             Command::new("ad-hoc")
                 .arg(extra_vars_arg())
+                .args(connection_args())
+                .arg(Arg::new("diff").long("diff").action(ArgAction::SetTrue).help("Show bounded structured differences from supported modules"))
                 .about("Run an ad-hoc command on managed nodes")
                 .arg(
                     Arg::new("pattern")
@@ -172,6 +181,26 @@ fn extra_vars_arg() -> Arg {
         .action(ArgAction::Append)
         .value_name("VARS")
         .help("Extra variables as name=value, a YAML/JSON mapping, or @file")
+}
+
+fn connection_args() -> [Arg; 3] {
+    [
+        Arg::new("ask-pass")
+            .short('k')
+            .long("ask-pass")
+            .action(ArgAction::SetTrue)
+            .help("Prompt for SSH password on the controlling terminal"),
+        Arg::new("ask-become-pass")
+            .short('K')
+            .long("ask-become-pass")
+            .action(ArgAction::SetTrue)
+            .help("Prompt for privilege escalation password on the controlling terminal"),
+        Arg::new("private-key")
+            .long("private-key")
+            .value_parser(clap::value_parser!(std::path::PathBuf))
+            .value_name("FILE")
+            .help("SSH private key file"),
+    ]
 }
 
 #[cfg(test)]

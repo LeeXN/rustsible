@@ -259,8 +259,7 @@ Playbooks support `meta: flush_handlers`, `clear_host_errors`, `reset_connection
 `end_host`, and `end_play`. Clear errors allows excluded hosts into later plays;
 it preserves the failure recap and exit status. End host/play stops that play
 without excluding the host from later plays. Ad-hoc meta supports only reset.
-Blocks cannot loop or register as a unit; static imports cannot loop. Tags are
-still outside the implemented scope.
+Blocks cannot loop or register as a unit; static imports cannot loop.
 See [the reusable deployment example](examples/reuse/main.yml) and the pinned
 reference scenarios under [tests/reference/reuse](tests/reference/reuse).
 
@@ -300,6 +299,45 @@ See [the rolling example](examples/rolling/playbook.yml). The SSH strategy
 fixture uses three distinct servers and checks physical identities, batch
 barriers, cross-host facts, parallel delegation, idempotency, check and cleanup.
 
+## Task selection, inspection and credentials
+
+`playbook --tags TAGS --skip-tags TAGS` accepts comma-separated values and
+repeated flags. Tags are additive across plays, blocks, static imports and
+roles/dependencies. Dynamic include tags select the include itself; child tags
+are independent, while apply and enclosing blocks propagate tags. String/list
+string tags may use existing variables, including a standalone list expression.
+The reserved always/never/all/tagged/untagged selection rules follow the pinned
+reference, with skip precedence. Implicit fact gathering uses always unless the
+play supplies tags. Notified handlers ignore tags. A rescue entirely removed by
+tag selection preserves the original failure; selected always tasks still run.
+
+`--syntax-check`, `--list-hosts` and `--list-tasks` return JSON without opening
+connections, prompting for credentials or deploying workers. Inspection uses
+the same source loader and variable layers as execution. Static imports/roles
+are expanded; dynamic includes remain placeholders and their contents require
+execution. Task lists omit handler/role boundary events and implicit gathering,
+and include source paths rather than module arguments. Fact/result-dependent
+tag expressions cannot be resolved during static listing and report an error.
+Syntax checks static structure, module names and argument keys; resolved types
+and runtime includes are checked before their selected execution.
+
+`--diff` works with playbook/ad-hoc and check mode. Supported file modules return
+structured before/after metadata and regular UTF-8 text up to 64 KiB per side.
+Binary/large content returns SHA-256/size summaries. Git reports commit IDs;
+archives report directory/entry summaries. Check predicts copy/template/line
+content where available, and labels unknown download/archive content without
+performing extra modifying requests. Modules without diff run normally. no_log
+hides diff/output while register retains private in-memory data.
+
+`-k/--ask-pass` and `-K/--ask-become-pass` read without echo from the controlling
+terminal, restore echo on cancellation, and reject non-interactive prompting.
+`-K` supplies a password; become is enabled separately by play/task/inventory
+or ad-hoc -b. Prompted passwords remain outside template variables and persisted
+configuration; native SSH/sudo paths keep them off argv and logs. Declared
+connection password variables override prompted defaults. `--private-key FILE`
+overrides configuration/environment defaults; inventory/play/task connection
+variables and -e retain their higher precedence.
+
 ## Target readiness and HTTP
 
 `wait_for` supports a TCP host/port, file presence/absence, or a multiline
@@ -336,11 +374,11 @@ default, branch, tag, full ref or full commit), and update (default true).
 New clones install from a private sibling directory. Updates reject local
 changes; update=false retains an existing checkout. Check uses ls-remote and
 local queries without clone/fetch/checkout. Results include before/after commit
-IDs. Ambiguous branch/tag names require a full ref; missing tools fail directly.
+IDs and commit summaries under --diff. Ambiguous branch/tag names require a full
+ref; missing tools fail directly.
 HTTP URL credentials and external remote helpers are rejected; use target SSH
 keys/known_hosts or credential helpers. Submodules and force/reset are outside
-this subset. Diff currently has no CLI entry; the common capability validator
-rejects a diff request until the CLI/diff delivery.
+this subset.
 
 `unarchive` supports tar, tar.gz and ZIP (stored/deflate), controller src by
 default or absolute target src with remote_src=true, absolute existing dest,
@@ -408,7 +446,8 @@ no service. SSH/controller exit after startup leaves the job running. Credential
 and requests use stdin. Later status queries retain the original job's no_log
 display policy, while registered data remains usable in memory.
 
-Protocol v4 adds native job and display metadata; mismatched workers are rejected.
+Protocol v5 adds explicit bounded diff requests alongside job/display metadata;
+mismatched workers are rejected.
 See [the async example](examples/async/playbook.yml) and the
 [fixed Ansible 2.21 comparison](tests/reference/async.yml).
 

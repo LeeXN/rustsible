@@ -18,12 +18,14 @@ use crate::ssh::config::ConnectionConfig;
 
 pub(crate) struct TaskExecution<'a> {
     pub workers: &'a crate::worker::Runtime,
+    pub tags: Option<&'a super::TagSelection>,
     pub delegation: Option<crate::playbook::play::Delegation<'a>>,
 }
 impl<'a> TaskExecution<'a> {
     pub fn new(workers: &'a crate::worker::Runtime) -> Self {
         Self {
             workers,
+            tags: None,
             delegation: None,
         }
     }
@@ -92,6 +94,7 @@ pub struct TaskGroup {
 pub struct TaskResult {
     /// run_once shares data and host policy without inventing extra executions.
     pub(crate) inherited_result: bool,
+    pub(crate) filtered: bool,
     pub(crate) meta: Option<String>,
     pub(crate) includes: Vec<IncludeRequest>,
     pub(crate) notifications: Vec<String>,
@@ -130,6 +133,7 @@ impl TaskResult {
         insert_output_values(&mut values, String::new(), String::new(), None);
         TaskResult {
             inherited_result: false,
+            filtered: false,
             meta: None,
             includes: Vec::new(),
             notifications: Vec::new(),
@@ -156,6 +160,7 @@ impl TaskResult {
 
         TaskResult {
             inherited_result: false,
+            filtered: false,
             meta: None,
             includes: Vec::new(),
             notifications: Vec::new(),
@@ -219,8 +224,7 @@ pub struct Task {
     /// Hide task payloads and errors from terminal/log output.
     pub no_log: Option<bool>,
     pub vars: Mapping,
-    #[allow(dead_code)]
-    pub tags: Vec<String>, // Keep this for future use
+    pub tags: Vec<String>,
     pub loop_items: Option<Value>,
     pub loop_var_name: Option<String>, // Name for loop variable (default: item)
     pub index_var_name: Option<String>, // Name for index variable
@@ -260,6 +264,20 @@ impl Task {
         } else {
             self.parent = Some(std::sync::Arc::new(parent.raw().clone()));
         }
+    }
+    /// Outer import/include defaults belong on each child in addition to the
+    /// child's own block header; keeping this shared avoids preview drift.
+    pub(crate) fn bind_children(&self, tasks: &[Task]) -> Vec<Task> {
+        tasks
+            .iter()
+            .cloned()
+            .map(|mut child| {
+                if let Some(parent) = &self.raw().parent {
+                    child.inherit(parent);
+                }
+                child
+            })
+            .collect()
     }
     pub(crate) fn raw(&self) -> &Task {
         self.original.as_deref().unwrap_or(self)
@@ -459,6 +477,13 @@ impl Task {
         let (mut definitions, mut data) =
             self.variable_layers(host, runtime, definitions, play_vars)?;
         let vars = crate::playbook::templar::resolve_definitions(&definitions, &data)?;
+        if let Some(tags) = execution.tags {
+            if !tags.selected(&self.tags, &vars)? {
+                let mut result = TaskResult::new(&host.name);
+                result.filtered = true;
+                return Ok(result);
+            }
+        }
         let start_time = Instant::now();
         info!("TASK [{}] on host {}", self.name, host.name);
 
@@ -1604,6 +1629,11 @@ pub(crate) fn print_task_result(
         return;
     }
 
+    if let Some(diff) = result.values.get("diff") {
+        if let Ok(text) = serde_json::to_string_pretty(diff) {
+            println!("    diff: {text}");
+        }
+    }
     if let Some(Value::String(stdout)) = result.values.get("stdout") {
         if !stdout.is_empty() {
             println!("    {}", stdout.trim());
@@ -1672,6 +1702,11 @@ pub(crate) fn print_loop_iteration_result(
         return;
     }
 
+    if let Some(diff) = result.values.get("diff") {
+        if let Ok(text) = serde_json::to_string_pretty(diff) {
+            println!("    diff: {text}");
+        }
+    }
     if let Some(Value::String(stdout)) = result.values.get("stdout") {
         if !stdout.is_empty() {
             for line in stdout.trim().lines() {

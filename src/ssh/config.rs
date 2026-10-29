@@ -18,6 +18,9 @@ pub struct ConnectionConfig {
 }
 
 impl ConnectionConfig {
+    pub(crate) fn set_private(&mut self, name: &str, value: String) {
+        self.variables.insert(name.into(), Value::String(value));
+    }
     pub fn hostname(&self) -> &str {
         &self.hostname
     }

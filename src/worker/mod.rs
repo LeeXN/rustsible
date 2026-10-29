@@ -58,6 +58,8 @@ impl Source {
 #[derive(Default)]
 pub(crate) struct Runtime {
     directory: Option<PathBuf>,
+    credentials: crate::ssh::credentials::Credentials,
+    diff: bool,
     leases: Mutex<HashMap<String, Arc<Mutex<Option<Client>>>>>,
 }
 impl Runtime {
@@ -66,6 +68,14 @@ impl Runtime {
             directory,
             ..Self::default()
         }
+    }
+    pub fn with_diff(mut self, diff: bool) -> Self {
+        self.diff = diff;
+        self
+    }
+    pub fn with_credentials(mut self, credentials: crate::ssh::credentials::Credentials) -> Self {
+        self.credentials = credentials;
+        self
     }
     fn directory(&self) -> Result<PathBuf> {
         if let Some(directory) = &self.directory {
@@ -103,6 +113,11 @@ impl Runtime {
         mut request: Request,
         mut source: Option<&mut Source>,
     ) -> Result<ModuleResult> {
+        let mut private_config = config.clone();
+        self.credentials.apply(&mut private_config);
+        let config = &private_config;
+        request.diff |= self.diff
+            && rustsible_protocol::registry::Builtin::lookup(&request.module)?.supports_diff();
         let module = request.module.clone();
         let check = request.check;
         let may_modify = request.asynchronous.is_some()
