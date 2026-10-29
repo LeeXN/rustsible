@@ -1,7 +1,6 @@
 FROM debian:12-slim
-ARG PYTHON_PACKAGES=python3
 RUN apt-get update \
-    && apt-get install -y --no-install-recommends openssh-server sudo ${PYTHON_PACKAGES} \
+    && apt-get install -y --no-install-recommends openssh-server sudo ca-certificates libcap2-bin \
     && rm -rf /var/lib/apt/lists/* /etc/ssh/ssh_host_* \
     && mkdir -p /run/sshd \
     && useradd -m -s /bin/sh deploy \

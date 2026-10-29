@@ -7,6 +7,10 @@ worker_dir=$(realpath -- "${2:-$(dirname -- "$controller_binary")/workers}")
 rustsible() { "$controller_binary" --worker-dir "$worker_dir" "$@"; }
 mode=${3:-full}
 libc=${4:-glibc}
+http_fixture=${5:-}
+if [[ $mode == native && ! -x $http_fixture ]]; then
+    echo 'Native acceptance requires the static http_fixture example as argument 5' >&2; exit 1
+fi
 fixture_dir=$(mktemp -d)
 chmod 0700 "$fixture_dir"
 container=''
@@ -24,13 +28,19 @@ cleanup() {
 trap cleanup EXIT
 trap 'exit 1' HUP INT TERM
 
-python_packages=python3
-if [[ $mode == native ]]; then python_packages=''; fi
 fixture_dockerfile=$repo_dir/tests/ssh/Dockerfile
 if [[ $libc == musl ]]; then fixture_dockerfile=$repo_dir/tests/ssh/Dockerfile.musl; fi
-docker build -q -f "$fixture_dockerfile" --build-arg "PYTHON_PACKAGES=$python_packages" -t "rustsible-ssh-fixture:$mode-$libc" "$repo_dir/tests/ssh" >/dev/null
+build_args=()
+if [[ -n ${CODEX_PROXY_CERT:-} ]]; then build_args+=(--secret "id=proxy_ca,src=$CODEX_PROXY_CERT"); fi
+docker build -q -f "$fixture_dockerfile" "${build_args[@]}" -t "rustsible-ssh-fixture:$mode-$libc" "$repo_dir/tests/ssh" >/dev/null
 ssh-keygen -q -t ed25519 -N '' -f "$fixture_dir/key"
-container=$(docker run -d --rm -p 127.0.0.1::22 --tmpfs /noexec:rw,noexec,mode=1777 "rustsible-ssh-fixture:$mode-$libc")
+input_tmp_size=$(( $(stat -c %s "$worker_dir/rustsible-worker-linux-$(uname -m)") + 8 * 1024 * 1024 ))
+container=$(docker run -d --rm -p 127.0.0.1::22 --tmpfs /noexec:rw,noexec,mode=1777 --tmpfs /small:rw,size=64k,mode=1777 \
+    --tmpfs "/input-small:rw,exec,size=$input_tmp_size,mode=1777" --tmpfs "/input-inodes:rw,exec,size=$input_tmp_size,nr_inodes=3,mode=1777" \
+    -e HTTP_PROXY=http://127.0.0.1:18080 -e http_proxy=http://127.0.0.1:18080 \
+    -e HTTPS_PROXY=http://127.0.0.1:18080 -e https_proxy=http://127.0.0.1:18080 \
+    -e NO_PROXY=localhost,127.0.0.1 -e no_proxy=localhost,127.0.0.1 \
+    "rustsible-ssh-fixture:$mode-$libc")
 docker cp "$fixture_dir/key.pub" "$container:/tmp/authorized_keys" >/dev/null
 docker exec "$container" sh -eu -c '
     install -d -m 0700 -o deploy -g deploy /home/deploy/.ssh
@@ -75,6 +85,7 @@ rustsible_known_hosts_file=$fixture_dir/known_hosts
 EOF
 if [[ $mode == native ]]; then
     source "$repo_dir/tests/ssh/native.sh"
+    source "$repo_dir/tests/ssh/files.sh"
     exit 0
 fi
 cat > "$fixture_dir/playbook.yml" <<'EOF'

@@ -193,7 +193,8 @@ impl Builtin {
             if !valid {
                 bail!("Invalid type for {} parameter '{key}'", self.name());
             }
-            if value.as_str().is_some_and(|value| value.contains('\0')) {
+            let binary_content = key == "content" && matches!(self, Self::Copy | Self::Template);
+            if !binary_content && value.as_str().is_some_and(|value| value.contains('\0')) {
                 bail!("Module parameter '{key}' cannot contain NUL bytes");
             }
         }
@@ -269,7 +270,7 @@ impl Builtin {
         }
         if self != Self::User {
             if let Some(mode) = string("mode") {
-                super::file::normalize_mode(mode)?;
+                super::param::parse_mode(mode)?;
             }
             for key in ["owner", "group"] {
                 if let Some(value) = string(key) {
@@ -301,6 +302,12 @@ impl Builtin {
             }
             if let Some(pattern) = string("regexp") {
                 regex::Regex::new(pattern)?;
+            }
+            if string("state") == Some("absent")
+                && args.get("line").is_none()
+                && args.get("regexp").is_none()
+            {
+                bail!("lineinfile state=absent requires line or regexp");
             }
             if string("state").unwrap_or("present") == "present" && args.get("line").is_none() {
                 bail!("lineinfile state=present requires line");
@@ -366,6 +373,34 @@ impl Invocation {
                 return super::debug::execute_without_connection(&self.args);
             }
             let config = config.context("Target module needs a connection configuration")?;
+            if matches!(self.module, Builtin::Copy | Builtin::Template) {
+                let mut args = self.args.clone();
+                let mut source = if self.module == Builtin::Template {
+                    crate::worker::Source::bytes(super::template::render(&args, vars)?.into_bytes())
+                } else if let Some(src) = args.get("src").and_then(Value::as_str) {
+                    crate::worker::Source::file(src)?
+                } else {
+                    crate::worker::Source::bytes(
+                        args.get("content")
+                            .and_then(Value::as_str)
+                            .context("Copy requires string content")?
+                            .as_bytes()
+                            .to_vec(),
+                    )
+                };
+                if let Some(mapping) = args.as_mapping_mut() {
+                    for name in ["src", "content", "vars"] {
+                        mapping.remove(Value::String(name.into()));
+                    }
+                }
+                return runtime.execute_with_source(
+                    config,
+                    self.module.name(),
+                    args,
+                    self.check,
+                    Some(&mut source),
+                );
+            }
             if rustsible_protocol::NATIVE_MODULES.contains(&self.module.name()) {
                 return runtime.execute(config, self.module.name(), self.args.clone(), self.check);
             }
@@ -375,7 +410,6 @@ impl Invocation {
                 connection.as_connection(),
                 config.use_become,
                 &config.become_user,
-                vars,
             )
         })();
         match result {
@@ -395,20 +429,14 @@ impl Invocation {
         connection: &dyn crate::ssh::connection::SshConnection,
         use_become: bool,
         user: &str,
-        vars: &HashMap<String, Value>,
     ) -> Result<ModuleResult> {
         let args = &self.args;
         match self.module {
             Builtin::Command | Builtin::Shell | Builtin::Setup | Builtin::Stat => {
                 unreachable!("Native modules use the worker")
             }
-            Builtin::Copy => super::copy::execute(connection, args, use_become, user, self.check),
-            Builtin::File => super::file::execute(connection, args, use_become, user, self.check),
-            Builtin::Template => super::template::execute_with_context(
-                connection, args, use_become, user, self.check, vars,
-            ),
-            Builtin::Lineinfile => {
-                super::lineinfile::execute(connection, args, use_become, user, self.check)
+            Builtin::Copy | Builtin::Template | Builtin::File | Builtin::Lineinfile => {
+                unreachable!("Native file modules use the worker")
             }
             Builtin::User => super::user::execute(connection, args, use_become, user, self.check),
             Builtin::Service => {
@@ -417,9 +445,7 @@ impl Invocation {
             Builtin::Systemd => {
                 super::service::execute_systemd(connection, args, use_become, user, self.check)
             }
-            Builtin::GetUrl => {
-                super::get_url::execute(connection, args, use_become, user, self.check)
-            }
+            Builtin::GetUrl => unreachable!("Native downloads use the worker"),
             Builtin::Package => {
                 super::package::execute(connection, args, use_become, user, self.check)
             }

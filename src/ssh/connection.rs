@@ -1,4 +1,3 @@
-use super::atomic::{self, FileMetadata};
 use anyhow::{anyhow, bail, Context, Result};
 use log::{debug, info, warn};
 #[cfg(test)]
@@ -30,11 +29,7 @@ impl std::fmt::Display for TransportFailure {
     }
 }
 impl std::error::Error for TransportFailure {}
-pub(crate) fn result_unavailable(error: anyhow::Error) -> anyhow::Error {
-    transport_error(error, false, true)
-}
-
-fn transport_error(error: anyhow::Error, remote: bool, started: bool) -> anyhow::Error {
+pub(crate) fn transport_error(error: anyhow::Error, remote: bool, started: bool) -> anyhow::Error {
     let message = error.to_string();
     error.context(TransportFailure {
         remote,
@@ -570,11 +565,6 @@ fn sudo_password_input(password: &str) -> Result<Option<Vec<u8>>> {
 /// POSIX `test` has no portable `--` option terminator. After unary `-e`, the
 /// next shell-quoted token is unambiguously the path, including names starting
 /// with a dash.
-fn test_path_exists_command(path: &str) -> String {
-    format!("test -e {}", shell_quote(path))
-}
-
-/// Trait defining SSH connection operations for mocking.
 #[cfg_attr(test, automock)]
 pub trait SshConnection {
     fn is_local(&self) -> bool {
@@ -594,54 +584,6 @@ pub trait SshConnection {
         sudo_user: &str,
         input: &[u8],
     ) -> Result<(i32, String, String)>;
-    fn write_file_with_sudo(
-        &self,
-        content: &str,
-        remote_path: &str,
-        sudo_user: &str,
-        mode: Option<String>,
-        owner: Option<String>,
-        group: Option<String>,
-    ) -> Result<()>;
-    fn write_file_content(&self, remote_path: &str, content: &str) -> Result<()>;
-    fn write_file_bytes(&self, remote_path: &str, content: &[u8]) -> Result<()>;
-    fn write_file_bytes_with_sudo(
-        &self,
-        content: &[u8],
-        remote_path: &str,
-        sudo_user: &str,
-        mode: Option<String>,
-        owner: Option<String>,
-        group: Option<String>,
-    ) -> Result<()>;
-    /// Read a regular file without text decoding. A missing path returns None.
-    fn read_file_bytes(&self, path: &str) -> Result<Option<Vec<u8>>>;
-    /// Read a regular file through the selected become identity without
-    /// decoding it as text. A missing path returns None.
-    fn read_file_bytes_with_sudo(&self, path: &str, sudo_user: &str) -> Result<Option<Vec<u8>>> {
-        let inspect = test_path_exists_command(path);
-        let (exists, _, stderr) = self.execute_sudo_command(&inspect, sudo_user)?;
-        match exists {
-            0 => {}
-            1 => return Ok(None),
-            code => bail!(
-                "Failed to inspect privileged file (exit {}): {}",
-                code,
-                stderr.trim()
-            ),
-        }
-        let command = format!("cat -- {}", shell_quote(path));
-        let (code, stdout, stderr) = self.execute_sudo_command(&command, sudo_user)?;
-        if code != 0 {
-            bail!(
-                "Failed to read privileged file (exit {}): {}",
-                code,
-                stderr.trim()
-            );
-        }
-        Ok(Some(stdout.into_bytes()))
-    }
-    fn upload_file(&self, local_path: &str, remote_path: &str) -> Result<()>;
 }
 
 /// A connection selected for one inventory host.
@@ -701,6 +643,7 @@ impl Connection {
                 Ok(crate::worker::transport::Session::Remote {
                     channel,
                     _session: client.session.clone(),
+                    pending: std::collections::VecDeque::new(),
                 })
             }
         }
@@ -996,99 +939,6 @@ impl SshConnection for LocalConnection {
         let sudo_command = build_noninteractive_sudo_command(command, sudo_user);
         self.execute_with_input(&sudo_command, Some(input))
     }
-
-    fn write_file_with_sudo(
-        &self,
-        content: &str,
-        remote_path: &str,
-        sudo_user: &str,
-        mode: Option<String>,
-        owner: Option<String>,
-        group: Option<String>,
-    ) -> Result<()> {
-        self.write_file_bytes_with_sudo(
-            content.as_bytes(),
-            remote_path,
-            sudo_user,
-            mode,
-            owner,
-            group,
-        )
-    }
-
-    fn write_file_bytes_with_sudo(
-        &self,
-        content: &[u8],
-        remote_path: &str,
-        sudo_user: &str,
-        mode: Option<String>,
-        owner: Option<String>,
-        group: Option<String>,
-    ) -> Result<()> {
-        atomic::install(
-            self,
-            remote_path,
-            content,
-            Some(sudo_user),
-            FileMetadata {
-                mode: mode.as_deref(),
-                owner: owner.as_deref(),
-                group: group.as_deref(),
-            },
-        )
-    }
-
-    fn write_file_content(&self, remote_path: &str, content: &str) -> Result<()> {
-        self.write_file_bytes(remote_path, content.as_bytes())
-    }
-
-    fn write_file_bytes(&self, remote_path: &str, content: &[u8]) -> Result<()> {
-        atomic::install(self, remote_path, content, None, FileMetadata::default())
-    }
-
-    fn read_file_bytes(&self, path: &str) -> Result<Option<Vec<u8>>> {
-        match std::fs::read(path) {
-            Ok(content) => Ok(Some(content)),
-            Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
-            Err(error) => Err(error).with_context(|| format!("Failed to read local file: {path}")),
-        }
-    }
-
-    fn read_file_bytes_with_sudo(&self, path: &str, sudo_user: &str) -> Result<Option<Vec<u8>>> {
-        let inspect = test_path_exists_command(path);
-        let (exists, _, stderr) = self.execute_sudo_command(&inspect, sudo_user)?;
-        match exists {
-            0 => {}
-            1 => return Ok(None),
-            code => bail!(
-                "Failed to inspect privileged local file (exit {}): {}",
-                code,
-                stderr.trim()
-            ),
-        }
-        let command = format!("cat -- {}", shell_quote(path));
-        if let Some(password_input) = sudo_password_input(&self.sudo_password)? {
-            let validation = build_sudo_validation_command(sudo_user);
-            let (code, _, stderr) = self.execute_with_input(&validation, Some(&password_input))?;
-            if code != 0 {
-                bail!("Local sudo authentication failed: {}", stderr.trim());
-            }
-        }
-        let sudo_command = build_noninteractive_sudo_command(&command, sudo_user);
-        let (code, stdout, stderr) = self.execute_with_input_bytes(&sudo_command, None)?;
-        if code != 0 {
-            bail!(
-                "Failed to read privileged local file (exit {}): {}",
-                code,
-                String::from_utf8_lossy(&stderr).trim()
-            );
-        }
-        Ok(Some(stdout))
-    }
-
-    fn upload_file(&self, local_path: &str, remote_path: &str) -> Result<()> {
-        self.write_file_bytes(remote_path, &std::fs::read(local_path)?)
-    }
 }
 
 pub struct SshClient {
@@ -1281,61 +1131,6 @@ impl SshClient {
         ))
     }
 
-    fn write_file_with_sudo_bytes(
-        &self,
-        content: &[u8],
-        remote_path: &str,
-        sudo_user: &str,
-        mode: Option<String>,
-        owner: Option<String>,
-        group: Option<String>,
-    ) -> Result<()> {
-        atomic::install(
-            self,
-            remote_path,
-            content,
-            Some(sudo_user),
-            FileMetadata {
-                mode: mode.as_deref(),
-                owner: owner.as_deref(),
-                group: group.as_deref(),
-            },
-        )
-    }
-
-    fn read_remote_bytes(&self, path: &str) -> Result<Option<Vec<u8>>> {
-        let _operation = self
-            .operation_lock
-            .lock()
-            .map_err(|_| anyhow!("SSH operation lock was poisoned"))?;
-        let sftp = self
-            .session
-            .sftp()
-            .context("Failed to initialize SFTP subsystem")?;
-        let mut file = match sftp.open(Path::new(path)) {
-            Ok(file) => file,
-            Err(error) => {
-                let io_error: io::Error = error.into();
-                if io_error.kind() == io::ErrorKind::NotFound {
-                    return Ok(None);
-                }
-                return Err(io_error).context("Failed to open remote file through SFTP");
-            }
-        };
-        let mut content = Vec::new();
-        let mut bounded = (&mut file).take((MAX_COMMAND_OUTPUT_BYTES + 1) as u64);
-        bounded
-            .read_to_end(&mut content)
-            .context("Failed to read remote file through SFTP")?;
-        if content.len() > MAX_COMMAND_OUTPUT_BYTES {
-            bail!(
-                "Remote file exceeded the {} byte safety limit",
-                MAX_COMMAND_OUTPUT_BYTES
-            );
-        }
-        Ok(Some(content))
-    }
-
     pub fn connect(host: &Host) -> Result<Self> {
         Self::from_config(&ConnectionConfig::from_host(host)?)
     }
@@ -1438,55 +1233,6 @@ impl SshClient {
             operation_lock: Mutex::new(()),
         })
     }
-
-    /// Upload a local file with sudo privileges (legacy compatibility API).
-    #[allow(dead_code)]
-    pub fn upload_sudo_file(&self, local_path: &str, remote_path: &str) -> Result<()> {
-        let content = std::fs::read(local_path)
-            .with_context(|| format!("Failed to read local file: {local_path}"))?;
-        self.write_file_with_sudo_bytes(&content, remote_path, "", None, None, None)
-    }
-
-    // Forwarding methods retained for backward compatibility.
-    pub fn execute_command(&self, command: &str) -> Result<(i32, String, String)> {
-        SshConnection::execute_command(self, command)
-    }
-
-    pub fn execute_sudo_command(
-        &self,
-        command: &str,
-        sudo_user: &str,
-    ) -> Result<(i32, String, String)> {
-        SshConnection::execute_sudo_command(self, command, sudo_user)
-    }
-
-    pub fn write_file_with_sudo(
-        &self,
-        content: &str,
-        remote_path: &str,
-        sudo_user: &str,
-        mode: Option<&str>,
-        owner: Option<&str>,
-        group: Option<&str>,
-    ) -> Result<()> {
-        SshConnection::write_file_with_sudo(
-            self,
-            content,
-            remote_path,
-            sudo_user,
-            mode.map(str::to_string),
-            owner.map(str::to_string),
-            group.map(str::to_string),
-        )
-    }
-
-    pub fn write_file_content(&self, remote_path: &str, content: &str) -> Result<()> {
-        SshConnection::write_file_content(self, remote_path, content)
-    }
-
-    pub fn upload_file(&self, local_path: &str, remote_path: &str) -> Result<()> {
-        SshConnection::upload_file(self, local_path, remote_path)
-    }
 }
 
 impl SshConnection for SshClient {
@@ -1526,88 +1272,6 @@ impl SshConnection for SshClient {
         let sudo_command = build_noninteractive_sudo_command(command, sudo_user);
         debug!("Executing a sudo command on {}", self.host);
         self.execute_with_input(&sudo_command, Some(input))
-    }
-
-    fn write_file_with_sudo(
-        &self,
-        content: &str,
-        remote_path: &str,
-        sudo_user: &str,
-        mode: Option<String>,
-        owner: Option<String>,
-        group: Option<String>,
-    ) -> Result<()> {
-        self.write_file_bytes_with_sudo(
-            content.as_bytes(),
-            remote_path,
-            sudo_user,
-            mode,
-            owner,
-            group,
-        )
-    }
-
-    fn write_file_content(&self, remote_path: &str, content: &str) -> Result<()> {
-        self.write_file_bytes(remote_path, content.as_bytes())
-    }
-
-    fn write_file_bytes(&self, remote_path: &str, content: &[u8]) -> Result<()> {
-        atomic::install(self, remote_path, content, None, FileMetadata::default())
-    }
-
-    fn write_file_bytes_with_sudo(
-        &self,
-        content: &[u8],
-        remote_path: &str,
-        sudo_user: &str,
-        mode: Option<String>,
-        owner: Option<String>,
-        group: Option<String>,
-    ) -> Result<()> {
-        self.write_file_with_sudo_bytes(content, remote_path, sudo_user, mode, owner, group)
-    }
-
-    fn read_file_bytes(&self, path: &str) -> Result<Option<Vec<u8>>> {
-        self.read_remote_bytes(path)
-            .map_err(|error| transport_error(error, true, false))
-    }
-
-    fn read_file_bytes_with_sudo(&self, path: &str, sudo_user: &str) -> Result<Option<Vec<u8>>> {
-        let inspect = test_path_exists_command(path);
-        let (exists, _, stderr) = self.execute_sudo_command(&inspect, sudo_user)?;
-        match exists {
-            0 => {}
-            1 => return Ok(None),
-            code => bail!(
-                "Failed to inspect privileged remote file (exit {}): {}",
-                code,
-                stderr.trim()
-            ),
-        }
-        let command = format!("cat -- {}", shell_quote(path));
-        if let Some(password_input) = sudo_password_input(&self.sudo_password)? {
-            let validation = build_sudo_validation_command(sudo_user);
-            let (code, _, stderr) = self.execute_with_input(&validation, Some(&password_input))?;
-            if code != 0 {
-                bail!("Remote sudo authentication failed: {}", stderr.trim());
-            }
-        }
-        let sudo_command = build_noninteractive_sudo_command(&command, sudo_user);
-        let (code, stdout, stderr) = self.execute_with_input_bytes(&sudo_command, None)?;
-        if code != 0 {
-            bail!(
-                "Failed to read privileged remote file (exit {}): {}",
-                code,
-                String::from_utf8_lossy(&stderr).trim()
-            );
-        }
-        Ok(Some(stdout))
-    }
-
-    fn upload_file(&self, local_path: &str, remote_path: &str) -> Result<()> {
-        let content = std::fs::read(local_path)
-            .with_context(|| format!("Failed to read upload source: {local_path}"))?;
-        self.write_file_bytes(remote_path, &content)
     }
 }
 
@@ -1651,21 +1315,6 @@ mod tests {
             Some(b"not in argv\n".to_vec())
         );
         assert!(sudo_password_input("two\nlines").is_err());
-    }
-
-    #[test]
-    fn path_existence_probe_is_posix_and_shell_safe() {
-        for path in ["/missing", "-leading", "with space", "it's; echo unsafe"] {
-            let command = test_path_exists_command(path);
-            assert!(!command.contains("test -e --"));
-            let status = Command::new("sh").args(["-c", &command]).status().unwrap();
-            assert_eq!(
-                status.code(),
-                Some(1),
-                "probe had a syntax error: {command}"
-            );
-        }
-        assert_eq!(test_path_exists_command("it's"), "test -e 'it'\"'\"'s'");
     }
 
     #[test]
@@ -1858,23 +1507,6 @@ mod tests {
 
         host.set_variable("ansible_connection", "ssh");
         assert_eq!(connection_kind(&host).unwrap(), ConnectionKind::Ssh);
-    }
-
-    #[test]
-    fn local_connection_reads_and_writes_arbitrary_bytes() {
-        let host = Host::new("localhost");
-        let connection = LocalConnection::new(&host).unwrap();
-        let directory = tempfile::tempdir().unwrap();
-        let path = directory.path().join("binary content");
-        let bytes = [0_u8, 0xff, b'\n', b'\'', 0x80];
-
-        connection
-            .write_file_bytes(path.to_str().unwrap(), &bytes)
-            .unwrap();
-        assert_eq!(
-            connection.read_file_bytes(path.to_str().unwrap()).unwrap(),
-            Some(bytes.to_vec())
-        );
     }
 
     #[test]

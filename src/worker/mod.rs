@@ -10,13 +10,50 @@ use rustsible_protocol::{Hello, Manifest, ModuleResult, Request, Response, MAX_R
 use serde_yaml::Value;
 use std::{
     collections::{BTreeMap, HashMap},
-    fs::OpenOptions,
-    io::{Read, Seek},
+    fs::{File, OpenOptions},
+    io::{Cursor, Read, Seek, SeekFrom},
     os::unix::fs::OpenOptionsExt,
     path::{Path, PathBuf},
     sync::{Arc, Mutex},
     time::{Duration, Instant},
 };
+
+pub(crate) enum Source {
+    File(File),
+    Bytes(Cursor<Vec<u8>>),
+}
+impl Read for Source {
+    fn read(&mut self, bytes: &mut [u8]) -> std::io::Result<usize> {
+        match self {
+            Self::File(file) => file.read(bytes),
+            Self::Bytes(bytes_source) => bytes_source.read(bytes),
+        }
+    }
+}
+impl Seek for Source {
+    fn seek(&mut self, position: SeekFrom) -> std::io::Result<u64> {
+        match self {
+            Self::File(file) => file.seek(position),
+            Self::Bytes(bytes) => bytes.seek(position),
+        }
+    }
+}
+impl Source {
+    pub fn bytes(bytes: Vec<u8>) -> Self {
+        Self::Bytes(Cursor::new(bytes))
+    }
+    pub fn file(path: &str) -> Result<Self> {
+        let file = OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_NONBLOCK)
+            .open(path)
+            .context("Cannot open local source")?;
+        if !file.metadata()?.is_file() {
+            bail!("Local source must be a regular file");
+        }
+        Ok(Self::File(file))
+    }
+}
 
 #[derive(Default)]
 pub(crate) struct Runtime {
@@ -51,12 +88,31 @@ impl Runtime {
         args: Value,
         check: bool,
     ) -> Result<ModuleResult> {
+        self.execute_with_source(config, module, args, check, None)
+    }
+    pub fn execute_with_source(
+        &self,
+        config: &ConnectionConfig,
+        module: &str,
+        args: Value,
+        check: bool,
+        mut source: Option<&mut Source>,
+    ) -> Result<ModuleResult> {
         let mut request = Request::new(
             module,
             args,
             check,
             command_timeout(config)?.as_millis().try_into()?,
         );
+        if let Some(source) = source.as_mut() {
+            let size = source.seek(SeekFrom::End(0))?;
+            source.rewind()?;
+            request.payload = Some(rustsible_protocol::Payload {
+                size,
+                sha256: rustsible_protocol::sha256(source)?,
+            });
+            source.rewind()?;
+        }
         request.validate()?;
         // Keys include credentials but never variable/fact overlays. Hashing
         // avoids retaining another plaintext copy in a diagnostic-able map key.
@@ -85,10 +141,75 @@ impl Runtime {
         let deadline =
             Instant::now() + Duration::from_millis(request.timeout_ms) + Duration::from_secs(5);
         let mut diagnostic = Vec::new();
+        let remote = matches!(&client.session, transport::Session::Remote { .. });
+        let mut eligible = source.is_none()
+            || request
+                .payload
+                .as_ref()
+                .is_some_and(|payload| payload.size == 0);
         let result = (|| {
-            client.session.send(&frame, deadline, &mut diagnostic)?;
-            let response: Response = client.session.receive(deadline, &mut diagnostic)?;
-            response.validate()
+            client
+                .session
+                .send(&frame, deadline, &mut diagnostic)
+                .map_err(|error| {
+                    crate::ssh::connection::transport_error(error, remote, eligible)
+                })?;
+            if let Some(source) = source.as_mut() {
+                let ack: rustsible_protocol::PayloadAck = client
+                    .session
+                    .receive(deadline, &mut diagnostic)
+                    .map_err(|error| {
+                        crate::ssh::connection::transport_error(error, remote, eligible)
+                    })?;
+                let ready = match ack {
+                    rustsible_protocol::PayloadAck::Ready(ready) => ready,
+                    rustsible_protocol::PayloadAck::Result(response) => return response.validate(),
+                };
+                ready.validate().map_err(|error| {
+                    crate::ssh::connection::transport_error(error, remote, eligible)
+                })?;
+                eligible = request
+                    .payload
+                    .as_ref()
+                    .is_some_and(|payload| payload.size == 0);
+                let transfer_deadline = Instant::now()
+                    + Duration::from_millis(request.timeout_ms).max(Duration::from_secs(30));
+                let mut remaining = request
+                    .payload
+                    .as_ref()
+                    .context("Missing payload metadata")?
+                    .size;
+                let mut buffer = [0; 65536];
+                while remaining != 0 {
+                    let limit = remaining.min(buffer.len() as u64) as usize;
+                    let read = source.read(&mut buffer[..limit])?;
+                    if read == 0 {
+                        bail!("Local source ended before its declared size");
+                    }
+                    eligible |= read as u64 == remaining;
+                    client
+                        .session
+                        .send_payload(&buffer[..read], transfer_deadline, &mut diagnostic)
+                        .map_err(|error| {
+                            crate::ssh::connection::transport_error(error, remote, eligible)
+                        })?;
+                    remaining -= read as u64;
+                }
+            }
+            let response: Response = client
+                .session
+                .receive(
+                    Instant::now()
+                        + Duration::from_millis(request.timeout_ms)
+                        + Duration::from_secs(5),
+                    &mut diagnostic,
+                )
+                .map_err(|error| {
+                    crate::ssh::connection::transport_error(error, remote, eligible)
+                })?;
+            response
+                .validate()
+                .map_err(|error| crate::ssh::connection::transport_error(error, remote, eligible))
         })();
         match result {
             Ok(result) => {
@@ -98,15 +219,30 @@ impl Runtime {
                 Ok(result)
             }
             Err(error) => {
+                if request.payload.is_some()
+                    && error
+                        .downcast_ref::<crate::ssh::connection::TransportFailure>()
+                        .is_some()
+                {
+                    // A target-side input write error may close stdin while a
+                    // structured failure is already buffered on stdout.
+                    if let Ok(response) = client.session.receive::<Response>(
+                        Instant::now() + Duration::from_secs(1),
+                        &mut diagnostic,
+                    ) {
+                        if let Ok(result) = response.validate() {
+                            slot.take();
+                            return Ok(result);
+                        }
+                    }
+                }
                 // Any partial request may already have reached the target.
                 // Discard this lease; never replay a modifying invocation.
                 slot.take();
-                Ok(ModuleResult {
-                    failed: true,
-                    uncertain: !check && matches!(module, "command" | "shell"),
-                    msg: format!("Worker response lost; invocation was not replayed: {error:#}"),
-                    ..ModuleResult::default()
-                })
+                Ok(crate::modules::result::from_error(
+                    error.context("Native worker exchange failed; invocation was not replayed"),
+                    !check && !matches!(module, "setup" | "stat"),
+                ))
             }
         }
     }

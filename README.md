@@ -26,7 +26,9 @@ Module names and common parameters resemble Ansible, but their complete argument
 Playbook fact gathering follows the ansible-core 2.21 default: facts are gathered
 unless a play sets `gather_facts: false`. Fact gathering, `stat`, `command`, and
 `shell` use the native Rust worker and do not require Python or curl.
-`get_url` still requires target Python 3 until its native migration is complete.
+File operations and `get_url` also use native workers. No built-in module
+requires Python or curl; package/service/user modules still invoke OS tools and
+are being migrated into the worker.
 Registered results and gathered facts last for the complete playbook run;
 play and task variables remain scoped to their play or task. Explicit `setup: {}`
 merges facts just like automatic gathering, including time collected on the
@@ -58,22 +60,48 @@ The compatibility surface currently includes Linux architecture facts,
 `systemd.name/enabled/state/daemon_reload`, `copy.force`, and `default(omit)`.
 The systemd module rejects non-systemd hosts explicitly.
 
-`copy`, `template`, and `lineinfile` prepare replacements in a private directory
-on the destination filesystem before committing them. They preserve existing
-permissions, ownership, ACLs, and extended attributes unless explicitly changed;
-preparation failures leave the original inode intact. Transfers must be
-complete before commit: stdin and HTTP responses that end early are rejected.
-Ownership is applied before mode/ACL/xattr so `chown` cannot silently clear
-set-id bits or extended metadata in the prepared file. Destinations must be
-regular files or absent: symbolic links are rejected. This transitional file
-installer requires GNU coreutils (`cp`, `stat`, `mktemp`, `sync`, `mv`) on targets;
-it fails if protection metadata cannot be preserved. The transitional installer
-also requires a parent owned by root or the execution identity, and sticky-bit
-protection when a group or other users can write there. Unsafe parents fail
-explicitly; use the directory's owner as the execution identity.
-`get_url` also installs downloads atomically. With `force: false`, an existing
-file is retained without a request unless a supplied checksum differs. Invalid
-mode, identity, and checksum values fail before downloading or replacing files.
+`copy`, `template`, `lineinfile`, and `get_url` prepare content in a private
+same-filesystem directory and commit it with an atomic rename. File operations
+use directory descriptors to pin the destination across ancestor renames. The
+supervisor owns staging directories and cleans them after module success,
+failure, timeout or disconnect; killed module processes cannot leave staging
+cleanup to their own destructors. Sensitive content uses `0600` staging files
+inside `0700` directories. Controller file content is length-framed and streamed
+separately from JSON, including files larger than the 16 MiB command-output cap.
+Copy/template inline content also preserves NUL bytes.
+
+Replacement preserves existing mode, uid/gid, POSIX ACLs and extended attributes,
+including capabilities. Ownership precedes ACL/xattr/mode restoration, so chown
+cannot clear a protection after it has been restored. An explicit mode may change
+the ACL mask, but named ACL entries are retained. Verification, write failures,
+short transfers, full disks and detected destination changes leave the original
+file intact. Destinations for content installation must be regular files or
+absent; symbolic links are rejected. The staging parent must be readable/searchable/writable by the execution
+identity, owned by root or that identity, and use sticky-bit protection when
+group/other-writable.
+Metadata-only changes keep the inode and avoid rewriting content. Creating or
+repairing file metadata needs no read permission on the file. Recursive directory creation applies requested attributes to each
+new directory. Symlinks and removal use native filesystem calls.
+
+`get_url` uses blocking reqwest with Rustls on the target, so target DNS, HTTP(S)
+proxy environment and native certificate roots remain authoritative. Certificate
+verification stays enabled; `SSL_CERT_FILE`/`SSL_CERT_DIR` can select target CA
+roots. Sudo retains its normal environment policy. HTTP(S) redirects are limited
+to ten, connections to thirty seconds, and the overall request to the module
+budget (`rustsible_command_timeout`). Downloads stream without a response-size
+memory limit. With `force: false`, an existing file is retained without network
+traffic unless its supplied checksum differs; metadata changes still apply.
+Check mode uses HEAD for a required download and never creates destination
+staging files. Supported inline checksums are md5, sha1, sha224, sha256, sha384,
+and sha512; unknown options and invalid mode/identity/checksum inputs fail before
+network traffic or business modifications.
+
+`lineinfile` uses the last regexp/insertion match and handles line endings like
+the pinned Ansible 2.21 reference. It preserves no-op bytes, adds a missing final
+newline when ensuring that line, and preserves backup ownership/mode/ACL/xattrs
+and timestamps. Its current text-input bound is 64 MiB and its regexp language
+is Rust regex; Python-only regexp constructs are rejected. Templates render
+only on the controller.
 
 ## Build
 
@@ -336,11 +364,12 @@ redaction, follow [`MANUAL_TEST_PLAN.md`](MANUAL_TEST_PLAN.md).
 with strict host-key verification. It checks deploy/root/app execution identities,
 check-mode business-state equality, idempotency, cross-play facts/registers,
 file bytes and metadata, and temporary-file cleanup. The full fixture installs
-Python only for the transitional `get_url` implementation.
-`bash tests/ssh/run.sh CONTROLLER WORKER_DIRECTORY native glibc` and the same
-command ending in `native musl` use targets with neither Python nor curl. They
-verify native setup/stat/command/shell, password sudo, root/non-root execution,
-check invariance, noexec failures, and controller-interruption cleanup. The musl
+neither Python nor curl.
+`bash tests/ssh/run.sh CONTROLLER WORKER_DIRECTORY native glibc HTTP_FIXTURE`
+and the same command with `musl` instead of `glibc` use targets with neither Python nor curl. They
+verify native setup/stat/command/shell, files/downloads, password sudo,
+root/non-root execution, 20 MiB binary transfers, HTTPS/private CA/proxy,
+check invariance, noexec failures, real disk-full preservation and cleanup, including input-byte/inode exhaustion. The musl
 case also runs the static controller inside the target. CI runs these scenarios
 on native x86_64 and aarch64 runners and assembles offline bundles with both
 workers.

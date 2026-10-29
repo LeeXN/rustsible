@@ -24,7 +24,6 @@ pub fn execute(program: &str, shell: bool, scratch: &Path) -> Result<ModuleResul
             .mode(0o600)
             .open(&path)?;
         file.write_all(program.as_bytes())?;
-        file.sync_all()?;
         let mut command = Command::new("sh");
         command.arg(path);
         command
