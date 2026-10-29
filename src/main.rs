@@ -6,9 +6,15 @@ use log::{info, LevelFilter};
 use std::io::Write;
 
 fn main() -> Result<()> {
-    // Delay logger initialization until after parsing arguments
-    let app = cli::build_cli();
-    let matches = app.get_matches();
+    let matches = cli::build_cli().get_matches();
+    let vault = rustsible::vault::Vault::from_cli(&matches)?;
+    let _scope = vault.enter();
+    if let Some(("vault", sub)) = matches.subcommand() {
+        return vault.run_cli(sub);
+    }
+    vault.protect(run(matches))
+}
+fn run(matches: clap::ArgMatches) -> Result<()> {
     let mut config = rustsible::config::Config::load(
         matches
             .get_one::<std::path::PathBuf>("config")
@@ -41,6 +47,13 @@ fn main() -> Result<()> {
     let mut builder = Builder::new();
     builder
         .format(|buf, record| {
+            if rustsible::vault::Vault::current().used() {
+                return writeln!(
+                    buf,
+                    "[{}] Vault-protected diagnostic censored",
+                    record.level()
+                );
+            }
             writeln!(
                 buf,
                 "{} [{}] {} - {}",
@@ -73,6 +86,7 @@ fn main() -> Result<()> {
                     .unwrap_or_default(),
                 check_mode: sub_matches.get_flag("check"),
                 diff: sub_matches.get_flag("diff"),
+                vault: rustsible::vault::Vault::current(),
                 credentials: if sub_matches.get_flag("syntax-check")
                     || sub_matches.get_flag("list-hosts")
                     || sub_matches.get_flag("list-tasks")
@@ -139,6 +153,7 @@ fn main() -> Result<()> {
 
             let forks = config.host_limit(sub_matches)?;
             let options = modules::AdHocOptions {
+                vault: rustsible::vault::Vault::current(),
                 credentials: credentials(sub_matches)?,
                 inventory: Some(std::sync::Arc::new(inventory.clone())),
                 config_file: config.file.clone(),

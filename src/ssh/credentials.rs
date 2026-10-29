@@ -42,7 +42,7 @@ impl Credentials {
         }
     }
 }
-fn prompt(label: &str) -> Result<String> {
+pub(crate) fn prompt(label: &str) -> Result<String> {
     let tty = OpenOptions::new()
         .read(true)
         .write(true)

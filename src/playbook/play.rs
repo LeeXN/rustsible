@@ -698,6 +698,7 @@ impl Play {
         // Runtime values, connections and permits are shared; each logical
         // host retains its own task stack, handlers and failure recovery.
         let completed = crate::scheduler::map(hosts, forks, |host| {
+            let _vault = state.workers.vault.enter();
             let mut play = self.clone();
             let mut run = state.fork_for(&host.name);
             let result = play.execute_batch(std::slice::from_ref(host), check_mode, 1, &mut run);
@@ -1181,15 +1182,18 @@ impl Play {
                 let mut result = match task_result {
                     Ok(result) => result,
                     Err(error) => {
-                        if effective_task.no_log.unwrap_or(false) {
+                        if effective_task.no_log.unwrap_or(false) || state.workers.vault.used() {
                             error!("A no_log task failed on host {}", host.name);
                         } else {
                             error!("Task execution failed on host {}: {}", host.name, error);
                         }
                         let mut result = TaskResult::new(&host.name);
                         result.failed = true;
-                        result.no_log = effective_task.no_log.unwrap_or(false);
-                        result.msg = if effective_task.no_log.unwrap_or(false) {
+                        result.no_log =
+                            effective_task.no_log.unwrap_or(false) || state.workers.vault.used();
+                        result.msg = if effective_task.no_log.unwrap_or(false)
+                            || state.workers.vault.used()
+                        {
                             "output censored because no_log is enabled".to_string()
                         } else {
                             format!("Task execution error: {}", error)
@@ -1684,6 +1688,7 @@ impl Play {
             hosts.as_slice()
         };
         let mut results = crate::scheduler::map(selected, concurrency, |&host| {
+            let _vault = state.workers.vault.enter();
             let effective_task = play.apply_play_settings(task, host);
             let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                 let _permit = if play.strategy == crate::playbook::Strategy::Free {

@@ -2,7 +2,6 @@ use anyhow::{bail, Context, Result};
 use log::debug;
 use serde::Deserialize;
 use serde_yaml::{Mapping, Value};
-use std::io::Read;
 use std::path::Path;
 
 use crate::playbook::{Handler, Play, Task};
@@ -783,18 +782,7 @@ impl Loader<'_> {
 }
 
 fn read_file(path: &Path) -> Result<String> {
-    use std::os::unix::fs::OpenOptionsExt;
-    let mut file = std::fs::OpenOptions::new()
-        .read(true)
-        .custom_flags(libc::O_NONBLOCK)
-        .open(path)
-        .with_context(|| format!("Cannot open source file {}", path.display()))?;
-    if !file.metadata()?.is_file() {
-        bail!("Source must be a regular file: {}", path.display());
-    }
-    let mut content = String::new();
-    file.read_to_string(&mut content)?;
-    Ok(content)
+    Ok(crate::vault::Vault::current().read_text(path)?.to_string())
 }
 pub(crate) fn flush_task() -> Task {
     let mut task = parse_task_parts(

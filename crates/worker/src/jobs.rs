@@ -49,10 +49,12 @@ struct Directory {
 }
 fn safe(file: &File, directory: bool, mode: u32) -> Result<()> {
     let metadata = file.metadata()?;
+    // Atomic status replacement can unlink an already pinned, immutable
+    // snapshot. Zero links is safe; multiple links still expose private state.
     if metadata.uid() != unsafe { libc::geteuid() }
         || metadata.mode() & 0o7777 != mode
         || metadata.is_dir() != directory
-        || (!directory && (!metadata.is_file() || metadata.nlink() != 1))
+        || (!directory && (!metadata.is_file() || metadata.nlink() > 1))
     {
         bail!("Unsafe async state ownership, permissions or file type");
     }
@@ -460,6 +462,21 @@ pub fn supervise(descriptor: RawFd, jid: &str) -> Result<()> {
     Ok(())
 }
 
+/// Process death and an atomic result replacement are separate observations.
+/// Refresh a running snapshot after a missing PID before declaring the result
+/// lost; a normally exiting supervisor saves its final result first.
+fn confirm_liveness(job: &Directory, mut state: State) -> Result<(State, bool)> {
+    let lost = |state: &State| -> Result<bool> {
+        Ok(state.started && !state.finished && start_ticks(state.pid)? != state.start_ticks)
+    };
+    if !lost(&state)? {
+        return Ok((state, false));
+    }
+    state = job.load()?;
+    let lost = lost(&state)?;
+    Ok((state, lost))
+}
+
 pub fn status(args: &Value, check: bool) -> Result<ModuleResult> {
     Builtin::AsyncStatus.validate_parameters(args)?;
     let jid = args
@@ -484,7 +501,7 @@ pub fn status(args: &Value, check: bool) -> Result<ModuleResult> {
             return Err(error).context("Cannot open async job state for this execution identity")
         }
     };
-    let state = job.load()?;
+    let (state, lost) = confirm_liveness(&job, job.load()?)?;
     if cleanup {
         if !state.finished {
             bail!("Cannot clean a running or unconfirmed async job");
@@ -509,7 +526,6 @@ pub fn status(args: &Value, check: bool) -> Result<ModuleResult> {
     let mut result = if state.finished {
         state.result.context("Missing completed async result")?
     } else {
-        let lost = state.started && start_ticks(state.pid)? != state.start_ticks;
         ModuleResult {
             failed: lost,
             uncertain: lost,
@@ -527,4 +543,81 @@ pub fn status(args: &Value, check: bool) -> Result<ModuleResult> {
         .values
         .extend(job.metadata(state.started, state.finished));
     Ok(result)
+}
+
+#[cfg(test)]
+mod snapshot_tests {
+    use super::*;
+    use std::io::{Seek, Write};
+    #[test]
+    fn a_completed_replacement_wins_over_a_stale_running_pid_snapshot() -> Result<()> {
+        let directory = tempfile::tempdir()?;
+        let jid = format!("j{:064x}", 42);
+        let base = directory.path().join("jobs");
+        let job = Directory::open(Some(base.to_str().unwrap()), &jid, true)?;
+        let stale = State {
+            version: FORMAT,
+            jid: jid.clone(),
+            uid: unsafe { libc::geteuid() },
+            started: true,
+            finished: false,
+            pid: u32::MAX,
+            start_ticks: Some(1),
+            no_log: false,
+            result: None,
+        };
+        let finished = State {
+            version: FORMAT,
+            jid,
+            uid: unsafe { libc::geteuid() },
+            started: true,
+            finished: true,
+            pid: u32::MAX,
+            start_ticks: Some(1),
+            no_log: false,
+            result: Some(ModuleResult {
+                stdout: "final".into(),
+                ..Default::default()
+            }),
+        };
+        job.save(&finished)?;
+        let (observed, lost) = confirm_liveness(&job, stale)?;
+        assert!(!lost);
+        assert!(observed.finished);
+        assert_eq!(observed.result.unwrap().stdout, "final");
+        job.remove()?;
+        Ok(())
+    }
+    #[test]
+    fn replaced_state_snapshot_remains_readable_without_allowing_exposed_links() -> Result<()> {
+        let directory = tempfile::tempdir()?;
+        let path = directory.path().join("status.json");
+        let mut original = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&path)?;
+        original.write_all(b"old complete state")?;
+        original.rewind()?;
+        let replacement = directory.path().join("replacement");
+        let mut next = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&replacement)?;
+        next.write_all(b"new complete state")?;
+        fs::rename(&replacement, &path)?;
+        assert_eq!(original.metadata()?.nlink(), 0);
+        safe(&original, false, 0o600)?;
+        let mut old = String::new();
+        original.read_to_string(&mut old)?;
+        assert_eq!(old, "old complete state");
+        assert_eq!(fs::read_to_string(&path)?, "new complete state");
+        fs::hard_link(&path, directory.path().join("exposed"))?;
+        assert!(safe(&File::open(&path)?, false, 0o600).is_err());
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o644))?;
+        assert!(safe(&File::open(&path)?, false, 0o600).is_err());
+        Ok(())
+    }
 }

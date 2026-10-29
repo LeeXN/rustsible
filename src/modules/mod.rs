@@ -27,6 +27,7 @@ pub struct AdHocOptions {
     pub check_mode: bool,
     pub diff: bool,
     pub credentials: crate::ssh::credentials::Credentials,
+    pub vault: std::sync::Arc<crate::vault::Vault>,
     pub background: u64,
     pub poll: u64,
     pub forks: usize,
@@ -44,6 +45,7 @@ impl Default for AdHocOptions {
             check_mode: false,
             diff: false,
             credentials: Default::default(),
+            vault: crate::vault::Vault::current(),
             background: 0,
             poll: 15,
             forks: 5,
@@ -62,6 +64,18 @@ pub fn run_adhoc(hosts: &[Host], module_name: &str, args: &str) -> Result<()> {
 
 /// Run an ad-hoc command with explicit execution controls.
 pub fn run_adhoc_with_options(
+    hosts: &[Host],
+    module_name: &str,
+    args: &str,
+    options: &AdHocOptions,
+) -> Result<()> {
+    let _vault = options.vault.enter();
+    options
+        .vault
+        .protect(run_adhoc_in_scope(hosts, module_name, args, options))
+}
+
+fn run_adhoc_in_scope(
     hosts: &[Host],
     module_name: &str,
     args: &str,
@@ -123,6 +137,7 @@ pub fn run_adhoc_with_options(
     state.workers = std::sync::Arc::new(
         crate::worker::Runtime::new(options.worker_dir.clone())
             .with_credentials(options.credentials.clone())
+            .with_vault(options.vault.clone())
             .with_diff(options.diff),
     );
     state.prepare(
@@ -133,6 +148,7 @@ pub fn run_adhoc_with_options(
     let globals = state.variable_globals()?;
     let runtime = &state.workers;
     let executions = crate::scheduler::map(hosts, options.forks, |host| {
+        let _vault = state.workers.vault.enter();
         let start_time = Instant::now();
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             let mut variables = state.variables_for(&host.name, &globals)?;
@@ -152,6 +168,10 @@ pub fn run_adhoc_with_options(
             )
         }))
         .unwrap_or_else(|_| Err(anyhow::anyhow!("Ad-hoc host worker panicked")));
+        let result = runtime.vault.protect(result).map(|mut result| {
+            runtime.vault.protect_result(&mut result);
+            result
+        });
         HostExecution {
             result,
             duration: start_time.elapsed(),
@@ -374,6 +394,7 @@ fn execute_adhoc_module(
         options,
         &crate::worker::Runtime::new(options.worker_dir.clone())
             .with_credentials(options.credentials.clone())
+            .with_vault(options.vault.clone())
             .with_diff(options.diff),
         &variables,
     )
@@ -692,6 +713,7 @@ mod tests {
             check_mode: false,
             diff: false,
             credentials: Default::default(),
+            vault: crate::vault::Vault::current(),
             forks: 5,
             ..AdHocOptions::default()
         };

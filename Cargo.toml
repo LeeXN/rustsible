@@ -29,8 +29,15 @@ colored = "3.0.0"
 sha-crypt = "0.5.0"
 minijinja = { version = "=3.0.4", features = ["serde", "unicode", "fuel", "unstable_machinery"] }
 rpassword = "7.5.4"
+aes = { version = "0.8", features = ["zeroize"] }
+ctr = "0.9"
+pbkdf2 = "0.12"
+hmac = "0.12"
+sha2 = "0.10"
+zeroize = "1"
+getrandom = "0.4"
+tempfile = "3.8"
 
 [dev-dependencies]
 mockall = "0.12"
 proptest = "1.4"
-tempfile = "3.8"

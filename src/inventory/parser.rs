@@ -1,7 +1,6 @@
 use anyhow::{bail, Context, Result};
 use log::{debug, info};
 use serde_yaml::Value;
-use std::fs;
 use std::path::Path;
 
 use super::{Host, HostGroup, Inventory};
@@ -25,8 +24,7 @@ pub fn parse_inventory(inventory_path: &str) -> Result<Inventory> {
         bail!("Inventory file not found: {}", inventory_path);
     }
 
-    let content = fs::read_to_string(path)
-        .with_context(|| format!("failed to read inventory file {}", inventory_path))?;
+    let content = crate::vault::Vault::current().read_text(path)?;
     let format = detect_format(path, &content);
     info!(
         "Parsing {} inventory file: {}",
@@ -577,6 +575,9 @@ pub(crate) fn validate_resolved_connection_variable(
 }
 
 pub(crate) fn validate_yaml_connection_variable(key: &str, value: &Value) -> Result<()> {
+    if crate::vault::is_value(value) {
+        return Ok(());
+    }
     if matches!(value, Value::String(value) if value.contains("{{") || value.contains("{%")) {
         return Ok(());
     }

@@ -1,9 +1,7 @@
 use anyhow::{bail, Context, Result};
 use serde_yaml::{Mapping, Value};
 use std::{
-    fs::{self, OpenOptions},
-    io::Read,
-    os::unix::fs::OpenOptionsExt,
+    fs,
     path::{Path, PathBuf},
 };
 
@@ -25,17 +23,7 @@ pub(crate) fn parse(content: &str) -> Result<Mapping> {
 }
 
 pub(crate) fn load(path: &Path) -> Result<Mapping> {
-    let mut file = OpenOptions::new()
-        .read(true)
-        .custom_flags(libc::O_NONBLOCK)
-        .open(path)
-        .with_context(|| format!("Cannot open variable file {}", path.display()))?;
-    if !file.metadata()?.is_file() {
-        bail!("Variable file must be a regular file: {}", path.display());
-    }
-    let mut content = String::new();
-    file.read_to_string(&mut content)
-        .with_context(|| format!("Cannot read variable file {}", path.display()))?;
+    let content = crate::vault::Vault::current().read_text(path)?;
     parse(&content).with_context(|| format!("Invalid variable file {}", path.display()))
 }
 

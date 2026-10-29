@@ -65,7 +65,12 @@ impl ConnectionConfig {
     pub fn from_context(name: &str, variables: HashMap<String, Value>) -> Result<Self> {
         let mut normalized = HashMap::new();
         crate::inventory::host::merge_variable_layer(&mut normalized, &variables);
-        let variables = normalized;
+        let mut variables = normalized;
+        for (name, value) in &mut variables {
+            if is_connection_variable(name) {
+                *value = crate::vault::Vault::current().materialize(value)?;
+            }
+        }
         for (name, value) in &variables {
             if crate::inventory::host::canonical_variable_name(name) != name {
                 continue;

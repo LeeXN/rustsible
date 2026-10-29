@@ -1,0 +1,14 @@
+- hosts: localhost
+  gather_facts: false
+  vars_files:
+    - '@VARIABLES@'
+    - '@OTHER_VARIABLES@'
+  tasks:
+    - copy:
+        content: '{{ literal }}|{{ primary }}|{{ secondary }}'
+        dest: '@OUTPUT@/result'
+      no_log: true
+    - template:
+        src: '@TEMPLATE@'
+        dest: '@OUTPUT@/template'
+      no_log: true

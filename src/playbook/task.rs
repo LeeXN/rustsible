@@ -1058,7 +1058,9 @@ impl Task {
         let mut environment = std::collections::BTreeMap::new();
         for (name, value) in &self.environment {
             let name = name.as_str().context("Environment names must be strings")?;
-            let value = if let Value::String(text) = value {
+            let value = if crate::vault::is_value(value) {
+                crate::vault::Vault::current().materialize(value)?
+            } else if let Value::String(text) = value {
                 crate::playbook::templar::render_value(text, engine, &context, true)?
             } else {
                 value.clone()
@@ -1431,7 +1433,10 @@ pub(crate) fn render_module_arguments(
         if module_name == "debug" && key == "var" {
             if let Value::String(var_name_to_lookup) = &rendered_value {
                 if let Some(found_value) = get_nested_value(var_name_to_lookup, vars) {
-                    resolved.insert(Value::String("_var_value".to_string()), found_value.clone());
+                    resolved.insert(
+                        Value::String("_var_value".to_string()),
+                        crate::vault::Vault::current().materialize(found_value)?,
+                    );
                 } else {
                     resolved.remove(Value::String("_var_value".to_string()));
                 }
@@ -1527,6 +1532,9 @@ fn render_argument_value(
             }
             Ok(Value::Mapping(rendered))
         }
+        Value::Tagged(_) if crate::vault::is_value(value) => {
+            crate::vault::Vault::current().materialize(value)
+        }
         Value::Tagged(tagged) => {
             let mut rendered = (**tagged).clone();
             rendered.value = render_argument_value(
@@ -1583,6 +1591,7 @@ pub(crate) fn print_task_result(
     result: &TaskResult,
     execution_time: &str,
 ) {
+    let private = result.no_log || result.failed && crate::vault::Vault::current().used();
     let status = if result.uncertain {
         "uncertain"
     } else if result.unreachable {
@@ -1607,7 +1616,7 @@ pub(crate) fn print_task_result(
 
     let reset_code = "\x1B[0m";
 
-    let message = if result.no_log {
+    let message = if private {
         "output censored because no_log is enabled"
     } else if !result.failed
         && result
@@ -1625,7 +1634,7 @@ pub(crate) fn print_task_result(
         host_name, color_code, status, message, execution_time, reset_code
     );
 
-    if result.no_log {
+    if private {
         return;
     }
 
@@ -1655,6 +1664,7 @@ pub(crate) fn print_loop_iteration_result(
     iteration: usize,
     total_iterations: usize,
 ) {
+    let private = result.no_log || result.failed && crate::vault::Vault::current().used();
     let status = if result.uncertain {
         "uncertain"
     } else if result.unreachable {
@@ -1679,7 +1689,7 @@ pub(crate) fn print_loop_iteration_result(
 
     let reset_code = "\x1B[0m";
 
-    let message = if result.no_log {
+    let message = if private {
         "output censored because no_log is enabled"
     } else {
         result.msg.as_str()
@@ -1698,7 +1708,7 @@ pub(crate) fn print_loop_iteration_result(
         reset_code
     );
 
-    if result.no_log {
+    if private {
         return;
     }
 
@@ -1994,7 +2004,7 @@ mod tests {
     #[test]
     fn when_sequence_uses_and_semantics() {
         let mut engine = crate::playbook::templar::environment();
-        let context = TemplateContext::new();
+        let context = TemplateContext::new(&HashMap::new()).unwrap();
         let all_true = Value::Sequence(vec![Value::Bool(true), Value::Bool(true)]);
         let one_false = Value::Sequence(vec![Value::Bool(true), Value::Bool(false)]);
 
