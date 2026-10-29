@@ -51,10 +51,12 @@ pub enum Builtin {
     Assert,
     Fail,
     Group,
+    WaitFor,
+    Uri,
 }
 
 impl Builtin {
-    pub const ALL: [Self; 21] = [
+    pub const ALL: [Self; 23] = [
         Self::Command,
         Self::Shell,
         Self::Debug,
@@ -76,6 +78,8 @@ impl Builtin {
         Self::Assert,
         Self::Fail,
         Self::Group,
+        Self::WaitFor,
+        Self::Uri,
     ];
 
     pub fn lookup(name: &str) -> Result<Self> {
@@ -113,6 +117,8 @@ impl Builtin {
             Self::Assert => "assert",
             Self::Fail => "fail",
             Self::Group => "group",
+            Self::WaitFor => "wait_for",
+            Self::Uri => "uri",
         }
     }
     pub fn check_support(self) -> CheckSupport {
@@ -120,6 +126,7 @@ impl Builtin {
             Self::Debug
             | Self::Assert
             | Self::Fail
+            | Self::WaitFor
             | Self::Meta
             | Self::SetFact
             | Self::IncludeVars
@@ -153,7 +160,16 @@ impl Builtin {
     }
     pub fn may_modify(self, args: &Value, check: bool) -> bool {
         !check
-            && if self == Self::AsyncStatus {
+            && if self == Self::Uri {
+                !matches!(
+                    args.get("method")
+                        .and_then(Value::as_str)
+                        .unwrap_or("GET")
+                        .to_ascii_uppercase()
+                        .as_str(),
+                    "GET" | "HEAD" | "OPTIONS"
+                )
+            } else if self == Self::AsyncStatus {
                 args.get("mode").and_then(Value::as_str) == Some("cleanup")
             } else {
                 self.check_support() != CheckSupport::ReadOnly
@@ -218,6 +234,36 @@ impl Builtin {
             Self::Assert => &["that", "fail_msg", "msg", "success_msg", "quiet"],
             Self::Fail => &["msg"],
             Self::Group => &["name", "gid", "state", "system"],
+            Self::WaitFor => &[
+                "host",
+                "port",
+                "path",
+                "state",
+                "search_regex",
+                "timeout",
+                "connect_timeout",
+                "delay",
+                "sleep",
+            ],
+            Self::Uri => &[
+                "url",
+                "method",
+                "headers",
+                "body",
+                "body_format",
+                "status_code",
+                "timeout",
+                "return_content",
+                "validate_certs",
+                "use_proxy",
+                "ca_path",
+                "follow_redirects",
+                "url_username",
+                "url_password",
+                "user",
+                "password",
+                "force_basic_auth",
+            ],
         }
     }
 
@@ -256,6 +302,37 @@ impl Builtin {
                 .as_str()
                 .context("Module parameter names must be strings")?;
             let valid = match key {
+                "body" if self == Self::Uri => true,
+                "headers" if self == Self::Uri => value.as_mapping().is_some_and(|headers| {
+                    headers
+                        .iter()
+                        .all(|(name, value)| name.is_string() && value.is_string())
+                }),
+                "status_code" if self == Self::Uri => {
+                    value
+                        .as_u64()
+                        .is_some_and(|status| (100..=599).contains(&status))
+                        || value.as_sequence().is_some_and(|values| {
+                            !values.is_empty()
+                                && values.iter().all(|value| {
+                                    value
+                                        .as_u64()
+                                        .is_some_and(|status| (100..=599).contains(&status))
+                                })
+                        })
+                }
+                "port" if self == Self::WaitFor => value
+                    .as_u64()
+                    .is_some_and(|port| (1..=65535).contains(&port)),
+                "timeout" | "connect_timeout" | "delay" | "sleep"
+                    if matches!(self, Self::WaitFor | Self::Uri) =>
+                {
+                    value.as_u64().is_some_and(|value| {
+                        value <= 604000
+                            && (self == Self::WaitFor && !matches!(key, "connect_timeout")
+                                || value > 0)
+                    })
+                }
                 "gather_subset" | "filter" if self == Self::Setup => {
                     value.is_string()
                         || value
@@ -278,6 +355,7 @@ impl Builtin {
                 "quiet" if self == Self::Assert => value.is_bool(),
                 "vars" => value.is_mapping(),
                 "force" | "enabled" | "daemon_reload" | "backup" | "create" | "append"
+                | "return_content" | "validate_certs" | "use_proxy" | "force_basic_auth"
                 | "create_home" | "system" | "remove" | "update_cache" => value.is_bool(),
                 "uid" | "gid" if matches!(self, Self::User | Self::Group) => {
                     value.as_u64().is_some_and(|id| id < u32::MAX as u64)
@@ -312,6 +390,42 @@ impl Builtin {
             Ok(())
         };
         match self {
+            Self::WaitFor => {
+                if args.get("port").is_some() && args.get("path").is_some() {
+                    bail!("wait_for path and port are mutually exclusive");
+                }
+                if args.get("search_regex").is_some() && args.get("path").is_none() {
+                    bail!("wait_for search_regex requires a file path");
+                }
+                if let Some(pattern) = string("search_regex") {
+                    regex::Regex::new(pattern).context("Invalid wait_for regex")?;
+                }
+                if string("host").is_some_and(str::is_empty)
+                    || string("path").is_some_and(str::is_empty)
+                {
+                    bail!("wait_for host/path cannot be empty");
+                }
+            }
+            Self::Uri => {
+                required("url")?;
+                if !matches!(
+                    string("body_format"),
+                    None | Some("raw" | "json" | "form-urlencoded")
+                ) {
+                    bail!("Unsupported URI body format");
+                }
+                if !matches!(
+                    string("follow_redirects"),
+                    None | Some("none" | "safe" | "all")
+                ) {
+                    bail!("Unsupported URI redirect policy");
+                }
+                for (canonical, alias) in [("url_username", "user"), ("url_password", "password")] {
+                    if args.get(canonical).is_some() && args.get(alias).is_some() {
+                        bail!("URI authentication aliases are mutually exclusive");
+                    }
+                }
+            }
             Self::IncludeVars => {
                 if args.get("file").is_some() == args.get("dir").is_some() {
                     bail!("include_vars requires exactly one of file or dir");
@@ -415,6 +529,7 @@ impl Builtin {
             Self::User | Self::Lineinfile | Self::Group => &["present", "absent"],
             Self::Package => &["present", "absent", "latest"],
             Self::Service | Self::Systemd => &["started", "stopped", "restarted", "reloaded"],
+            Self::WaitFor => &["present", "started", "absent", "stopped"],
             _ => &[],
         };
         if let Some(state) = string("state") {

@@ -84,7 +84,8 @@ impl Invocation {
     }
     fn skip_check(&self) -> bool {
         self.check
-            && (self.asynchronous.is_some()
+            && (matches!(self.module, Builtin::WaitFor | Builtin::Uri)
+                || self.asynchronous.is_some()
                 || (matches!(self.module, Builtin::Command | Builtin::Shell)
                     && self.args.get("creates").is_none()
                     && self.args.get("removes").is_none()))
@@ -165,10 +166,35 @@ impl Invocation {
             let connection_timeout: u64 = crate::ssh::connection::command_timeout(config)?
                 .as_millis()
                 .try_into()?;
+            let module_budget = if self.module == Builtin::WaitFor {
+                self.args
+                    .get("delay")
+                    .and_then(Value::as_u64)
+                    .unwrap_or(0)
+                    .saturating_add(
+                        self.args
+                            .get("timeout")
+                            .and_then(Value::as_u64)
+                            .unwrap_or(300),
+                    )
+                    .saturating_add(5)
+                    .saturating_mul(1000)
+            } else if self.module == Builtin::Uri {
+                self.args
+                    .get("timeout")
+                    .and_then(Value::as_u64)
+                    .unwrap_or(30)
+                    .saturating_add(5)
+                    .saturating_mul(1000)
+            } else {
+                0
+            };
             let timeout_ms = if self.asynchronous.is_some() {
                 connection_timeout
             } else {
-                self.timeout_ms.unwrap_or(connection_timeout)
+                self.timeout_ms
+                    .unwrap_or(connection_timeout.max(module_budget))
+                    .min(7 * 24 * 60 * 60 * 1000)
             };
             if let Some((specification, _)) = self.asynchronous.as_mut() {
                 specification.directory = config

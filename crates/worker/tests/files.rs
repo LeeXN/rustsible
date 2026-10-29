@@ -431,6 +431,226 @@ impl Drop for HttpFixture {
         self.server.take().unwrap().join().unwrap();
     }
 }
+
+#[test]
+fn uri_methods_bodies_status_redirects_and_auth_are_structured_and_private() {
+    let server = HttpFixture::start(false);
+    let post = run(
+        "uri",
+        json!({"url":format!("{}/echo",server.url),"method":"POST","body_format":"json","body":{"message":"hello"},"headers":{"X-Test":"yes"},"return_content":true}),
+        false,
+    );
+    assert!(!post.failed && !post.changed, "{}", post.msg);
+    assert_eq!(post.values["status"].as_u64(), Some(200));
+    assert_eq!(post.values["json"]["method"].as_str(), Some("POST"));
+    assert_eq!(
+        post.values["json"]["headers"]["x-test"].as_str(),
+        Some("yes")
+    );
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(post.values["json"]["body"].as_str().unwrap())
+            .unwrap(),
+        json!({"message":"hello"})
+    );
+    let form = run(
+        "uri",
+        json!({"url":format!("{}/echo",server.url),"method":"PUT","body_format":"form-urlencoded","body":{"space":"a b"}}),
+        false,
+    );
+    assert!(!form.failed, "{}", form.msg);
+    assert_eq!(form.values["json"]["body"].as_str(), Some("space=a+b"));
+    assert!(!form.values.contains_key("content"));
+    let rejected = run(
+        "uri",
+        json!({"url":format!("{}/status",server.url),"status_code":[200,201]}),
+        false,
+    );
+    assert!(rejected.failed);
+    assert_eq!(rejected.values["status"].as_u64(), Some(503));
+    assert!(
+        !run(
+            "uri",
+            json!({"url":format!("{}/status",server.url),"status_code":503}),
+            false
+        )
+        .failed
+    );
+    let redirected = run(
+        "uri",
+        json!({"url":format!("{}/redirect",server.url),"return_content":true}),
+        false,
+    );
+    assert!(!redirected.failed, "{}", redirected.msg);
+    assert_eq!(redirected.values["content"].as_str(), Some("hello"));
+    let untouched = run(
+        "uri",
+        json!({"url":format!("{}/redirect",server.url),"method":"POST","status_code":302}),
+        false,
+    );
+    assert!(!untouched.failed, "{}", untouched.msg);
+    for force in [false, true] {
+        let auth = run(
+            "uri",
+            json!({"url":format!("{}/echo",server.url),"url_username":"user","url_password":"pass","force_basic_auth":force}),
+            false,
+        );
+        assert!(!auth.failed && auth.no_log, "{}", auth.msg);
+        assert_eq!(
+            auth.values["json"]["headers"]
+                .get("authorization")
+                .and_then(serde_yaml::Value::as_str),
+            force.then_some("Basic dXNlcjpwYXNz")
+        );
+        assert!(!serde_json::to_string(&auth.displayed())
+            .unwrap()
+            .contains("dXNlcjpwYXNz"));
+    }
+    let challenge = run(
+        "uri",
+        json!({"url":format!("{}/auth",server.url),"url_username":"user","url_password":"pass"}),
+        false,
+    );
+    assert!(!challenge.failed && challenge.no_log, "{}", challenge.msg);
+}
+
+#[test]
+fn uri_reuses_target_ca_proxy_and_bounded_response_policy() {
+    let tls = HttpFixture::start(true);
+    let root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("../../tests/fixtures/tls/ca.pem");
+    let rejected = run(
+        "uri",
+        json!({"url":format!("{}/hello?URI_PRIVATE_SENTINEL",tls.url)}),
+        false,
+    );
+    assert!(rejected.failed && !rejected.msg.contains("URI_PRIVATE_SENTINEL"));
+    let accepted = run(
+        "uri",
+        json!({"url":format!("{}/hello",tls.url),"ca_path":root,"return_content":true}),
+        false,
+    );
+    assert!(!accepted.failed, "{}", accepted.msg);
+    assert_eq!(accepted.values["content"].as_str(), Some("hello"));
+    let server = HttpFixture::start(false);
+    let proxy = [
+        ("HTTP_PROXY", server.url.clone()),
+        ("http_proxy", server.url.clone()),
+        ("NO_PROXY", String::new()),
+        ("no_proxy", String::new()),
+    ];
+    let (child, input) = start_env(
+        request(
+            "uri",
+            json!({"url":"http://must-not-resolve.invalid/hello","return_content":true}),
+            false,
+        ),
+        None,
+        None,
+        &proxy,
+    );
+    let proxied = finish(child, input);
+    assert!(!proxied.failed, "{}", proxied.msg);
+    assert_eq!(proxied.values["content"].as_str(), Some("hello"));
+    for path in ["oversized", "redirect-loop", "truncated"] {
+        assert!(
+            run(
+                "uri",
+                json!({"url":format!("{}/{path}",server.url),"return_content":true}),
+                false
+            )
+            .failed,
+            "{path}"
+        );
+    }
+    assert!(run("uri", json!({"url":format!("{}/echo",server.url),"method":"POST","body_format":"raw","body":{"invalid":"object"}}), false).failed);
+    assert!(run("uri", json!({"url":format!("{}/echo",server.url),"headers":{"Injected":"bad\r\nHeader: true"}}), false).failed);
+    assert!(run("uri", json!({"url":"http://must-not-resolve.invalid/","method":"POST","body":"must-not-send"}), true).skipped);
+}
+
+#[test]
+fn wait_for_observes_delayed_content_absence_and_tcp_readiness_with_bounds() {
+    let temporary = tempfile::tempdir().unwrap();
+    let path = temporary.path().join("ready");
+    let changing = path.clone();
+    let writer = std::thread::spawn(move || {
+        std::thread::sleep(Duration::from_millis(100));
+        fs::write(changing, "READY\n").unwrap();
+    });
+    let ready = run(
+        "wait_for",
+        json!({"path":path,"search_regex":"^READY$","timeout":3,"sleep":0}),
+        false,
+    );
+    assert!(!ready.failed && !ready.changed, "{}", ready.msg);
+    writer.join().unwrap();
+    assert!(
+        run(
+            "wait_for",
+            json!({"path":path,"search_regex":"MISSING","state":"absent","timeout":1}),
+            false
+        )
+        .failed
+    );
+    assert!(run("wait_for", json!({"path":path,"timeout":0}), false).failed);
+    assert!(
+        run(
+            "wait_for",
+            json!({"path":path,"delay":1,"timeout":1}),
+            false
+        )
+        .failed
+    );
+    fs::remove_file(&path).unwrap();
+    assert!(
+        !run(
+            "wait_for",
+            json!({"path":path,"state":"absent","timeout":1}),
+            false
+        )
+        .failed
+    );
+    assert!(run("wait_for", json!({"path":path,"timeout":0}), false).failed);
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    drop(listener);
+    let delayed = std::thread::spawn(move || {
+        std::thread::sleep(Duration::from_millis(100));
+        let listener = TcpListener::bind(("127.0.0.1", port)).unwrap();
+        let _ = listener.accept().unwrap();
+    });
+    let tcp = run(
+        "wait_for",
+        json!({"port":port,"timeout":3,"sleep":0}),
+        false,
+    );
+    assert!(!tcp.failed, "{}", tcp.msg);
+    delayed.join().unwrap();
+    assert!(
+        !run(
+            "wait_for",
+            json!({"port":port,"state":"stopped","timeout":1}),
+            false
+        )
+        .failed
+    );
+    assert!(run("wait_for", json!({"port":port,"path":path}), false).failed);
+    fs::write(&path, vec![b'x'; 8 * 1024 * 1024 + 1]).unwrap();
+    let bounded = run(
+        "wait_for",
+        json!({"path":path,"search_regex":"x","timeout":1}),
+        false,
+    );
+    assert!(bounded.failed && bounded.msg.contains("8 MiB"));
+    assert!(
+        run(
+            "wait_for",
+            json!({"path":path,"search_regex":"[","timeout":0}),
+            false
+        )
+        .failed
+    );
+    assert!(run("wait_for", json!({"port":port,"timeout":30}), true).skipped);
+}
 #[test]
 fn https_uses_target_ca_and_http_honors_proxy_and_redirect_limits_without_leaking_credentials() {
     let temporary = tempfile::tempdir().unwrap();

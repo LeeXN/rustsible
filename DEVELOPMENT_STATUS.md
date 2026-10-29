@@ -1,6 +1,6 @@
 # 分阶段计划的实现状态
 
-当前已实现并验证计划 **01–15**，以及文件安全补充修复。**M1、M2 已达成；完整的 22 项计划尚未完成。**
+当前已实现并验证计划 **01–16**，以及文件安全补充修复。**M1、M2 已达成；完整的 22 项计划尚未完成。**
 
 | 计划项 | 交付 | 证据 |
 | --- | --- | --- |
@@ -18,8 +18,9 @@
 | 12–13 复用、roles 与失败处置 | 已实现并验证 | [#15](https://github.com/LeeXN/rustsible/pull/15)，静态/动态导入、角色作用域与依赖、来源路径、pre/post/handlers；block/rescue/always、失败上下文、ignore_unreachable、listen/force_handlers、五种 meta；固定 Ansible 2.21 文件对照、本地覆盖率 86.36%；[双架构 CI 40880109243](https://github.com/LeeXN/rustsible/actions/runs/40880109243) 八作业通过，包括 glibc/musl SSH 三身份、父 block 身份与显式 false、预演无业务文件及临时程序清理 |
 | 14 发布编排 | 已实现并验证 | [#16](https://github.com/LeeXN/rustsible/pull/16)，serial/vars_files/原始分区与失败分母、throttle/run_once/失败阈值；委派身份和逐项 facts、linear/free、共享公开角色与独立逻辑主机连接；16 个本地真实文件场景、86.94% 覆盖率；[双架构 CI 40908464598](https://github.com/LeeXN/rustsible/actions/runs/40908464598) 八作业通过，包括三台独立 SSH 目标的 glibc/musl、三身份/属主、并行委派、幂等、check、清理和固定 Ansible 2.21 对照；libz-sys 已升级 1.1.31 修复 RUSTSEC-2026-0418 |
 | 15 异步执行 | 已实现并验证 | [#17](https://github.com/LeeXN/rustsible/pull/17)，原生后台监督、async/poll、ad-hoc -B/-P、async_status/finished；0700/0600 按身份隔离、原子结果、程序保留、poll 清理、查询沿用 no_log；86.93% 覆盖率；[双架构 CI 40924530647](https://github.com/LeeXN/rustsible/actions/runs/40924530647) 八作业通过，glibc/musl SSH 断连后继续、跨身份拒绝、原生文件、setsid 超时、noexec 与清理均有实证；协议 v4 |
-| 16 assert/fail/group | 实现并验收中 | 共用严格布尔条件和统一结果；控制端断言/失败、no_log/quiet、rescue；复用账号查询及 argv 系统工具的组生命周期/GID/冲突检查；本地场景与 x86_64 glibc/musl SSH 通过，最终门禁和双架构 CI 待完成 |
-| 17–19 网络/制品模块与 CLI | 未实现 | 第三阶段 |
+| 16 assert/fail/group | 已实现并验证 | [#18](https://github.com/LeeXN/rustsible/pull/18)，共用严格布尔条件和统一结果；控制端断言/失败、no_log/quiet、rescue；原生组生命周期/GID/冲突检查；87.05% 覆盖率；[双架构 CI 40928251351](https://github.com/LeeXN/rustsible/actions/runs/40928251351) 八作业通过，glibc/musl SSH 三身份与 check 有实证 |
+| 17 wait_for/uri | 实现并验收中 | 目标端 TCP/文件/内容就绪；共用 HTTP、TLS/私有 CA/代理、方法/请求体/状态码、认证遮蔽、8 MiB 边界和 until；本地及 x86_64 glibc/musl SSH 三身份通过，固定参考与最终双架构 CI 待完成 |
+| 18–19 制品模块与 CLI | 未实现 | 第三阶段 |
 | 20–22 Vault、扩展与发布验收 | 未实现 | 第四阶段 |
 
 当前验证包括 fmt、Clippy、全量测试、超过 80% 的行覆盖率、release 构建；真实 x86_64 SSH 的 deploy/root/app、check 前后业务状态一致、幂等、facts/register、权限/属主和清理；固定 ansible-core 2.21.0 的模板及条件对照；非法参数修改前失败，实际中断任务只执行一次、阻止后续循环项/后续 play。普通 Cargo 测试与参考环境分开。依赖审计保留既有 unsafe-libyaml 停止维护警告。

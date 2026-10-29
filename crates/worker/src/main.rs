@@ -12,6 +12,7 @@ mod services;
 mod staging;
 mod supervisor;
 mod tools;
+mod wait;
 use anyhow::{bail, Result};
 use rustsible_protocol::{
     Hello, ModuleResult, Request, Response, BUILD_ID, MAX_REQUEST_BYTES, MAX_RESPONSE_BYTES,

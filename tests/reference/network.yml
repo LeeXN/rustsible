@@ -1,0 +1,50 @@
+- hosts: localhost
+  gather_facts: false
+  environment:
+    NO_PROXY: localhost,127.0.0.1
+    no_proxy: localhost,127.0.0.1
+  tasks:
+    - wait_for:
+        host: 127.0.0.1
+        port: @PORT@
+        timeout: 5
+    - copy:
+        content: READY
+        dest: '@OUTPUT@/ready'
+    - wait_for:
+        path: '@OUTPUT@/ready'
+        search_regex: '^READY$'
+        timeout: 1
+    - wait_for:
+        path: '@OUTPUT@/ready'
+        timeout: 0
+      register: expired
+      ignore_errors: true
+    - wait_for:
+        path: '@OUTPUT@/ready'
+        state: absent
+        search_regex: MISSING
+        timeout: 1
+      register: still_present
+      ignore_errors: true
+    - uri:
+        url: http://@ADDRESS@/echo
+        method: POST
+        headers:
+          X-Check: native
+        body_format: json
+        body:
+          message: hello
+        return_content: true
+      register: posted
+    - uri:
+        url: http://@ADDRESS@/hello
+        return_content: true
+      register: hello
+    - uri:
+        url: http://@ADDRESS@/status
+        status_code: [200, 503]
+      register: status
+    - copy:
+        content: '{{ posted.json.method }}|{{ posted.json.headers["x-check"] }}|{{ hello.content }}|{{ status.status }}|{{ expired is failed }}|{{ still_present is failed }}'
+        dest: '@OUTPUT@/result'
