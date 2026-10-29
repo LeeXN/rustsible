@@ -525,46 +525,6 @@ impl Drop for BlockingModeGuard<'_> {
     }
 }
 
-fn build_noninteractive_sudo_command(command: &str, sudo_user: &str) -> String {
-    let user_option = if sudo_user.is_empty() || sudo_user == "root" {
-        String::new()
-    } else {
-        format!(" -u {}", shell_quote(sudo_user))
-    };
-
-    format!(
-        "sudo -n -p ''{} -- sh -c {}",
-        user_option,
-        shell_quote(command)
-    )
-}
-
-fn build_sudo_validation_command(sudo_user: &str) -> String {
-    let user_option = if sudo_user.is_empty() || sudo_user == "root" {
-        String::new()
-    } else {
-        format!(" -u {}", shell_quote(sudo_user))
-    };
-    format!("sudo -S -p ''{} -v", user_option)
-}
-
-fn sudo_password_input(password: &str) -> Result<Option<Vec<u8>>> {
-    if password.contains(['\n', '\r', '\0']) {
-        bail!("The sudo password contains characters unsupported by sudo -S");
-    }
-    if password.is_empty() {
-        Ok(None)
-    } else {
-        let mut input = Vec::with_capacity(password.len() + 1);
-        input.extend_from_slice(password.as_bytes());
-        input.push(b'\n');
-        Ok(Some(input))
-    }
-}
-
-/// POSIX `test` has no portable `--` option terminator. After unary `-e`, the
-/// next shell-quoted token is unambiguously the path, including names starting
-/// with a dash.
 #[cfg_attr(test, automock)]
 pub trait SshConnection {
     fn is_local(&self) -> bool {
@@ -574,14 +534,6 @@ pub trait SshConnection {
     fn execute_command_with_input(
         &self,
         command: &str,
-        input: &[u8],
-    ) -> Result<(i32, String, String)>;
-    fn execute_sudo_command(&self, command: &str, sudo_user: &str)
-        -> Result<(i32, String, String)>;
-    fn execute_sudo_command_with_input(
-        &self,
-        command: &str,
-        sudo_user: &str,
         input: &[u8],
     ) -> Result<(i32, String, String)>;
 }
@@ -659,7 +611,6 @@ impl Connection {
 
 pub struct LocalConnection {
     host: String,
-    sudo_password: String,
     command_timeout: Duration,
 }
 
@@ -674,7 +625,6 @@ impl LocalConnection {
         }
         Ok(Self {
             host: host.name.clone(),
-            sudo_password: host.get_ssh_sudo_password().unwrap_or("").to_string(),
             command_timeout: command_timeout(host)?,
         })
     }
@@ -914,37 +864,11 @@ impl SshConnection for LocalConnection {
     ) -> Result<(i32, String, String)> {
         self.execute_with_input(command, Some(input))
     }
-
-    fn execute_sudo_command(
-        &self,
-        command: &str,
-        sudo_user: &str,
-    ) -> Result<(i32, String, String)> {
-        self.execute_sudo_command_with_input(command, sudo_user, &[])
-    }
-
-    fn execute_sudo_command_with_input(
-        &self,
-        command: &str,
-        sudo_user: &str,
-        input: &[u8],
-    ) -> Result<(i32, String, String)> {
-        if let Some(password_input) = sudo_password_input(&self.sudo_password)? {
-            let validation = build_sudo_validation_command(sudo_user);
-            let (code, _, stderr) = self.execute_with_input(&validation, Some(&password_input))?;
-            if code != 0 {
-                bail!("Local sudo authentication failed: {}", stderr.trim());
-            }
-        }
-        let sudo_command = build_noninteractive_sudo_command(command, sudo_user);
-        self.execute_with_input(&sudo_command, Some(input))
-    }
 }
 
 pub struct SshClient {
     session: Session,
     host: String,
-    sudo_password: String,
     command_timeout: Duration,
     operation_lock: Mutex<()>,
 }
@@ -1177,7 +1101,6 @@ impl SshClient {
         verify_host_key(&session, host)?;
 
         let username = host.get_ssh_user().unwrap_or("root");
-        let sudo_password = host.get_ssh_sudo_password().unwrap_or("");
 
         debug!("Using SSH username: {}", username);
         let mut auth_succeeded = false;
@@ -1228,7 +1151,6 @@ impl SshClient {
         Ok(Self {
             session,
             host: host.name.clone(),
-            sudo_password: sudo_password.to_string(),
             command_timeout,
             operation_lock: Mutex::new(()),
         })
@@ -1247,32 +1169,6 @@ impl SshConnection for SshClient {
     ) -> Result<(i32, String, String)> {
         self.execute_with_input(command, Some(input))
     }
-
-    fn execute_sudo_command(
-        &self,
-        command: &str,
-        sudo_user: &str,
-    ) -> Result<(i32, String, String)> {
-        self.execute_sudo_command_with_input(command, sudo_user, &[])
-    }
-
-    fn execute_sudo_command_with_input(
-        &self,
-        command: &str,
-        sudo_user: &str,
-        input: &[u8],
-    ) -> Result<(i32, String, String)> {
-        if let Some(password_input) = sudo_password_input(&self.sudo_password)? {
-            let validation = build_sudo_validation_command(sudo_user);
-            let (code, _, stderr) = self.execute_with_input(&validation, Some(&password_input))?;
-            if code != 0 {
-                bail!("Remote sudo authentication failed: {}", stderr.trim());
-            }
-        }
-        let sudo_command = build_noninteractive_sudo_command(command, sudo_user);
-        debug!("Executing a sudo command on {}", self.host);
-        self.execute_with_input(&sudo_command, Some(input))
-    }
 }
 
 #[cfg(test)]
@@ -1290,31 +1186,6 @@ mod tests {
             shell_quote("$(touch /tmp/pwn); *\nnext"),
             "'$(touch /tmp/pwn); *\nnext'"
         );
-    }
-
-    #[test]
-    fn sudo_command_quotes_user_and_program_without_a_password() {
-        let command = build_noninteractive_sudo_command("printf '%s' hello; id", "user; id");
-        assert_eq!(
-            command,
-            "sudo -n -p '' -u 'user; id' -- sh -c 'printf '\"'\"'%s'\"'\"' hello; id'"
-        );
-        assert!(!command.contains("password"));
-
-        assert_eq!(
-            build_noninteractive_sudo_command("id", "root"),
-            "sudo -n -p '' -- sh -c 'id'"
-        );
-    }
-
-    #[test]
-    fn sudo_password_is_a_separate_single_input_line() {
-        assert_eq!(sudo_password_input("").unwrap(), None);
-        assert_eq!(
-            sudo_password_input("not in argv").unwrap(),
-            Some(b"not in argv\n".to_vec())
-        );
-        assert!(sudo_password_input("two\nlines").is_err());
     }
 
     #[test]

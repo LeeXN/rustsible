@@ -1,0 +1,20 @@
+FROM alpine:3.22
+RUN --mount=type=secret,id=proxy_ca \
+    if [ -f /run/secrets/proxy_ca ]; then export SSL_CERT_FILE=/run/secrets/proxy_ca; fi; \
+    apk add --no-cache openssh sudo shadow util-linux ca-certificates libcap-utils openrc \
+    && mkdir -p /run/sshd \
+    && useradd -m -s /bin/sh deploy \
+    && useradd -m -s /bin/sh app \
+    && passwd -d deploy \
+    && printf 'deploy ALL=(ALL) NOPASSWD: ALL\n' > /etc/sudoers.d/deploy \
+    && chmod 0440 /etc/sudoers.d/deploy
+RUN --mount=type=secret,id=proxy_ca \
+    if [ -f /run/secrets/proxy_ca ]; then export SSL_CERT_FILE=/run/secrets/proxy_ca; fi; \
+    mkdir -p /srv/http/repo /srv/apk-cache \
+    && apk --cache-dir /srv/apk-cache update \
+    && apk --cache-dir /srv/apk-cache fetch --output /srv/http/repo tree \
+    && for index in /srv/apk-cache/APKINDEX*.tar.gz; do \
+         if tar -xzOf "$index" APKINDEX | grep -qx 'P:tree'; then cp "$index" /srv/http/repo/APKINDEX.tar.gz; break; fi; \
+       done \
+    && test -f /srv/http/repo/APKINDEX.tar.gz
+CMD ["sh", "-c", "ssh-keygen -A >/dev/null && exec /usr/sbin/sshd -D -e"]

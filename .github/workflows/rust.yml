@@ -84,6 +84,12 @@ jobs:
         run: bash tests/ssh/run.sh target/${{ matrix.target }}/release/rustsible target/workers native glibc target/${{ matrix.target }}/release/examples/http_fixture
       - name: Native execution without Python or curl (musl)
         run: bash tests/ssh/run.sh target/${{ matrix.target }}/release/rustsible target/workers native musl target/${{ matrix.target }}/release/examples/http_fixture
+      - name: Native accounts, packages and real systemd acceptance
+        run: bash tests/ssh/run.sh target/${{ matrix.target }}/release/rustsible target/workers systems glibc target/${{ matrix.target }}/release/examples/http_fixture
+      - name: Native accounts, signed APK and OpenRC acceptance
+        run: bash tests/ssh/run.sh target/${{ matrix.target }}/release/rustsible target/workers systems musl target/${{ matrix.target }}/release/examples/http_fixture
+      - name: Native SysV service lifetime acceptance
+        run: bash tests/ssh/run.sh target/${{ matrix.target }}/release/rustsible target/workers systems sysv target/${{ matrix.target }}/release/examples/http_fixture
       - uses: actions/upload-artifact@v4
         with:
           name: native-${{ matrix.arch }}
@@ -91,6 +97,32 @@ jobs:
             target/${{ matrix.target }}/release/rustsible
             target/${{ matrix.target }}/release/rustsible-worker
           if-no-files-found: error
+
+  system-tools:
+    name: Real RPM, Pacman and Upstart acceptance
+    needs: ssh
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-unknown-linux-musl
+      - uses: Swatinem/rust-cache@v2
+      - uses: actions/download-artifact@v4
+        with:
+          name: native-x86_64
+          path: target/native
+      - run: sudo apt-get update && sudo apt-get install -y musl-tools
+      - run: cargo build -p rustsible-worker --example http_fixture --release --target x86_64-unknown-linux-musl --locked
+      - run: cargo run --locked -p rustsible-protocol --example worker_manifest -- target/workers x86_64=target/native/rustsible-worker
+      - name: Real package managers with isolated offline repositories
+        run: |
+          chmod +x target/native/rustsible target/native/rustsible-worker
+          for manager in dnf yum pacman zypper; do
+            bash tests/managers/run.sh target/native/rustsible target/workers "$manager"
+          done
+      - name: Real Upstart PID 1 and daemon lifetime
+        run: bash tests/managers/upstart.sh target/native/rustsible target/workers target/x86_64-unknown-linux-musl/release/examples/http_fixture
 
   offline-packages:
     name: Dual architecture offline packages

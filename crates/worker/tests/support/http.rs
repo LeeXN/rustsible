@@ -94,10 +94,25 @@ pub fn handle(connection: TcpStream, root: &Path, tls: Option<Arc<ServerConfig>>
     let name = path
         .strip_prefix('/')
         .context("Expected absolute fixture path")?;
-    if name.contains('/') || name.contains("..") {
+    if Path::new(name).components().any(|component| {
+        matches!(
+            component,
+            std::path::Component::ParentDir
+                | std::path::Component::RootDir
+                | std::path::Component::Prefix(_)
+        )
+    }) {
         bail!("Fixture path traversal rejected");
     }
-    let mut file = fs::File::open(root.join(name))?;
+    let mut file = match fs::File::open(root.join(name)) {
+        Ok(file) if file.metadata()?.is_file() => file,
+        _ => {
+            stream.write_all(
+                b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+            )?;
+            return Ok(());
+        }
+    };
     write!(
         stream,
         "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",

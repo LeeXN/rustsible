@@ -19,12 +19,18 @@ pub fn execute(
             result.changed |= rustsible_protocol::change::known_changed();
             result
         }
-        Err(error) => ModuleResult {
-            failed: true,
-            changed: rustsible_protocol::change::known_changed(),
-            msg: format!("{error:#}"),
-            ..ModuleResult::default()
-        },
+        Err(error) => {
+            let mut result = error
+                .downcast_ref::<crate::tools::Failure>()
+                .map(|failure| failure.0.clone())
+                .unwrap_or_else(|| ModuleResult {
+                    failed: true,
+                    ..ModuleResult::default()
+                });
+            result.changed |= rustsible_protocol::change::known_changed();
+            result.msg = format!("{error:#}");
+            result
+        }
     }
 }
 fn run(
@@ -59,6 +65,15 @@ fn run(
         return crate::process::execute(command, request.module == "shell", scratch);
     }
     match request.module.as_str() {
+        "service" | "systemd" => {
+            return crate::services::execute(
+                &request.args,
+                request.check,
+                request.module == "systemd",
+            )
+        }
+        "package" => return crate::packages::execute(&request.args, request.check),
+        "user" => return crate::accounts::execute(&request.args, request.check),
         "copy" | "template" => {
             return crate::files::copy(
                 &request.args,

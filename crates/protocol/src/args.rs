@@ -1,4 +1,5 @@
 use anyhow::Result;
+use serde_yaml::Value;
 
 pub fn tokenize_args(input: &str) -> Result<Vec<String>> {
     #[derive(Clone, Copy)]
@@ -81,4 +82,23 @@ pub fn tokenize_args(input: &str) -> Result<Vec<String>> {
     }
 
     Ok(tokens)
+}
+
+pub fn extract_command_arg(args: &Value) -> Result<String> {
+    match args {
+        Value::String(cmd) => Ok(cmd.clone()),
+        Value::Mapping(map) => {
+            if map.len() != 1 {
+                return Err(anyhow::anyhow!(
+                    "Command modules accept only the 'cmd' parameter"
+                ));
+            }
+            if let Some(Value::String(cmd)) = map.get(Value::String("cmd".to_string())) {
+                Ok(cmd.clone())
+            } else {
+                Err(anyhow::anyhow!("Module requires a valid command string"))
+            }
+        }
+        _ => Err(anyhow::anyhow!("Module requires a valid command string")),
+    }
 }

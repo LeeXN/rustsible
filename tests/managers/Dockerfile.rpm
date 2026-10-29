@@ -1,0 +1,9 @@
+FROM rockylinux:9 AS packages
+RUN --mount=type=secret,id=proxy_ca \
+    if [ -f /run/secrets/proxy_ca ]; then cert_args=--setopt=sslcacert=/run/secrets/proxy_ca; else cert_args=; fi; \
+    dnf -y $cert_args install rpm-build createrepo_c && dnf clean all
+COPY rpm-packages.sh /tmp/rpm-packages.sh
+RUN sh /tmp/rpm-packages.sh
+FROM rockylinux:9
+COPY --from=packages /srv/versions /srv/versions
+CMD ["sleep", "infinity"]

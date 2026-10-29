@@ -3,9 +3,10 @@
 mod args;
 pub mod change;
 pub mod param;
+pub mod registry;
 mod result;
 use anyhow::{bail, Context, Result};
-pub use args::tokenize_args;
+pub use args::{extract_command_arg, tokenize_args};
 pub use result::{insert_output_values, result_fields, ModuleResult, Outcome};
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -26,6 +27,10 @@ pub const NATIVE_MODULES: &[&str] = &[
     "file",
     "lineinfile",
     "get_url",
+    "user",
+    "service",
+    "systemd",
+    "package",
 ];
 
 #[derive(Serialize, Deserialize)]

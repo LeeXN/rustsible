@@ -1,0 +1,4 @@
+FROM archlinux:base
+COPY arch-packages.sh /tmp/arch-packages.sh
+RUN bash /tmp/arch-packages.sh
+CMD ["sleep", "infinity"]

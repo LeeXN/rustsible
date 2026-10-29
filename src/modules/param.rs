@@ -1,4 +1,3 @@
-pub(crate) use rustsible_protocol::param::{digest_hex_length, parse_mode, validate_identity};
 pub use rustsible_protocol::param::{get_optional_param, get_param, has_param, validate_params};
 
 #[cfg(test)]
