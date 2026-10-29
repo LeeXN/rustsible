@@ -114,21 +114,29 @@ impl Runtime {
             source.rewind()?;
         }
         request.validate()?;
-        // Keys include credentials but never variable/fact overlays. Hashing
-        // avoids retaining another plaintext copy in a diagnostic-able map key.
+        // Fingerprint only effective transport settings, never fact overlays.
+        // A host keeps one live connection: changing settings shuts down the
+        // previous lease, even when returning later to a former configuration.
         let key = config.worker_key()?;
         let lease = self
             .leases
             .lock()
             .map_err(|_| anyhow!("Worker cache lock poisoned"))?
-            .entry(key)
+            .entry(config.name.clone())
             .or_default()
             .clone();
         let mut slot = lease
             .lock()
             .map_err(|_| anyhow!("Worker lease lock poisoned"))?;
+        if slot.as_ref().is_some_and(|client| client.config_key != key) {
+            if let Some(mut client) = slot.take() {
+                client
+                    .close()
+                    .context("Cannot close previous connection after configuration change")?;
+            }
+        }
         if slot.is_none() {
-            *slot = Some(Client::start(config, &self.directory()?, module)?);
+            *slot = Some(Client::start(config, &self.directory()?, module, key)?);
         }
         let client = slot.as_mut().context("Missing worker lease")?;
         client.hello.validate(&client.arch, client.uid, module)?;
@@ -246,15 +254,47 @@ impl Runtime {
             }
         }
     }
+
+    /// Explicit reset shares the same lock as requests, so shutdown cannot
+    /// interrupt a task already executing on this host or replay its request.
+    pub(crate) fn reset(&self, host: &str) -> Result<()> {
+        let lease = self
+            .leases
+            .lock()
+            .map_err(|_| anyhow!("Worker cache lock poisoned"))?
+            .get(host)
+            .cloned();
+        if let Some(lease) = lease {
+            let client = lease
+                .lock()
+                .map_err(|_| anyhow!("Worker lease lock poisoned"))?
+                .take();
+            if let Some(mut client) = client {
+                client.close().context("Cannot reset worker connection")?;
+            }
+        }
+        Ok(())
+    }
 }
 struct Client {
+    closed: bool,
+    config_key: String,
     session: transport::Session,
     hello: Hello,
     arch: String,
     uid: u32,
 }
 impl Client {
-    fn start(config: &ConnectionConfig, directory: &Path, module: &str) -> Result<Self> {
+    fn close(&mut self) -> Result<()> {
+        self.closed = true;
+        self.session.shutdown()
+    }
+    fn start(
+        config: &ConnectionConfig,
+        directory: &Path,
+        module: &str,
+        config_key: String,
+    ) -> Result<Self> {
         let manifest_file = OpenOptions::new().read(true).custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK).open(directory.join("manifest.json")).context(
             "Cannot open worker manifest; specify --worker-dir with the release workers directory",
         )?;
@@ -383,6 +423,8 @@ impl Client {
         })();
         match initialized {
             Ok(hello) => Ok(Self {
+                closed: false,
+                config_key,
                 session,
                 hello,
                 arch,
@@ -401,8 +443,10 @@ impl Client {
 }
 impl Drop for Client {
     fn drop(&mut self) {
-        if let Err(error) = self.session.shutdown() {
-            eprintln!("Worker lease cleanup failed: {error:#}");
+        if !self.closed {
+            if let Err(error) = self.close() {
+                eprintln!("Worker lease cleanup failed: {error:#}");
+            }
         }
     }
 }
@@ -497,6 +541,39 @@ mod tests {
         );
         drop(runtime);
         assert_eq!(fs::read_dir(temporary.path()).unwrap().count(), 0);
+    }
+    #[test]
+    fn configuration_changes_and_explicit_reset_close_the_previous_lease() {
+        let first = tempfile::tempdir().unwrap();
+        let second = tempfile::tempdir().unwrap();
+        let runtime = Runtime::default();
+        let execute = |config: &ConnectionConfig| {
+            let result = runtime
+                .execute(config, "setup", Value::Mapping(Default::default()), true)
+                .unwrap();
+            assert!(!result.failed, "{}", result.msg);
+        };
+        execute(&config(first.path()));
+        assert_eq!(fs::read_dir(first.path()).unwrap().count(), 1);
+        execute(&config(second.path()));
+        assert_eq!(fs::read_dir(first.path()).unwrap().count(), 0);
+        assert_eq!(fs::read_dir(second.path()).unwrap().count(), 1);
+        assert_eq!(runtime.leases.lock().unwrap().len(), 1);
+        let original = fs::read_dir(second.path())
+            .unwrap()
+            .next()
+            .unwrap()
+            .unwrap()
+            .path();
+        runtime.reset("local").unwrap();
+        assert_eq!(fs::read_dir(second.path()).unwrap().count(), 0);
+        execute(&config(second.path()));
+        assert!(!original.exists());
+        execute(&config(first.path()));
+        assert_eq!(fs::read_dir(second.path()).unwrap().count(), 0);
+        runtime.reset("local").unwrap();
+        runtime.reset("absent").unwrap();
+        assert_eq!(fs::read_dir(first.path()).unwrap().count(), 0);
     }
     #[test]
     fn unsafe_directory_and_damaged_or_missing_artifacts_fail_without_business_changes() {

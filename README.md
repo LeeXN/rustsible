@@ -117,6 +117,13 @@ and package daemons pass to PID 1 when that supervisor exits, rather than being
 adopted by the persistent worker and killed by a subsequent task. Cancelled or
 unconfirmed operations terminate their owned execution trees.
 
+Playbook and ad-hoc executions share a bounded pool of host threads. A free
+thread immediately takes the next host, while playbook tasks retain their
+default ordering barrier. A host reuses its authenticated worker connection
+until effective connection settings change or `meta: reset_connection` runs.
+Changing settings closes the previous lease before creating another. Lost
+responses are reported without automatically replaying a modifying request.
+
 The current real OS acceptance covers Debian systemd/APT, Alpine OpenRC/APK,
 and Debian SysV, including normal/root/non-root-become identities and local/SSH
 transports on x86_64 and aarch64. Additional x86_64 fixtures exercise real Rocky

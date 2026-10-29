@@ -80,6 +80,8 @@ jobs:
         run: cargo run --locked -p rustsible-protocol --example worker_manifest -- target/workers ${{ matrix.arch }}=target/${{ matrix.target }}/release/rustsible-worker
       - name: Existing SSH scenarios
         run: bash tests/ssh/run.sh target/${{ matrix.target }}/release/rustsible target/workers
+      - name: SSH connection reuse and reset acceptance
+        run: bash tests/ssh/run.sh target/${{ matrix.target }}/release/rustsible target/workers sessions
       - name: Native execution without Python or curl (glibc)
         run: bash tests/ssh/run.sh target/${{ matrix.target }}/release/rustsible target/workers native glibc target/${{ matrix.target }}/release/examples/http_fixture
       - name: Native execution without Python or curl (musl)

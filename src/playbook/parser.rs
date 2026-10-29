@@ -459,6 +459,9 @@ fn parse_module_args(module: &str, value: &Value) -> Result<(String, Mapping)> {
     let mut args = Mapping::new();
     match value {
         Value::Null => {}
+        Value::String(value) if normalized == "meta" => {
+            args.insert(Value::String("action".into()), Value::String(value.clone()));
+        }
         Value::String(value) if normalized == "debug" => {
             args.insert(
                 Value::String("msg".to_string()),
