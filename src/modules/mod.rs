@@ -111,7 +111,7 @@ pub fn run_adhoc_with_options(
     };
     let mut state = crate::playbook::RunState::default();
     state.extra = std::sync::Arc::new(extra);
-    state.workers = crate::worker::Runtime::new(options.worker_dir.clone());
+    state.workers = std::sync::Arc::new(crate::worker::Runtime::new(options.worker_dir.clone()));
     state.prepare(
         inventory,
         &std::env::current_dir()?,

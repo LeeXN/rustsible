@@ -69,6 +69,60 @@ mkdir "$fixture_dir/reuse-output"
 "$binary" --config "$fixture_dir/reuse/ansible.cfg" playbook -i "$fixture_dir/inventory" "$fixture_dir/reuse/main.yml" > "$fixture_dir/native-reuse.log" 2>&1
 diff -r "$fixture_dir/reference-reuse" "$fixture_dir/reuse-output"
 [[ ! -e $fixture_dir/reuse-output/must-not-run ]]
+printf '[rollout]\na ansible_connection=local\nb ansible_connection=local\nc ansible_connection=local\nd ansible_connection=local\n[delegation]\norigin ansible_connection=ssh ansible_host=unreachable.invalid marker=origin\ntarget ansible_connection=local marker=target\n' > "$fixture_dir/strategy-inventory"
+mkdir "$fixture_dir/strategy-output"
+sed "s|@OUTPUT@|$fixture_dir/strategy-output|g" "$repo_dir/tests/reference/strategy.yml" > "$fixture_dir/strategy.yml"
+uv tool run --from ansible-core==2.21.0 ansible-playbook -i "$fixture_dir/strategy-inventory" "$fixture_dir/strategy.yml" > "$fixture_dir/reference-strategy.log" 2>&1
+mv "$fixture_dir/strategy-output" "$fixture_dir/reference-strategy"
+mkdir "$fixture_dir/strategy-output"
+"$binary" playbook -i "$fixture_dir/strategy-inventory" "$fixture_dir/strategy.yml" > "$fixture_dir/native-strategy.log" 2>&1
+diff -r "$fixture_dir/reference-strategy" "$fixture_dir/strategy-output"
+for percentage in 49 50; do
+    mkdir "$fixture_dir/limit-$percentage"
+    sed "s|@OUTPUT@|$fixture_dir/limit-$percentage|g; s|@PERCENTAGE@|$percentage|g" "$repo_dir/tests/reference/failure-limit.yml" > "$fixture_dir/limit-$percentage.yml"
+    if uv tool run --from ansible-core==2.21.0 ansible-playbook -i "$fixture_dir/strategy-inventory" "$fixture_dir/limit-$percentage.yml" > "$fixture_dir/reference-limit-$percentage.log" 2>&1; then
+        echo 'Reference unexpectedly accepted a failed rollout' >&2; exit 1
+    fi
+    mv "$fixture_dir/limit-$percentage" "$fixture_dir/reference-limit-$percentage"
+    mkdir "$fixture_dir/limit-$percentage"
+    if "$binary" playbook -i "$fixture_dir/strategy-inventory" "$fixture_dir/limit-$percentage.yml" > "$fixture_dir/native-limit-$percentage.log" 2>&1; then
+        echo 'Rustsible unexpectedly accepted a failed rollout' >&2; exit 1
+    fi
+    diff -r "$fixture_dir/reference-limit-$percentage" "$fixture_dir/limit-$percentage"
+done
+mkdir "$fixture_dir/fatal-output"
+sed "s|@OUTPUT@|$fixture_dir/fatal-output|g" "$repo_dir/tests/reference/fatal-rescue.yml" > "$fixture_dir/fatal.yml"
+if uv tool run --from ansible-core==2.21.0 ansible-playbook -i "$fixture_dir/strategy-inventory" "$fixture_dir/fatal.yml" > "$fixture_dir/reference-fatal.log" 2>&1; then
+    echo 'Ansible 2.21 unexpectedly cleared the fatal failure exit status' >&2; exit 1
+fi
+[[ $(cat "$fixture_dir/fatal-output/continued-a") == continued && $(cat "$fixture_dir/fatal-output/later-a") == later-play ]]
+[[ ! -e $fixture_dir/fatal-output/later-d ]]
+mv "$fixture_dir/fatal-output" "$fixture_dir/reference-fatal"
+mkdir "$fixture_dir/fatal-output"
+if "$binary" playbook -i "$fixture_dir/strategy-inventory" "$fixture_dir/fatal.yml" > "$fixture_dir/native-fatal.log" 2>&1; then
+    echo 'Rustsible unexpectedly cleared the fatal failure exit status' >&2; exit 1
+fi
+diff -r "$fixture_dir/reference-fatal" "$fixture_dir/fatal-output"
+mkdir "$fixture_dir/previous-output"
+sed "s|@OUTPUT@|$fixture_dir/previous-output|g" "$repo_dir/tests/reference/previous-failures.yml" > "$fixture_dir/previous.yml"
+if uv tool run --from ansible-core==2.21.0 ansible-playbook -i "$fixture_dir/strategy-inventory" "$fixture_dir/previous.yml" > "$fixture_dir/reference-previous.log" 2>&1; then
+    echo 'Reference unexpectedly cleared earlier host failures' >&2; exit 1
+fi
+[[ $(cat "$fixture_dir/previous-output/batch-c") == c,d && $(cat "$fixture_dir/previous-output/survived-d") == survived ]]
+mv "$fixture_dir/previous-output" "$fixture_dir/reference-previous"
+mkdir "$fixture_dir/previous-output"
+if "$binary" playbook -i "$fixture_dir/strategy-inventory" "$fixture_dir/previous.yml" > "$fixture_dir/native-previous.log" 2>&1; then
+    echo 'Rustsible unexpectedly cleared earlier host failures' >&2; exit 1
+fi
+diff -r "$fixture_dir/reference-previous" "$fixture_dir/previous-output"
+mkdir -p "$fixture_dir/roles" "$fixture_dir/free-output"
+cp -a "$repo_dir/tests/reference/free-role" "$fixture_dir/roles/demo"
+sed "s|@OUTPUT@|$fixture_dir/free-output|g" "$repo_dir/tests/reference/free.yml" > "$fixture_dir/free.yml"
+uv tool run --from ansible-core==2.21.0 ansible-playbook -i "$fixture_dir/strategy-inventory" "$fixture_dir/free.yml" > "$fixture_dir/reference-free.log" 2>&1
+mv "$fixture_dir/free-output" "$fixture_dir/reference-free"
+mkdir "$fixture_dir/free-output"
+"$binary" playbook -i "$fixture_dir/strategy-inventory" "$fixture_dir/free.yml" > "$fixture_dir/native-free.log" 2>&1
+diff -r "$fixture_dir/reference-free" "$fixture_dir/free-output"
 if uv tool run --from ansible-core==2.21.0 ansible-playbook \
     -i "$fixture_dir/inventory" "$fixture_dir/non_boolean.yml" > "$fixture_dir/reference-condition.log" 2>&1; then
     echo 'Reference unexpectedly accepted a string condition' >&2; exit 1
@@ -77,4 +131,4 @@ if "$binary" playbook -i "$fixture_dir/inventory" "$fixture_dir/non_boolean.yml"
     echo 'Rustsible unexpectedly accepted a string condition' >&2; exit 1
 fi
 [[ ! -e $fixture_dir/result/unsafe-condition ]]
-printf 'Ansible 2.21.0 comparison passed: templates/types, native files, retries/conditions, environment, command prediction, fact names/fields/filtering, variable sources, host scope, imports/roles and handler/rescue phases\n'
+printf 'Ansible 2.21.0 comparison passed: templates/types, native files, retries/conditions, environment, command prediction, facts, variables, imports/roles, handlers/rescue, serial/run_once, failure thresholds, delegation and free strategy\n'

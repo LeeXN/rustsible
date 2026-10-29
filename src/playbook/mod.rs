@@ -2,6 +2,7 @@ pub mod filters;
 mod handlers;
 mod parser;
 mod play;
+mod strategy;
 mod task;
 pub(crate) mod templar;
 
@@ -13,6 +14,7 @@ use std::collections::HashSet;
 pub use handlers::Handler;
 pub use play::Play;
 pub(crate) use play::RunState;
+pub use strategy::Strategy;
 pub(crate) use task::render_module_arguments;
 pub use task::{Task, TaskGroup, TaskResult, TaskScope};
 
@@ -92,7 +94,7 @@ pub fn execute_with_options(
 
     let mut failures = Vec::new();
     let mut state = play::RunState::default();
-    state.workers = crate::worker::Runtime::new(options.worker_dir.clone());
+    state.workers = std::sync::Arc::new(crate::worker::Runtime::new(options.worker_dir.clone()));
     state.extra = std::sync::Arc::new(extra);
     state.prepare(
         &inventory,
@@ -132,7 +134,7 @@ pub fn execute_with_options(
         if let Err(e) = play_result {
             error!("Play '{}' failed: {}", play.name, e);
             // Continue with next play unless fail_fast is enabled
-            if play.fail_fast {
+            if play.fail_fast || state.abort_book {
                 state.print_recap();
                 return Err(e);
             }

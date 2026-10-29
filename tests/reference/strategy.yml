@@ -1,0 +1,75 @@
+- hosts: rollout
+  gather_facts: false
+  serial: [2, 1]
+  tasks:
+    - command: test -f @OUTPUT@/handled-a
+      when: inventory_hostname in ['c', 'd']
+    - command: /bin/echo '{{ inventory_hostname }}'
+      run_once: true
+      register: leader
+      notify: finish
+    - copy:
+        content: '{{ ansible_play_batch | join(",") }}|{{ leader.stdout }}'
+        dest: '@OUTPUT@/batch-{{ inventory_hostname }}'
+  handlers:
+    - name: finish
+      copy:
+        content: handled
+        dest: '@OUTPUT@/handled-{{ inventory_hostname }}'
+- hosts: rollout
+  gather_facts: false
+  serial: '50%'
+  tasks:
+    - copy:
+        content: '{{ ansible_play_batch | join(",") }}'
+        dest: '@OUTPUT@/percentage-{{ inventory_hostname }}'
+- hosts: rollout
+  gather_facts: false
+  tasks:
+    - block:
+        - command: /bin/false
+          when: inventory_hostname == 'a'
+      rescue:
+        - copy:
+            content: rescued
+            dest: '@OUTPUT@/rescued'
+      always:
+        - copy:
+            content: always
+            dest: '@OUTPUT@/always-{{ inventory_hostname }}'
+    - copy:
+        content: completed
+        dest: '@OUTPUT@/completed-{{ inventory_hostname }}'
+- hosts: origin
+  gather_facts: false
+  tasks:
+    - copy:
+        content: '{{ marker }}|{{ inventory_hostname }}'
+        dest: '@OUTPUT@/delegated'
+      delegate_to: target
+    - setup:
+        filter: ansible_system
+      delegate_to: target
+      delegate_facts: true
+    - set_fact:
+        assigned: '{{ inventory_hostname }}'
+      delegate_to: target
+      delegate_facts: true
+    - set_fact:
+        default_assigned: origin
+      delegate_to: target
+    - copy:
+        content: '{{ hostvars.target.assigned }}|{{ hostvars.target.ansible_facts.system }}|{{ default_assigned }}'
+        dest: '@OUTPUT@/delegated-facts'
+      delegate_to: localhost
+    - set_fact:
+        loop_assigned: '{{ item }}|{{ inventory_hostname }}'
+        iteration_count: '{{ (iteration_count | default(0)) + 1 }}'
+      delegate_to: '{{ item }}'
+      delegate_facts: true
+      loop: [target, localhost]
+    - copy:
+        content: '{{ hostvars.target.loop_assigned }}|{{ hostvars.localhost.loop_assigned }}|{{ hostvars.target.iteration_count }}|{{ hostvars.localhost.iteration_count }}'
+        dest: '@OUTPUT@/delegated-loop-facts'
+      delegate_to: localhost
+

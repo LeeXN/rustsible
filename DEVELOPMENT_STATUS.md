@@ -1,6 +1,6 @@
 # 分阶段计划的实现状态
 
-当前已实现并验证计划 **01–11**，以及文件安全补充修复。**M1 已达成；完整的 22 项计划尚未完成。**
+当前已实现并验证计划 **01–13**，以及文件安全补充修复。**M1 已达成；完整的 22 项计划尚未完成。**
 
 | 计划项 | 交付 | 证据 |
 | --- | --- | --- |
@@ -15,8 +15,9 @@
 | 09 连接与调度 | 已实现并验证 | [#12](https://github.com/LeeXN/rustsible/pull/12)，Playbook/ad-hoc 共用固定线程领取主机；任务屏障、结果顺序和 forks 上限；有效配置变化关闭旧连接；meta reset_connection。真实 SSH 12 次目标调用仅 4 次认证，包含 reset 与两次配置变化；[双架构 CI 40831259231](https://github.com/LeeXN/rustsible/actions/runs/40831259231) 八作业通过 |
 | 10 任务执行语义 | 已实现并验证 | [#13](https://github.com/LeeXN/rustsible/pull/13)，changed_when/failed_when、until/retries/delay、timeout、environment、command 参数与安全预测；固定 Ansible 2.21 文件对照、84.09% 覆盖率；[双架构 CI 40833587972](https://github.com/LeeXN/rustsible/actions/runs/40833587972) 八作业通过，真实 SSH 三身份、超时终止 setsid 后代且只执行一次；协议 v3 |
 | 11 变量、配置与常用 facts | 已实现并验证 | [#14](https://github.com/LeeXN/rustsible/pull/14)，group_vars/host_vars、vars_files、include_vars、set_fact、-e；hostvars/groups/路径上下文；配置、环境与 CLI 优先级；目标端发行版/主机/网络/时间 facts；Ansible 2.21 对照、本地 85.17% 覆盖率；[双架构 CI 40853781614](https://github.com/LeeXN/rustsible/actions/runs/40853781614) 八作业通过，glibc/musl SSH 三身份、check、配置/play/task 身份与属主、hosts 完整域名别名均有实证 |
-| 12–13 复用、roles 与失败处置 | 实现并验收中 | 静态/动态导入、角色 defaults/vars/参数/依赖/handlers、来源路径、pre/post 阶段；block/rescue/always、失败上下文、ignore_unreachable、listen/force_handlers、五种 meta；固定 Ansible 2.21 文件结果对照、嵌套救援、不可达与不确定结果分类、递归 handler、no_log/check 回归；本地 glibc/musl SSH 三身份的模板/属主/顺序/预演清理已验证；最终提交的双架构 CI 待运行 |
-| 14–15 发布编排与异步 | 未实现 | 第二阶段 |
+| 12–13 复用、roles 与失败处置 | 已实现并验证 | [#15](https://github.com/LeeXN/rustsible/pull/15)，静态/动态导入、角色作用域与依赖、来源路径、pre/post/handlers；block/rescue/always、失败上下文、ignore_unreachable、listen/force_handlers、五种 meta；固定 Ansible 2.21 文件对照、本地覆盖率 86.36%；[双架构 CI 40880109243](https://github.com/LeeXN/rustsible/actions/runs/40880109243) 八作业通过，包括 glibc/musl SSH 三身份、父 block 身份与显式 false、预演无业务文件及临时程序清理 |
+| 14 发布编排 | 实现并验收中 | serial 数量/百分比/列表、vars_files 模板、原始批次分母与失败主机跳过；throttle、run_once、失败阈值/any_errors_fatal；delegate_to/delegate_facts、linear/free、共享 facts/公开角色作用域与独立逻辑主机连接；本地全量测试、严格 Clippy 与 86.80% 覆盖率已通过；x86_64 glibc/musl 的三台独立 SSH 目标通过批次屏障、三身份/属主、并行委派、幂等、check 与清理；参考对照及最终提交的双架构 CI 待完成 |
+| 15 异步执行 | 未实现 | 第二阶段 |
 | 16–19 常用模块与 CLI | 未实现 | 第三阶段 |
 | 20–22 Vault、扩展与发布验收 | 未实现 | 第四阶段 |
 

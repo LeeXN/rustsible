@@ -1,0 +1,24 @@
+- hosts: rollout
+  gather_facts: false
+  any_errors_fatal: true
+  tasks:
+    - block:
+        - command: /bin/false
+          when: inventory_hostname == 'a'
+      rescue:
+        - copy:
+            content: rescued
+            dest: '@OUTPUT@/rescued-{{ inventory_hostname }}'
+      always:
+        - copy:
+            content: always
+            dest: '@OUTPUT@/always-{{ inventory_hostname }}'
+    - copy:
+        content: continued
+        dest: '@OUTPUT@/continued-{{ inventory_hostname }}'
+- hosts: rollout
+  gather_facts: false
+  tasks:
+    - copy:
+        content: later-play
+        dest: '@OUTPUT@/later-{{ inventory_hostname }}'

@@ -1,0 +1,39 @@
+- hosts: web
+  gather_facts: false
+  serial: '{{ deployment_batches }}'
+  vars:
+    deployment_batches: [1, 2]
+    demo_root: /tmp/rustsible-rolling-demo
+  pre_tasks:
+    - file:
+        path: '{{ demo_root }}-{{ inventory_hostname }}'
+        state: directory
+        mode: '0700'
+  tasks:
+    - command:
+        argv: [/bin/echo, '{{ inventory_hostname }}']
+      run_once: true
+      changed_when: false
+      register: leader
+    - copy:
+        content: 'host={{ inventory_hostname }}; leader={{ leader.stdout | default("check", true) }}'
+        dest: '{{ demo_root }}-{{ inventory_hostname }}/config'
+        mode: '0600'
+      notify: configuration changed
+    - command:
+        argv: [cat, '{{ demo_root }}-{{ inventory_hostname }}/config']
+      register: health
+      changed_when: false
+      failed_when: health.stdout != ('host=' ~ inventory_hostname ~ '; leader=' ~ leader.stdout)
+    - copy:
+        content: '{{ inventory_hostname }} configured'
+        dest: '{{ demo_root }}-receipt-{{ inventory_hostname }}'
+        mode: '0600'
+      delegate_to: localhost
+  handlers:
+    - name: record configuration update
+      listen: configuration changed
+      copy:
+        content: configured
+        dest: '{{ demo_root }}-{{ inventory_hostname }}/handler-result'
+        mode: '0600'

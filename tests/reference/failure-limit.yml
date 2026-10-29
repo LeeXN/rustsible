@@ -1,0 +1,11 @@
+- hosts: rollout
+  gather_facts: false
+  serial: 2
+  max_fail_percentage: @PERCENTAGE@
+  tasks:
+    - command: /bin/false
+      when: inventory_hostname == 'a'
+    - copy:
+        content: continued
+        dest: '@OUTPUT@/continued-{{ inventory_hostname }}'
+

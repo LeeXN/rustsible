@@ -14,6 +14,7 @@ fi
 fixture_dir=$(mktemp -d)
 chmod 0700 "$fixture_dir"
 container=''
+additional_containers=()
 cleanup() {
     local result=$?
     if (( result != 0 )); then
@@ -21,7 +22,9 @@ cleanup() {
             [[ ! -f $log ]] || cat "$log" >&2
         done
     fi
-    if [[ -n $container ]] && ! docker rm -f "$container" >/dev/null; then result=1; fi
+    for owned_container in "$container" "${additional_containers[@]}"; do
+        if [[ -n $owned_container ]] && ! docker rm -f "$owned_container" >/dev/null; then result=1; fi
+    done
     rm -rf -- "$fixture_dir"
     exit "$result"
 }
@@ -115,6 +118,10 @@ if [[ $mode == variables ]]; then
 fi
 if [[ $mode == reuse ]]; then
     source "$repo_dir/tests/ssh/reuse.sh"
+    exit 0
+fi
+if [[ $mode == strategy ]]; then
+    source "$repo_dir/tests/ssh/strategy.sh"
     exit 0
 fi
 cat > "$fixture_dir/playbook.yml" <<'EOF'

@@ -836,6 +836,12 @@ fn short_name(name: &str) -> &str {
 }
 
 const SUPPORTED_PLAY_KEYWORDS: &[&str] = &[
+    "strategy",
+    "serial",
+    "throttle",
+    "run_once",
+    "any_errors_fatal",
+    "max_fail_percentage",
     "force_handlers",
     "ignore_errors",
     "ignore_unreachable",
@@ -860,7 +866,6 @@ const SUPPORTED_PLAY_KEYWORDS: &[&str] = &[
 ];
 
 const UNSUPPORTED_PLAY_KEYWORDS: &[&str] = &[
-    "any_errors_fatal",
     "become_exe",
     "become_flags",
     "become_method",
@@ -869,21 +874,21 @@ const UNSUPPORTED_PLAY_KEYWORDS: &[&str] = &[
     "debugger",
     "diff",
     "fact_path",
-    "max_fail_percentage",
     "module_defaults",
     "order",
     "port",
     "remote_user",
-    "run_once",
-    "serial",
-    "strategy",
     "tags",
-    "throttle",
     "timeout",
     "vars_prompt",
 ];
 
 const SUPPORTED_TASK_KEYWORDS: &[&str] = &[
+    "delegate_to",
+    "delegate_facts",
+    "throttle",
+    "run_once",
+    "any_errors_fatal",
     "ignore_unreachable",
     "name",
     "args",
@@ -912,7 +917,6 @@ const SUPPORTED_TASK_KEYWORDS: &[&str] = &[
 const UNSUPPORTED_TASK_KEYWORDS: &[&str] = &[
     "action",
     "always",
-    "any_errors_fatal",
     "async",
     "become_exe",
     "become_flags",
@@ -920,8 +924,6 @@ const UNSUPPORTED_TASK_KEYWORDS: &[&str] = &[
     "block",
     "collections",
     "debugger",
-    "delegate_facts",
-    "delegate_to",
     "diff",
     "listen",
     "module_defaults",
@@ -929,9 +931,7 @@ const UNSUPPORTED_TASK_KEYWORDS: &[&str] = &[
     "port",
     "remote_user",
     "rescue",
-    "run_once",
     "tags",
-    "throttle",
 ];
 
 #[derive(Clone, Copy)]
@@ -1077,7 +1077,20 @@ impl Loader<'_> {
             handlers.len()
         );
 
-        Ok(Play {
+        let strategy = match parse_optional_nonempty_string(&play_map, "strategy", "Play")?
+            .as_deref()
+            .unwrap_or("linear")
+        {
+            "linear" | "ansible.builtin.linear" | "ansible.legacy.linear" => {
+                crate::playbook::Strategy::Linear
+            }
+            "free" | "ansible.builtin.free" | "ansible.legacy.free" => {
+                crate::playbook::Strategy::Free
+            }
+            strategy => bail!("Unsupported strategy: {strategy}"),
+        };
+        let play = Play {
+            strategy,
             name,
             hosts,
             tasks,
@@ -1096,6 +1109,18 @@ impl Loader<'_> {
             become_user,
             become_user_override,
             fail_fast,
+            serial: play_map.get(Value::String("serial".into())).cloned(),
+            throttle: parse_optional_usize(&play_map, "throttle", "Play")?,
+            run_once: parse_optional_bool(&play_map, "run_once", "Play")?,
+            any_errors_fatal: parse_optional_bool(&play_map, "any_errors_fatal", "Play")?,
+            max_fail_percentage: parse_optional_usize(&play_map, "max_fail_percentage", "Play")?
+                .map(|value| {
+                    if value > 100 {
+                        bail!("max_fail_percentage must be between 0 and 100");
+                    }
+                    Ok(value as u8)
+                })
+                .transpose()?,
             force_handlers: parse_optional_bool(&play_map, "force_handlers", "Play")?
                 .unwrap_or(false),
             ignore_errors: parse_optional_bool(&play_map, "ignore_errors", "Play")?,
@@ -1107,7 +1132,9 @@ impl Loader<'_> {
             gather_subset,
             gather_timeout,
             tags: Vec::new(),
-        })
+        };
+        play.validate_strategy()?;
+        Ok(play)
     }
 }
 
@@ -1298,6 +1325,7 @@ impl Loader<'_> {
             };
             handler.task.source_file = Some(source.to_path_buf());
             handler.task.scope = self.options.scope.clone();
+            handler.task.scope.source_index = index;
             handler.task.scope.ancestors = self.stack.clone();
             parsed.push(handler);
         }
@@ -1327,6 +1355,7 @@ fn parse_task(task_map: Mapping, index: usize, kind: TaskKind) -> Result<Task> {
                     | "name"
                     | "no_log"
                     | "register"
+                    | "run_once"
                     | "timeout"
                     | "vars"
                     | "when"
@@ -1456,6 +1485,11 @@ fn parse_task_parts(
         loop_items,
         loop_var_name,
         index_var_name,
+        delegate_to: parse_optional_nonempty_string(&task_map, "delegate_to", kind.label())?,
+        delegate_facts: parse_optional_bool(&task_map, "delegate_facts", kind.label())?,
+        throttle: parse_optional_usize(&task_map, "throttle", kind.label())?,
+        run_once: parse_optional_bool(&task_map, "run_once", kind.label())?,
+        any_errors_fatal: parse_optional_bool(&task_map, "any_errors_fatal", kind.label())?,
     })
 }
 
@@ -1580,6 +1614,17 @@ fn parse_variables(value: Option<&Value>, label: &str) -> Result<Mapping> {
         crate::vars::validate_name(name, label)?;
     }
     Ok(variables.clone())
+}
+
+fn parse_optional_usize(map: &Mapping, key: &str, label: &str) -> Result<Option<usize>> {
+    map.get(Value::String(key.into()))
+        .map(|value| {
+            value
+                .as_u64()
+                .and_then(|value| usize::try_from(value).ok())
+                .with_context(|| format!("{label} {key} must be a nonnegative integer"))
+        })
+        .transpose()
 }
 
 fn parse_optional_bool(map: &Mapping, key: &str, label: &str) -> Result<Option<bool>> {
@@ -2079,7 +2124,7 @@ mod tests {
 
     #[test]
     fn recognized_but_unsupported_task_keywords_are_not_modules() {
-        for keyword in ["delegate_to", "run_once", "async", "poll"] {
+        for keyword in ["async", "poll"] {
             let content = format!(
                 "---\n- hosts: all\n  tasks:\n    - command: echo\n      {keyword}: true\n"
             );

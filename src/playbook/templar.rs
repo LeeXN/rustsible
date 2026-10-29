@@ -56,6 +56,13 @@ impl RuntimeVariables {
             data.remove(name);
         }
         data.extend(self.facts.clone());
+        // Ansible exposes an empty namespace before gathering. Keeping the
+        // namespace does not invent any target facts and permits default() on
+        // a missing fact, including after delegated gathering on another host.
+        if !definitions.contains_key("ansible_facts") {
+            data.entry("ansible_facts".into())
+                .or_insert_with(|| Value::Mapping(Default::default()));
+        }
         for name in higher.keys() {
             data.remove(name);
         }
@@ -326,6 +333,24 @@ pub(crate) fn evaluate_condition(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn empty_fact_namespace_has_no_invented_fields_and_keeps_declared_precedence() {
+        let runtime = RuntimeVariables::default();
+        let (definitions, data) = runtime.layers(&HashMap::new(), &[], None, None).unwrap();
+        let values = resolve_definitions(&definitions, &data).unwrap();
+        assert!(values["ansible_facts"].as_mapping().unwrap().is_empty());
+        assert!(!values.contains_key("ansible_date_time"));
+        let declared = HashMap::from([(
+            "ansible_facts".into(),
+            serde_yaml::from_str("{custom: 42}").unwrap(),
+        )]);
+        let (definitions, data) = runtime.layers(&declared, &[], None, None).unwrap();
+        assert_eq!(
+            resolve_definitions(&definitions, &data).unwrap()["ansible_facts"]["custom"].as_u64(),
+            Some(42)
+        );
+    }
 
     #[test]
     fn native_types_are_preserved_without_parsing_strings() {
