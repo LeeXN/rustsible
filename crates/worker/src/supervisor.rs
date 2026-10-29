@@ -19,6 +19,7 @@ extern "C" fn interrupt(_: libc::c_int) {
     INTERRUPTED.store(true, Ordering::Relaxed);
 }
 
+#[derive(serde::Serialize, serde::Deserialize)]
 pub struct Supervised {
     pub result: ModuleResult,
     pub cancelled: bool,
@@ -33,9 +34,6 @@ pub fn prepare() -> Result<()> {
     // fork. All pointers are valid stack objects and handlers only store an
     // atomic flag. No allocator/IO/locking is used by a signal handler.
     unsafe {
-        if libc::prctl(libc::PR_SET_CHILD_SUBREAPER, 1, 0, 0, 0) != 0 {
-            return Err(io::Error::last_os_error()).context("Cannot establish worker subreaper");
-        }
         libc::signal(libc::SIGCHLD, libc::SIG_DFL);
         let mut action: libc::sigaction = std::mem::zeroed();
         action.sa_sigaction = interrupt as *const () as usize;
@@ -51,12 +49,123 @@ pub fn prepare() -> Result<()> {
     Ok(())
 }
 
+/// Keep adoption scoped to this one request. Successful service/package
+/// daemons pass to PID 1 when this supervisor exits; they must never become
+/// children of the persistent worker and be killed by an unrelated later task.
 pub fn run(
     timeout: Duration,
     managed: bool,
     may_modify: bool,
+    keep_services: bool,
     execute: impl FnOnce(&std::path::Path) -> ModuleResult,
 ) -> Result<Supervised> {
+    let main_pid = unsafe { libc::getpid() };
+    let mut descriptors = [0; 2];
+    if unsafe { libc::pipe2(descriptors.as_mut_ptr(), libc::O_CLOEXEC) } != 0 {
+        return Err(io::Error::last_os_error()).context("Cannot create supervision pipe");
+    }
+    let supervisor = unsafe { libc::fork() };
+    if supervisor < 0 {
+        unsafe {
+            libc::close(descriptors[0]);
+            libc::close(descriptors[1]);
+        }
+        return Err(io::Error::last_os_error()).context("Cannot start request supervisor");
+    }
+    if supervisor == 0 {
+        unsafe {
+            libc::close(descriptors[0]);
+            libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGTERM, 0, 0, 0);
+            if libc::getppid() != main_pid {
+                libc::_exit(125);
+            }
+        }
+        let execution = run_core(timeout, managed, may_modify, keep_services, execute)
+            .unwrap_or_else(|error| {
+                cancelled(
+                    may_modify,
+                    &format!("Request supervision failed: {error:#}"),
+                )
+            });
+        let mut output = unsafe { File::from_raw_fd(descriptors[1]) };
+        let status = if write_frame(&mut output, &execution, MAX_RESPONSE_BYTES).is_ok() {
+            0
+        } else {
+            125
+        };
+        std::process::exit(status);
+    }
+    unsafe {
+        libc::close(descriptors[1]);
+    }
+    let mut input = unsafe { File::from_raw_fd(descriptors[0]) };
+    let flags = unsafe { libc::fcntl(input.as_raw_fd(), libc::F_GETFL) };
+    if flags < 0
+        || unsafe { libc::fcntl(input.as_raw_fd(), libc::F_SETFL, flags | libc::O_NONBLOCK) } < 0
+    {
+        unsafe {
+            libc::kill(supervisor, libc::SIGTERM);
+            libc::waitpid(supervisor, std::ptr::null_mut(), 0);
+        }
+        return Err(io::Error::last_os_error()).context("Cannot configure supervisor pipe");
+    }
+    let deadline = Instant::now() + timeout + Duration::from_secs(10);
+    let mut bytes = Vec::new();
+    let mut signalled = false;
+    let result = (|| -> Result<Supervised> {
+        loop {
+            if interrupted() && !signalled {
+                unsafe {
+                    libc::kill(supervisor, libc::SIGTERM);
+                }
+                signalled = true;
+            }
+            let mut chunk = [0; 65536];
+            match input.read(&mut chunk) {
+                Ok(0) => return decode(&bytes, MAX_RESPONSE_BYTES),
+                Ok(length) => {
+                    if bytes.len() + length > MAX_RESPONSE_BYTES + 4 {
+                        bail!("Supervision result exceeded bound");
+                    }
+                    bytes.extend_from_slice(&chunk[..length]);
+                }
+                Err(error)
+                    if matches!(
+                        error.kind(),
+                        io::ErrorKind::WouldBlock | io::ErrorKind::Interrupted
+                    ) => {}
+                Err(error) => return Err(error).context("Cannot read supervision result"),
+            }
+            if Instant::now() >= deadline {
+                bail!("Request supervisor did not confirm cancellation/cleanup");
+            }
+            std::thread::sleep(Duration::from_millis(2));
+        }
+    })();
+    if result.is_err() {
+        unsafe {
+            libc::kill(supervisor, libc::SIGTERM);
+        }
+    }
+    // A complete frame/EOF means its writer has exited. On an abnormal pipe
+    // failure do not block the worker forever; parent death also signals it.
+    let flags = if result.is_ok() { 0 } else { libc::WNOHANG };
+    unsafe {
+        libc::waitpid(supervisor, std::ptr::null_mut(), flags);
+    }
+    result
+}
+
+fn run_core(
+    timeout: Duration,
+    managed: bool,
+    may_modify: bool,
+    keep_services: bool,
+    execute: impl FnOnce(&std::path::Path) -> ModuleResult,
+) -> Result<Supervised> {
+    if unsafe { libc::prctl(libc::PR_SET_CHILD_SUBREAPER, 1, 0, 0, 0) } != 0 {
+        return Err(io::Error::last_os_error()).context("Cannot establish request subreaper");
+    }
     let mut builder = tempfile::Builder::new();
     builder.prefix(".rustsible-request-");
     let executable = std::env::current_exe()?;
@@ -219,7 +328,22 @@ pub fn run(
     })();
     // Cleanup is mandatory after both success and failure: synchronous shell
     // tools may otherwise leave background descendants even after returning.
-    terminate_tree(child)?;
+    let retain = keep_services
+        && result.as_ref().is_ok_and(|execution| {
+            !execution.cancelled
+                && !execution.result.uncertain
+                && (!execution.result.failed || execution.result.changed)
+        });
+    if retain {
+        // Only normal completed OS operations may transfer daemon ownership.
+        // Cancelled/unconfirmed operations still terminate their entire tree.
+        unsafe {
+            libc::waitpid(child, std::ptr::null_mut(), 0);
+            while libc::waitpid(-1, std::ptr::null_mut(), libc::WNOHANG) > 0 {}
+        }
+    } else {
+        terminate_tree(child)?;
+    }
     staging.cleanup()?;
     result
 }

@@ -8,7 +8,7 @@ rustsible() { "$controller_binary" --worker-dir "$worker_dir" "$@"; }
 mode=${3:-full}
 libc=${4:-glibc}
 http_fixture=${5:-}
-if [[ $mode == native && ! -x $http_fixture ]]; then
+if [[ ( $mode == native || $mode == systems ) && ! -x $http_fixture ]]; then
     echo 'Native acceptance requires the static http_fixture example as argument 5' >&2; exit 1
 fi
 fixture_dir=$(mktemp -d)
@@ -29,13 +29,22 @@ trap cleanup EXIT
 trap 'exit 1' HUP INT TERM
 
 fixture_dockerfile=$repo_dir/tests/ssh/Dockerfile
-if [[ $libc == musl ]]; then fixture_dockerfile=$repo_dir/tests/ssh/Dockerfile.musl; fi
+system_flags=()
+if [[ $mode == systems ]]; then
+    fixture_dockerfile=$repo_dir/tests/systems/Dockerfile
+    system_flags=(--privileged --cgroupns=private --tmpfs /run --tmpfs /run/lock)
+fi
+if [[ $mode == systems && $libc == sysv ]]; then fixture_dockerfile=$repo_dir/tests/ssh/Dockerfile; system_flags=(); fi
+if [[ $libc == musl ]]; then
+    fixture_dockerfile=$repo_dir/tests/ssh/Dockerfile.musl
+    if [[ $mode == systems ]]; then fixture_dockerfile=$repo_dir/tests/systems/Dockerfile.alpine; system_flags=(); fi
+fi
 build_args=()
 if [[ -n ${CODEX_PROXY_CERT:-} ]]; then build_args+=(--secret "id=proxy_ca,src=$CODEX_PROXY_CERT"); fi
 docker build -q -f "$fixture_dockerfile" "${build_args[@]}" -t "rustsible-ssh-fixture:$mode-$libc" "$repo_dir/tests/ssh" >/dev/null
 ssh-keygen -q -t ed25519 -N '' -f "$fixture_dir/key"
 input_tmp_size=$(( $(stat -c %s "$worker_dir/rustsible-worker-linux-$(uname -m)") + 8 * 1024 * 1024 ))
-container=$(docker run -d --rm -p 127.0.0.1::22 --tmpfs /noexec:rw,noexec,mode=1777 --tmpfs /small:rw,size=64k,mode=1777 \
+container=$(docker run -d --rm "${system_flags[@]}" -p 127.0.0.1::22 --tmpfs /noexec:rw,noexec,mode=1777 --tmpfs /small:rw,size=64k,mode=1777 \
     --tmpfs "/input-small:rw,exec,size=$input_tmp_size,mode=1777" --tmpfs "/input-inodes:rw,exec,size=$input_tmp_size,nr_inodes=3,mode=1777" \
     -e HTTP_PROXY=http://127.0.0.1:18080 -e http_proxy=http://127.0.0.1:18080 \
     -e HTTPS_PROXY=http://127.0.0.1:18080 -e https_proxy=http://127.0.0.1:18080 \
@@ -83,6 +92,10 @@ ansible_user=deploy
 ansible_ssh_private_key_file=$fixture_dir/key
 rustsible_known_hosts_file=$fixture_dir/known_hosts
 EOF
+if [[ $mode == systems ]]; then
+    if [[ $libc == musl ]]; then source "$repo_dir/tests/systems/alpine.sh"; elif [[ $libc == sysv ]]; then source "$repo_dir/tests/systems/sysv.sh"; else source "$repo_dir/tests/systems/cases.sh"; fi
+    exit 0
+fi
 if [[ $mode == native ]]; then
     source "$repo_dir/tests/ssh/native.sh"
     source "$repo_dir/tests/ssh/files.sh"

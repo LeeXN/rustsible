@@ -26,9 +26,9 @@ Module names and common parameters resemble Ansible, but their complete argument
 Playbook fact gathering follows the ansible-core 2.21 default: facts are gathered
 unless a play sets `gather_facts: false`. Fact gathering, `stat`, `command`, and
 `shell` use the native Rust worker and do not require Python or curl.
-File operations and `get_url` also use native workers. No built-in module
-requires Python or curl; package/service/user modules still invoke OS tools and
-are being migrated into the worker.
+File operations and `get_url` also use native workers. All target modules now use the native worker and argument-array OS tools;
+Rustsible does not invoke Python or curl. Package managers such as dnf/yum can
+have their own OS-provided Python dependencies.
 Registered results and gathered facts last for the complete playbook run;
 play and task variables remain scoped to their play or task. Explicit `setup: {}`
 merges facts just like automatic gathering, including time collected on the
@@ -102,6 +102,29 @@ newline when ensuring that line, and preserves backup ownership/mode/ACL/xattrs
 and timestamps. Its current text-input bound is 64 MiB and its regexp language
 is Rust regex; Python-only regexp constructs are rejected. Templates render
 only on the controller.
+
+User, package and service tasks execute under the worker's selected identity;
+they do not add implicit sudo. User passwords/hashes go to `chpasswd -e` over
+stdin. Account groups and IDs are resolved before mutation; missing homes for
+existing accounts use `mkhomedir_helper`. Both controller frontends and workers
+use the same module schemas. OS-tool failures retain rc/stdout/stderr and known
+partial changes. A package list uses one install/remove transaction, cache
+refresh precedes candidate queries, and check never refreshes cache.
+
+Each task has a temporary subreaper supervisor. Shell/command descendants are
+terminated and reaped on completion or cancellation. Successful system-service
+and package daemons pass to PID 1 when that supervisor exits, rather than being
+adopted by the persistent worker and killed by a subsequent task. Cancelled or
+unconfirmed operations terminate their owned execution trees.
+
+The current real OS acceptance covers Debian systemd/APT, Alpine OpenRC/APK,
+and Debian SysV, including normal/root/non-root-become identities and local/SSH
+transports. DNF/Yum/Pacman/Zypper and Upstart paths are ported with deterministic
+planning tests but still need distribution-specific runtime acceptance before
+being considered release-verified. Zypper `state=latest` remains explicitly
+unsupported. Package specifications currently require concrete names; APT
+`name=version` is recognized. Existing-account home repair requires the target
+OS's `mkhomedir_helper` tool.
 
 ## Build
 

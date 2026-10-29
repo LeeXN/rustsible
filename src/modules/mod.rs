@@ -1,24 +1,18 @@
 pub mod debug;
-pub mod file;
-pub mod package;
 pub mod param;
 pub mod registry;
-pub mod remote;
 pub(crate) mod result;
 pub use result::{ExecutionFailure, Outcome};
-pub mod service;
 pub mod template;
-pub mod user;
 
 use anyhow::{Context, Result};
 use colored::Colorize;
-use log::{debug, info};
+use log::info;
 use serde_yaml::Value;
 use std::collections::HashMap;
 use std::time::Instant;
 
 use crate::inventory::Host;
-use crate::ssh::connection::{Connection, SshConnection};
 
 pub use rustsible_protocol::ModuleResult;
 
@@ -43,114 +37,6 @@ impl Default for AdHocOptions {
             forks: 5,
             worker_dir: None,
         }
-    }
-}
-
-/// Trait for common module execution patterns
-pub trait ModuleExecutor {
-    /// Execute the module with the given SSH client and arguments
-    fn execute(
-        connection: &dyn SshConnection,
-        args: &Value,
-        use_become: bool,
-        become_user: &str,
-        check_mode: bool,
-    ) -> Result<ModuleResult>;
-
-    /// Execute the module in ad-hoc mode for a single host
-    fn execute_adhoc(
-        host: &Host,
-        args: &Value,
-        use_become: bool,
-        become_user: &str,
-        check_mode: bool,
-    ) -> Result<ModuleResult> {
-        info!("Opening connection for host: {}", host.name);
-        let connection = Connection::connect(host)?;
-        Self::execute(
-            connection.as_connection(),
-            args,
-            use_become,
-            become_user,
-            check_mode,
-        )
-    }
-
-    /// Helper to execute a command on a remote host with proper sudo handling
-    fn execute_command(
-        connection: &dyn SshConnection,
-        cmd: &str,
-        use_become: bool,
-        become_user: &str,
-    ) -> Result<(i32, String, String)> {
-        result::ensure_mutation_allowed()?;
-        debug!("Executing module command ({} bytes)", cmd.len());
-
-        if use_become {
-            connection.execute_sudo_command(cmd, become_user)
-        } else {
-            connection.execute_command(cmd)
-        }
-    }
-
-    /// Helper to process command execution results into a ModuleResult
-    fn process_command_result(
-        exit_code: i32,
-        stdout: String,
-        stderr: String,
-        success_msg: &str,
-        error_prefix: &str,
-    ) -> Result<ModuleResult> {
-        let module_result = ModuleResult {
-            stdout,
-            stderr: stderr.clone(),
-            rc: Some(exit_code),
-            changed: true,
-            failed: exit_code != 0,
-            skipped: false,
-            unreachable: false,
-            uncertain: false,
-            msg: if exit_code == 0 {
-                format!("{} (exit code: {})", success_msg, exit_code)
-            } else if stderr.trim().is_empty() {
-                format!("{} (exit code: {})", error_prefix, exit_code)
-            } else {
-                format!(
-                    "{} (exit code: {}): {}",
-                    error_prefix,
-                    exit_code,
-                    stderr.trim()
-                )
-            },
-            values: Default::default(),
-        };
-
-        if exit_code != 0 {
-            return Ok(module_result);
-        }
-
-        info!("{}", success_msg);
-        Ok(module_result)
-    }
-}
-
-/// Helper to extract a string argument from Value, handling both String and Mapping with "cmd" key
-pub(crate) fn extract_command_arg(args: &Value) -> Result<String> {
-    match args {
-        Value::String(cmd) => Ok(cmd.clone()),
-        Value::Mapping(map) => {
-            if map.len() != 1 {
-                return Err(anyhow::anyhow!(
-                    "Command modules accept only the 'cmd' parameter"
-                ));
-            }
-            if let Some(Value::String(cmd)) = map.get(Value::String("cmd".to_string())) {
-                Ok(cmd.clone())
-            } else {
-                Err(anyhow::anyhow!("Module requires a valid command string"))
-            }
-        }
-        _ => Err(anyhow::anyhow!("Module requires a valid command string")),
     }
 }
 

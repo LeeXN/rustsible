@@ -54,16 +54,8 @@ pub(crate) fn from_error(error: anyhow::Error, may_modify: bool) -> ModuleResult
             messages.push(message);
         }
     }
-    let output = error.downcast_ref::<CommandOutput>();
     ModuleResult {
         changed: known_changed(),
-        rc: output.map(|output| output.rc),
-        stdout: output
-            .map(|output| output.stdout.clone())
-            .unwrap_or_default(),
-        stderr: output
-            .map(|output| output.stderr.clone())
-            .unwrap_or_default(),
         failed: true,
         uncertain: outcome == Outcome::Uncertain,
         unreachable: outcome == Outcome::Unreachable,
@@ -91,57 +83,20 @@ mod tests {
     }
 }
 
-pub(crate) use rustsible_protocol::change::{
-    ensure_mutation_allowed, is_check_active, known_changed, record_change, ChangeScope,
-};
-
-#[derive(Debug)]
-struct CommandOutput {
-    rc: i32,
-    stdout: String,
-    stderr: String,
-    message: String,
-}
-impl std::fmt::Display for CommandOutput {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(&self.message)
-    }
-}
-impl std::error::Error for CommandOutput {}
-pub(crate) fn command_error(
-    error: anyhow::Error,
-    rc: i32,
-    stdout: String,
-    stderr: String,
-) -> anyhow::Error {
-    let message = error.to_string();
-    error.context(CommandOutput {
-        rc,
-        stdout,
-        stderr,
-        message,
-    })
-}
+pub(crate) use rustsible_protocol::change::{is_check_active, known_changed, ChangeScope};
 
 #[cfg(test)]
 mod accounting_tests {
     use super::*;
+    use rustsible_protocol::change::{ensure_mutation_allowed, record_change};
     #[test]
     fn failures_retain_known_changes_and_command_outputs_without_leaking_to_next_invocation() {
         {
             let _scope = ChangeScope::enter(false);
             record_change();
-            let error = command_error(
-                anyhow::anyhow!("second operation failed"),
-                42,
-                "available output".into(),
-                "available error".into(),
-            );
+            let error = anyhow::anyhow!("second operation failed");
             let result = from_error(error, true);
             assert!(result.changed);
-            assert_eq!(result.rc, Some(42));
-            assert_eq!(result.stdout, "available output");
-            assert_eq!(result.stderr, "available error");
             assert_eq!(result.outcome(), Outcome::Failed);
         }
         let _scope = ChangeScope::enter(false);

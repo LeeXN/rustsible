@@ -1,11 +1,15 @@
+mod accounts;
 mod files;
 mod filesystem;
 mod http;
 mod lines;
 mod modules;
+mod packages;
 mod process;
+mod services;
 mod staging;
 mod supervisor;
+mod tools;
 use anyhow::{bail, Result};
 use rustsible_protocol::{
     Hello, ModuleResult, Request, Response, BUILD_ID, MAX_REQUEST_BYTES, MAX_RESPONSE_BYTES,
@@ -157,6 +161,7 @@ fn run() -> Result<()> {
             Duration::from_millis(request.timeout_ms),
             request.managed,
             !matches!(request.module.as_str(), "setup" | "stat") && !request.check,
+            !request.check && matches!(request.module.as_str(), "service" | "systemd" | "package"),
             |scratch| modules::execute(&request, scratch, payload.as_ref().map(|file| file.path())),
         )?;
         rustsible_protocol::write_frame(

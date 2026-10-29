@@ -84,6 +84,12 @@ jobs:
         run: bash tests/ssh/run.sh target/${{ matrix.target }}/release/rustsible target/workers native glibc target/${{ matrix.target }}/release/examples/http_fixture
       - name: Native execution without Python or curl (musl)
         run: bash tests/ssh/run.sh target/${{ matrix.target }}/release/rustsible target/workers native musl target/${{ matrix.target }}/release/examples/http_fixture
+      - name: Native accounts, packages and real systemd acceptance
+        run: bash tests/ssh/run.sh target/${{ matrix.target }}/release/rustsible target/workers systems glibc target/${{ matrix.target }}/release/examples/http_fixture
+      - name: Native accounts, signed APK and OpenRC acceptance
+        run: bash tests/ssh/run.sh target/${{ matrix.target }}/release/rustsible target/workers systems musl target/${{ matrix.target }}/release/examples/http_fixture
+      - name: Native SysV service lifetime acceptance
+        run: bash tests/ssh/run.sh target/${{ matrix.target }}/release/rustsible target/workers systems sysv target/${{ matrix.target }}/release/examples/http_fixture
       - uses: actions/upload-artifact@v4
         with:
           name: native-${{ matrix.arch }}

@@ -2,21 +2,7 @@ use anyhow::{anyhow, Result};
 use log::debug;
 use serde_yaml::Value;
 
-use crate::inventory::Host;
 use crate::modules::ModuleResult;
-use crate::ssh::connection::SshConnection;
-
-/// Execute the debug module - outputs the given debug message or variable value
-#[allow(dead_code)]
-pub fn execute(
-    _connection: &dyn SshConnection,
-    args: &Value,
-    _use_become: bool,
-    _become_user: &str,
-    _check_mode: bool,
-) -> Result<ModuleResult> {
-    execute_without_connection(args)
-}
 
 /// Debug is a controller-side action and must not require an SSH connection
 /// merely to display an already-resolved value.
@@ -129,18 +115,6 @@ pub fn execute_without_connection(args: &Value) -> Result<ModuleResult> {
             Err(anyhow!("Debug module requires parameters as a YAML map"))
         }
     }
-}
-
-/// Execute the debug module for ad-hoc commands
-pub fn execute_adhoc(
-    host: &Host,
-    args: &Value,
-    _use_become: bool,
-    _become_user: &str,
-    _check_mode: bool,
-) -> Result<ModuleResult> {
-    debug!("Executing ad-hoc debug module for host {}", host.name);
-    execute_without_connection(args)
 }
 
 /// Format YAML values in a human-readable way
@@ -256,7 +230,6 @@ fn format_complex_value(value: &Value, indent_level: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::ssh::connection::MockSshConnection;
 
     fn yaml(input: &str) -> Value {
         serde_yaml::from_str(input).unwrap()
@@ -318,18 +291,7 @@ mod tests {
         assert!(execute_without_connection(&Value::String("no map".to_string())).is_err());
         assert!(execute_without_connection(&yaml("msg: ok\nunknown: true")).is_err());
 
-        let mut connection = MockSshConnection::new();
-        connection.expect_execute_command().never();
-        let direct = execute(&connection, &yaml("msg: direct"), true, "root", true).unwrap();
+        let direct = execute_without_connection(&yaml("msg: direct")).unwrap();
         assert_eq!(direct.stdout, "direct");
-        let adhoc = execute_adhoc(
-            &Host::new("unreachable.invalid"),
-            &yaml("msg: adhoc"),
-            false,
-            "root",
-            false,
-        )
-        .unwrap();
-        assert_eq!(adhoc.stdout, "adhoc");
     }
 }
