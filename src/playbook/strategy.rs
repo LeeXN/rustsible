@@ -9,6 +9,61 @@ pub enum Strategy {
     #[default]
     Linear,
     Free,
+    Compiled(&'static str),
+}
+
+impl Strategy {
+    pub fn parse(name: &str) -> Result<Self> {
+        match name {
+            "linear" | "ansible.builtin.linear" | "ansible.legacy.linear" => Ok(Self::Linear),
+            "free" | "ansible.builtin.free" | "ansible.legacy.free" => Ok(Self::Free),
+            name => crate::extensions::Registry::current()
+                .components()
+                .strategies
+                .get_key_value(name)
+                .map(|(name, _)| Self::Compiled(name))
+                .with_context(|| format!("Unsupported strategy: {name}")),
+        }
+    }
+    pub(crate) fn engine(self) -> Self {
+        if let Self::Compiled(name) = self {
+            crate::extensions::Registry::current()
+                .components()
+                .strategies
+                .get(name)
+                .map(|strategy| strategy.engine)
+                .unwrap_or(self)
+        } else {
+            self
+        }
+    }
+    pub(crate) fn order(
+        self,
+        hosts: &[crate::inventory::Host],
+    ) -> Result<Vec<crate::inventory::Host>> {
+        let Self::Compiled(name) = self else {
+            return Ok(hosts.to_vec());
+        };
+        let registry = crate::extensions::Registry::current();
+        let strategy = registry
+            .components()
+            .strategies
+            .get(name)
+            .context("Compiled strategy is not registered in this execution")?;
+        let order = (strategy.order)(hosts)?;
+        let mut unique = std::collections::HashSet::new();
+        if order.len() != hosts.len()
+            || order
+                .iter()
+                .any(|index| *index >= hosts.len() || !unique.insert(*index))
+        {
+            bail!("Compiled scheduling must return a permutation of selected hosts");
+        }
+        Ok(order
+            .into_iter()
+            .map(|index| hosts[index].clone())
+            .collect())
+    }
 }
 
 #[derive(Default)]

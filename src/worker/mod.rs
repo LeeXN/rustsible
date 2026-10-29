@@ -1,6 +1,6 @@
 //! One private worker lease per effective host/identity during a controller run.
 //! Closing stdin cancels synchronous work and lets the bootstrap remove itself.
-pub(crate) mod transport;
+pub mod transport;
 use crate::ssh::{
     config::ConnectionConfig,
     connection::{command_timeout, shell_quote, Connection},
@@ -69,6 +69,7 @@ impl Source {
 pub(crate) struct Runtime {
     directory: Option<PathBuf>,
     pub(crate) vault: Arc<crate::vault::Vault>,
+    pub(crate) extensions: Arc<crate::extensions::Registry>,
     credentials: crate::ssh::credentials::Credentials,
     diff: bool,
     leases: Mutex<HashMap<String, Arc<Mutex<Option<Client>>>>>,
@@ -78,6 +79,7 @@ impl Default for Runtime {
         Self {
             directory: None,
             vault: crate::vault::Vault::current(),
+            extensions: crate::extensions::Registry::current(),
             credentials: Default::default(),
             diff: false,
             leases: Default::default(),
@@ -90,6 +92,13 @@ impl Runtime {
             directory,
             ..Self::default()
         }
+    }
+    pub(crate) fn diff_enabled(&self) -> bool {
+        self.diff && !self.vault.used()
+    }
+    pub fn with_extensions(mut self, registry: Arc<crate::extensions::Registry>) -> Self {
+        self.extensions = registry;
+        self
     }
     pub fn with_vault(mut self, vault: Arc<crate::vault::Vault>) -> Self {
         self.vault = vault;
@@ -140,6 +149,7 @@ impl Runtime {
         mut source: Option<&mut Source>,
     ) -> Result<ModuleResult> {
         let _vault = self.vault.enter();
+        let _extensions = self.extensions.enter();
         if self.vault.used() {
             request.diff = false;
             if let Some(asynchronous) = &mut request.asynchronous {
@@ -149,14 +159,9 @@ impl Runtime {
         let mut private_config = config.clone();
         self.credentials.apply(&mut private_config);
         let config = &private_config;
-        request.diff |= !self.vault.used()
-            && self.diff
-            && rustsible_protocol::registry::Builtin::lookup(&request.module)?.supports_diff();
+        request.diff |= !self.vault.used() && self.diff && request.supports_diff()?;
         let module = request.module.clone();
-        let check = request.check;
-        let may_modify = request.asynchronous.is_some()
-            || rustsible_protocol::registry::Builtin::lookup(&module)?
-                .may_modify(&request.args, check);
+        let may_modify = request.may_modify()?;
         if let Some(source) = source.as_mut() {
             let size = source.seek(SeekFrom::End(0))?;
             source.rewind()?;
@@ -166,7 +171,10 @@ impl Runtime {
             });
             source.rewind()?;
         }
-        request.validate()?;
+        request.validate_envelope()?;
+        if request.extension.is_none() {
+            request.validate()?;
+        }
         // Fingerprint only effective transport settings, never fact overlays.
         // A host keeps one live connection: changing settings shuts down the
         // previous lease, even when returning later to a former configuration.
@@ -193,6 +201,29 @@ impl Runtime {
         }
         let client = slot.as_mut().context("Missing worker lease")?;
         client.hello.validate(&client.arch, client.uid, &module)?;
+        let mut native_source = None;
+        if let Some(definition) = &request.extension {
+            let native = self.extensions.resolve(
+                &definition.name,
+                rustsible_protocol::extension::Kind::Module,
+            )?;
+            if native.definition != *definition {
+                bail!("Native definition changed before execution");
+            }
+            let (file, digest) = native.open(&client.arch)?;
+            request.payload = Some(rustsible_protocol::Payload {
+                size: file.metadata()?.len(),
+                sha256: digest,
+            });
+            native_source = Some(Source::File(file));
+        }
+        let mut source = if native_source.is_some() {
+            native_source.as_mut()
+        } else {
+            source
+        };
+        request.validate()?;
+
         // Commands are normalized into one native parameter form before wire
         // encoding, so the worker never repeats controller CLI parsing.
         if let Value::String(command) = request.args {
@@ -420,39 +451,43 @@ impl Client {
         if !metadata.is_file() || metadata.len() == 0 {
             bail!("Worker artifact must be a nonempty regular file");
         }
-        if rustsible_protocol::sha256(&mut binary)? != artifact.sha256.to_ascii_lowercase() {
-            bail!("Worker artifact SHA-256 mismatch");
-        }
-        binary.rewind()?;
-        let mut header = [0u8; 64];
-        binary
-            .read_exact(&mut header)
-            .context("Incomplete worker ELF header")?;
-        // Reject mislabeled architectures before a POSIX shell can try its
-        // ENOEXEC script fallback on a foreign binary. Hello checks it again.
-        let machine = if arch == "x86_64" { 62u16 } else { 183u16 };
-        if &header[..4] != b"\x7fELF"
-            || header[4..7] != [2, 1, 1]
-            || !matches!(u16::from_le_bytes([header[16], header[17]]), 2 | 3)
-            || u16::from_le_bytes([header[18], header[19]]) != machine
-        {
-            bail!("Worker artifact is not a Linux ELF64 executable for target architecture {arch}");
-        }
-        binary.rewind()?;
+        rustsible_protocol::extension::verify_binary(
+            &mut binary,
+            &artifact.sha256,
+            &arch,
+            "Worker artifact",
+        )?;
         let bootstrap = bootstrap(&base, metadata.len(), &artifact.sha256);
-        let command = if config.use_become {
-            let sudo = format!(
-                "sudo -n -u {} -- sh -c {}",
-                shell_quote(&config.become_user),
-                shell_quote(&bootstrap)
-            );
-            if config.get_ssh_sudo_password().is_some() {
-                format!("set -eu\nIFS= read -r rustsible_password\nprintf '%s\\n' \"$rustsible_password\" | sudo -S -p '' -u {} -v\nunset rustsible_password\n{sudo}\nrustsible_status=$?\nexit \"$rustsible_status\"", shell_quote(&config.become_user))
-            } else {
-                format!("{sudo}\nrustsible_status=$?\nexit \"$rustsible_status\"")
-            }
+        let registry = crate::extensions::Registry::current();
+        let method = config.get_variable("ansible_become_method");
+        let provider = method
+            .as_deref()
+            .and_then(|method| registry.components().become_providers.get(method));
+        let custom = if config.use_become {
+            provider
+                .map(|provider| provider(config, &bootstrap))
+                .transpose()?
         } else {
-            bootstrap
+            None
+        };
+        let command = if let Some(custom) = &custom {
+            custom.command.clone()
+        } else {
+            let command = if config.use_become {
+                let sudo = format!(
+                    "sudo -n -u {} -- sh -c {}",
+                    shell_quote(&config.become_user),
+                    shell_quote(&bootstrap)
+                );
+                if config.get_ssh_sudo_password().is_some() {
+                    format!("set -eu\nIFS= read -r rustsible_password\nprintf '%s\\n' \"$rustsible_password\" | sudo -S -p '' -u {} -v\nunset rustsible_password\n{sudo}\nrustsible_status=$?\nexit \"$rustsible_status\"", shell_quote(&config.become_user))
+                } else {
+                    format!("{sudo}\nrustsible_status=$?\nexit \"$rustsible_status\"")
+                }
+            } else {
+                bootstrap
+            };
+            command
         };
         let mut session = connection.start_worker(&command)?;
         // A short business-command deadline must not truncate a large binary
@@ -460,7 +495,9 @@ impl Client {
         let deadline = Instant::now() + command_timeout(config)?.max(Duration::from_secs(30));
         let mut diagnostic = Vec::new();
         let initialized = (|| -> Result<Hello> {
-            if config.use_become {
+            if let Some(custom) = &custom {
+                session.send(&custom.input, deadline, &mut diagnostic)?;
+            } else if config.use_become {
                 if let Some(password) = config.get_ssh_sudo_password() {
                     if password.contains(['\n', '\r', '\0']) {
                         bail!("Become password cannot contain line breaks or NUL");

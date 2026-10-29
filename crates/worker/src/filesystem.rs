@@ -187,14 +187,7 @@ impl Location {
         }
     }
     pub fn ensure_safe_parent(&self) -> Result<()> {
-        let metadata = self.directory.metadata()?;
-        if metadata.uid() != 0 && metadata.uid() != unsafe { libc::geteuid() } {
-            bail!("Unsafe destination directory owner; execute as its owner");
-        }
-        if metadata.mode() & 0o022 != 0 && metadata.mode() & 0o1000 == 0 {
-            bail!("Unsafe destination directory: writable staging entries need the sticky bit");
-        }
-        Ok(())
+        rustsible_native::protection::ensure_safe_directory(&self.directory)
     }
     pub fn pin_object(&self, expected: &Metadata) -> Result<File> {
         // Metadata operations need ownership, not read permission (mode=0000
@@ -349,10 +342,10 @@ pub fn preserve_metadata(
     attributes: Attributes,
     default_mode: u32,
 ) -> Result<()> {
-    rustsible_protocol::protection::preserve(
+    rustsible_native::protection::preserve(
         output,
         source,
-        rustsible_protocol::protection::Protection {
+        rustsible_native::protection::Protection {
             mode: attributes.mode,
             uid: attributes.uid,
             gid: attributes.gid,

@@ -7,7 +7,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-pub(crate) enum Session {
+pub enum Session {
     Local {
         child: Child,
         input: Option<ChildStdin>,

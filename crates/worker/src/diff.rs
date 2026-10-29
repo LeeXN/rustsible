@@ -11,7 +11,7 @@ use std::{
 };
 const MAX_TEXT: u64 = 64 * 1024;
 pub fn before(request: &Request) -> Option<Value> {
-    if !request.diff {
+    if !request.diff || request.extension.is_some() {
         return None;
     }
     path(request).map(snapshot)
@@ -29,7 +29,7 @@ pub fn finish(
     before: Option<Value>,
     result: &mut ModuleResult,
 ) {
-    if !request.diff || !result.changed {
+    if !request.diff || !result.changed || request.extension.is_some() {
         return;
     }
     let diff = if request.module == "git" {

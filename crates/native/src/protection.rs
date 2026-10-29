@@ -23,7 +23,7 @@ pub fn preserve(
     attributes: Protection,
     default_mode: u32,
 ) -> Result<()> {
-    crate::change::ensure_mutation_allowed()?;
+    rustsible_protocol::change::ensure_mutation_allowed()?;
     let metadata = source.map(File::metadata).transpose()?;
     let old = metadata.as_ref();
     let current = output.metadata()?;
@@ -169,4 +169,17 @@ fn xattr_bytes(
         }
     }
     bail!("File protection metadata changed repeatedly during inspection")
+}
+
+/// Pinning a directory prevents path replacement, while ownership/sticky-bit
+/// validation protects generated staging entries from other identities.
+pub fn ensure_safe_directory(file: &File) -> Result<()> {
+    let metadata = file.metadata()?;
+    if metadata.uid() != 0 && metadata.uid() != unsafe { libc::geteuid() } {
+        bail!("Unsafe destination directory owner; execute as its owner");
+    }
+    if metadata.mode() & 0o022 != 0 && metadata.mode() & 0o1000 == 0 {
+        bail!("Unsafe destination directory: writable staging entries need the sticky bit");
+    }
+    Ok(())
 }

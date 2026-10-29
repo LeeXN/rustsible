@@ -68,7 +68,7 @@ impl ConnectionConfig {
         let mut variables = normalized;
         for (name, value) in &mut variables {
             if is_connection_variable(name) {
-                *value = crate::vault::Vault::current().materialize(value)?;
+                *value = crate::data::materialize(value)?;
             }
         }
         for (name, value) in &variables {
@@ -92,10 +92,16 @@ impl ConnectionConfig {
             ("ansible_become_method", "sudo"),
             ("ansible_become_exe", "sudo"),
         ] {
-            if host
-                .get_variable(key)
-                .is_some_and(|value| value.as_str() != Some(supported))
-            {
+            if host.get_variable(key).is_some_and(|value| {
+                value.as_str() != Some(supported)
+                    && !(key == "ansible_become_method"
+                        && value.as_str().is_some_and(|name| {
+                            crate::extensions::Registry::current()
+                                .components()
+                                .become_providers
+                                .contains_key(name)
+                        }))
+            }) {
                 bail!("Only {key}={supported} is supported");
             }
         }

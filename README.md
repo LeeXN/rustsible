@@ -813,3 +813,5 @@ Rustsible is available under the [MIT License](LICENSE).
 ## Acknowledgements
 
 Rustsible is inspired by [Ansible](https://github.com/ansible/ansible) and uses names familiar to Ansible users. It is an independent implementation and is not affiliated with or endorsed by Red Hat or the Ansible project.
+
+Native collections and explicitly configured executable extensions are described in [NATIVE_EXTENSIONS.md](NATIVE_EXTENSIONS.md), with a complete [example collection](examples/native-collection/README.md). Python plugins are rejected; external code is never authorized merely by appearing in a repository.

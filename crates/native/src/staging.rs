@@ -8,7 +8,7 @@ use std::{
     io,
     os::{
         fd::{AsRawFd, FromRawFd, RawFd},
-        unix::net::UnixDatagram,
+        unix::{fs::PermissionsExt, net::UnixDatagram},
     },
     path::PathBuf,
 };
@@ -56,6 +56,7 @@ struct OwnedStage {
     directory: tempfile::TempDir,
     _parent: File,
 }
+#[derive(Default)]
 pub struct Registry {
     stages: Vec<OwnedStage>,
 }
@@ -66,14 +67,11 @@ impl Registry {
     pub fn serve(&mut self, socket: &UnixDatagram) -> Result<()> {
         let parent = receive_descriptor(socket.as_raw_fd())?;
         let created = (|| -> Result<String> {
-            let location = crate::filesystem::Location {
-                directory: parent,
-                name: "unused".into(),
-            };
-            location.ensure_safe_parent()?;
+            crate::protection::ensure_safe_directory(&parent)?;
             let directory = tempfile::Builder::new()
                 .prefix(".rustsible-write-")
-                .tempdir_in(location.parent())?;
+                .permissions(std::fs::Permissions::from_mode(0o700))
+                .tempdir_in(format!("/proc/self/fd/{}", parent.as_raw_fd()))?;
             let name = directory
                 .path()
                 .file_name()
@@ -82,7 +80,7 @@ impl Registry {
                 .to_owned();
             self.stages.push(OwnedStage {
                 directory,
-                _parent: location.directory,
+                _parent: parent,
             });
             Ok(name)
         })();

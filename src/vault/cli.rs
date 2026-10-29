@@ -19,7 +19,7 @@ impl Vault {
         let mut scope = Some(matches);
         while let Some(matches) = scope {
             let mut sources = Vec::new();
-            if let Some(paths) = matches.get_many::<PathBuf>("vault-password-file") {
+            if let Ok(Some(paths)) = matches.try_get_many::<PathBuf>("vault-password-file") {
                 for (index, path) in matches
                     .indices_of("vault-password-file")
                     .into_iter()
@@ -29,7 +29,7 @@ impl Vault {
                     sources.push((index, None, Some(path.clone())));
                 }
             }
-            if let Some(ids) = matches.get_many::<String>("vault-id") {
+            if let Ok(Some(ids)) = matches.try_get_many::<String>("vault-id") {
                 for (index, spec) in matches
                     .indices_of("vault-id")
                     .into_iter()
@@ -40,7 +40,13 @@ impl Vault {
                     sources.push((index, id, path));
                 }
             }
-            if matches.get_flag("ask-vault-pass") {
+            if matches
+                .try_get_one::<bool>("ask-vault-pass")
+                .ok()
+                .flatten()
+                .copied()
+                .unwrap_or(false)
+            {
                 sources.push((
                     matches.index_of("ask-vault-pass").unwrap_or(usize::MAX),
                     None,

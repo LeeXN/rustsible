@@ -22,8 +22,9 @@
 | 17 wait_for/uri | 已实现并验证 | [#19](https://github.com/LeeXN/rustsible/pull/19)，目标端 TCP/文件/内容就绪；共用 HTTP、TLS/私有 CA/代理、方法/请求体/状态码、认证遮蔽、8 MiB 边界和 until；87.12% 覆盖率、固定 Ansible 2.21 对照及 x86_64 glibc/musl SSH 三身份通过；[双架构 CI 40932840299](https://github.com/LeeXN/rustsible/actions/runs/40932840299) 八作业全部通过，glibc/musl 三身份、固定参考及离线包有实证 |
 | 18 git/unarchive | 已实现并验证 | [#20](https://github.com/LeeXN/rustsible/pull/20)，目标端 Git 固定版本/更新/保留本地修改/只读 check；tar/gzip/ZIP 全部预解码、路径/链接/覆盖检查、复用原子安装；原生场景和 x86_64 glibc/musl SSH 三身份、幂等、check、写满保留 inode/字节/元数据及暂存清理通过；固定 Ansible 2.21 对照、87.12% 覆盖率；[双架构 CI 40935652637](https://github.com/LeeXN/rustsible/actions/runs/40935652637) 八作业通过 |
 | 19 CLI/tags/diff | 已实现并验证 | [#21](https://github.com/LeeXN/rustsible/pull/21)， tags/skip-tags、静态继承/动态 apply、handler 及过滤 rescue；无连接的 JSON 语法/列表、结构化有界 diff/no_log、隐藏 SSH/sudo 提示和私钥优先级；真实 PTY、固定 Ansible 2.21 对照及 87.03% 覆盖率；[双架构 CI 40941504804](https://github.com/LeeXN/rustsible/actions/runs/40941504804) 八作业通过，glibc/musl SSH 三身份、预演、清理及离线包有实证；协议 v5 |
-| 20 Vault | 实现并验收中 | AES256 1.1/1.2、HMAC 先验、受保护密码来源/ID、CLI encrypt/decrypt/view/rekey、内存加载与惰性 !vault、普通数据不重渲染；本地场景、x86_64 glibc/musl SSH 三身份、磁盘写满/原 inode 与 capabilities、无 Python 控制端通过；最终参考/覆盖率/双架构 CI 待完成 |
-| 21–22 扩展与发布验收 | 未实现 | 第四阶段 |
+| 20 Vault | 已实现并验证 | [#22](https://github.com/LeeXN/rustsible/pull/22)，AES256 1.1/1.2、HMAC 先验、密码来源/ID、CLI 四入口、内存加载与惰性 !vault、普通数据不重渲染；固定参考双向验证、覆盖率门禁；[双架构 CI 40961978764](https://github.com/LeeXN/rustsible/actions/runs/40961978764) 八作业通过，glibc/musl 三身份、写满保留 inode/capabilities、无 Python 控制端；修复异步原子快照/监督进程退出观察竞态 |
+| 21 collections 与原生扩展 | 实现并验收中 | 受控搜索/FQCN/角色与 playbook、原生模块及 inventory/lookup/filter、打包/安装/校验和外部授权记录；编译期 action/callback/connection/become/strategy 已接入并有真实执行测试；崩溃/超时/脱离会话后代回收、check/async/数据不重渲染已有本地证据；真实 SSH、参考及最终双架构 CI 待完成，协议 v6 |
+| 22 完整发布验收 | 待实施 | 组合部署、Vault/异步/离线 collection、跨架构最终包和完整支持矩阵 |
 
 当前验证包括 fmt、Clippy、全量测试、超过 80% 的行覆盖率、release 构建；真实 x86_64 SSH 的 deploy/root/app、check 前后业务状态一致、幂等、facts/register、权限/属主和清理；固定 ansible-core 2.21.0 的模板及条件对照；非法参数修改前失败，实际中断任务只执行一次、阻止后续循环项/后续 play。普通 Cargo 测试与参考环境分开。依赖审计保留既有 unsafe-libyaml 停止维护警告。
 

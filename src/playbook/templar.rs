@@ -110,6 +110,7 @@ pub(crate) fn environment() -> Environment<'static> {
     environment.set_undefined_behavior(UndefinedBehavior::Strict);
     environment.set_fuel(Some(1_000_000));
     crate::playbook::filters::register_ansible_filters(&mut environment);
+    crate::extensions::register_template(&mut environment);
     environment
 }
 
@@ -203,7 +204,8 @@ pub(crate) fn resolve_definitions(
                     references(value, environment, names, depth + 1)?;
                 }
             }
-            Value::Tagged(_) if crate::vault::is_value(value) => {}
+            Value::Tagged(_)
+                if crate::vault::is_value(value) || crate::data::literal(value).is_some() => {}
             Value::Tagged(value) => references(&value.value, environment, names, depth + 1)?,
             _ => {}
         }
@@ -232,7 +234,11 @@ pub(crate) fn resolve_definitions(
                 })
                 .collect::<Result<serde_yaml::Mapping>>()
                 .map(Value::Mapping),
-            Value::Tagged(_) if crate::vault::is_value(value) => Ok(value.clone()),
+            Value::Tagged(_)
+                if crate::vault::is_value(value) || crate::data::literal(value).is_some() =>
+            {
+                Ok(value.clone())
+            }
             Value::Tagged(value) => {
                 let mut value = (**value).clone();
                 value.value = render(&value.value, environment, context, depth + 1)?;

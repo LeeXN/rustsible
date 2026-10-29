@@ -1,0 +1,9 @@
+- name: Inspect the target with the native collection module
+  probe:
+    path: "{{ native_probe_path | default('/etc/passwd') }}"
+  register: native_probe
+- name: Check the target identity and architecture were returned
+  assert:
+    that:
+      - native_probe.probe.exists
+      - native_probe.probe.arch in ['x86_64', 'aarch64']

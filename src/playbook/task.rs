@@ -39,6 +39,7 @@ pub struct TaskScope {
     /// Identical sibling tasks still have separate concurrency limits.
     pub(crate) source_index: usize,
     pub role_id: Option<String>,
+    pub collections: Vec<String>,
     pub allow_duplicates: bool,
     pub(crate) boundary: Option<Boundary>,
     pub defaults: Mapping,
@@ -1435,7 +1436,7 @@ pub(crate) fn render_module_arguments(
                 if let Some(found_value) = get_nested_value(var_name_to_lookup, vars) {
                     resolved.insert(
                         Value::String("_var_value".to_string()),
-                        crate::vault::Vault::current().materialize(found_value)?,
+                        crate::data::materialize(found_value)?,
                     );
                 } else {
                     resolved.remove(Value::String("_var_value".to_string()));
@@ -1531,6 +1532,9 @@ fn render_argument_value(
                 rendered.insert(Value::String(key.clone()), value);
             }
             Ok(Value::Mapping(rendered))
+        }
+        Value::Tagged(_) if crate::data::literal(value).is_some() => {
+            crate::data::materialize(value)
         }
         Value::Tagged(_) if crate::vault::is_value(value) => {
             crate::vault::Vault::current().materialize(value)

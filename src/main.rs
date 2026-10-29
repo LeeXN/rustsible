@@ -1,16 +1,22 @@
 use rustsible::{cli, inventory, modules, playbook};
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use env_logger::Builder;
 use log::{info, LevelFilter};
 use std::io::Write;
 
 fn main() -> Result<()> {
+    if let Some(result) = rustsible_native::rpc::handle_runner_mode() {
+        return result;
+    }
     let matches = cli::build_cli().get_matches();
     let vault = rustsible::vault::Vault::from_cli(&matches)?;
     let _scope = vault.enter();
     if let Some(("vault", sub)) = matches.subcommand() {
         return vault.run_cli(sub);
+    }
+    if let Some(("collection", sub)) = matches.subcommand() {
+        return rustsible::extensions::run_cli(sub);
     }
     vault.protect(run(matches))
 }
@@ -66,6 +72,21 @@ fn run(matches: clap::ArgMatches) -> Result<()> {
         .filter_level(log_level)
         .init();
 
+    let sub = matches.subcommand().context("A command is required")?.1;
+    let paths = sub
+        .get_many::<std::path::PathBuf>("collections-path")
+        .map(|paths| paths.cloned().collect::<Vec<_>>())
+        .unwrap_or_else(|| config.collection_paths.clone());
+    let project = sub
+        .try_get_one::<String>("playbook")
+        .ok()
+        .flatten()
+        .filter(|file| std::path::Path::new(file).is_file())
+        .and_then(|file| std::path::Path::new(file).parent())
+        .map(std::path::Path::to_path_buf)
+        .unwrap_or(std::env::current_dir()?);
+    let extensions = rustsible::extensions::Registry::new(&paths, &project)?;
+    let _extensions = extensions.enter();
     info!("Starting Rustsible");
 
     match matches.subcommand() {
@@ -87,6 +108,7 @@ fn run(matches: clap::ArgMatches) -> Result<()> {
                 check_mode: sub_matches.get_flag("check"),
                 diff: sub_matches.get_flag("diff"),
                 vault: rustsible::vault::Vault::current(),
+                extensions: extensions.clone(),
                 credentials: if sub_matches.get_flag("syntax-check")
                     || sub_matches.get_flag("list-hosts")
                     || sub_matches.get_flag("list-tasks")
@@ -154,6 +176,7 @@ fn run(matches: clap::ArgMatches) -> Result<()> {
             let forks = config.host_limit(sub_matches)?;
             let options = modules::AdHocOptions {
                 vault: rustsible::vault::Vault::current(),
+                extensions: extensions.clone(),
                 credentials: credentials(sub_matches)?,
                 inventory: Some(std::sync::Arc::new(inventory.clone())),
                 config_file: config.file.clone(),

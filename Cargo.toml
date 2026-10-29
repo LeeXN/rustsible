@@ -1,5 +1,5 @@
 [workspace]
-members = [".", "crates/protocol", "crates/worker"]
+members = [".", "crates/protocol", "crates/worker", "crates/native", "crates/native-example"]
 resolver = "2"
 
 [package]
@@ -14,6 +14,7 @@ repository = "https://github.com/LeeXN/rustsible"
 
 [dependencies]
 rustsible-protocol = { path = "crates/protocol" }
+rustsible-native = { path = "crates/native" }
 clap = "4.4"
 serde = "1.0"
 serde_yaml = "0.9"
@@ -38,6 +39,10 @@ zeroize = "1"
 getrandom = "0.4"
 tempfile = "3.8"
 
+tar = { version = "0.4.46", default-features = false }
+flate2 = "1.1.9"
+
 [dev-dependencies]
+rustsible-native-example = { path = "crates/native-example" }
 mockall = "0.12"
 proptest = "1.4"
