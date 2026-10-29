@@ -475,9 +475,9 @@ fn named_acl_entries(bytes: &[u8]) -> Result<Vec<&[u8]>> {
         bail!("Unsupported Linux POSIX ACL encoding");
     }
     let mut named = Vec::new();
-    for entry in bytes[4..].chunks_exact(8) {
+    for entry in bytes[4..].as_chunks::<8>().0 {
         match u16::from_le_bytes([entry[0], entry[1]]) {
-            2 | 8 => named.push(entry),
+            2 | 8 => named.push(entry.as_slice()),
             1 | 4 | 16 | 32 => {}
             _ => bail!("Unsupported Linux POSIX ACL entry"),
         }
