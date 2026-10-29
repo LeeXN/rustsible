@@ -6,13 +6,13 @@ pub mod param;
 pub mod registry;
 mod result;
 use anyhow::{bail, Context, Result};
-pub use args::{extract_command_arg, tokenize_args};
+pub use args::{tokenize_args, CommandArgs};
 pub use result::{insert_output_values, result_fields, ModuleResult, Outcome};
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::io::{Read, Write};
 
-pub const VERSION: u32 = 2;
+pub const VERSION: u32 = 3;
 pub const BUILD_ID: &str = env!("RUSTSIBLE_BUILD_ID");
 pub const MAX_REQUEST_BYTES: usize = 16 * 1024 * 1024;
 // JSON escaping can expand a bounded 16 MiB command response sixfold.
@@ -42,6 +42,7 @@ pub struct Request {
     pub args: serde_yaml::Value,
     pub check: bool,
     pub timeout_ms: u64,
+    pub environment: std::collections::BTreeMap<String, String>,
     pub managed: bool,
     pub payload: Option<Payload>,
 }
@@ -54,6 +55,7 @@ impl Request {
             args,
             check,
             timeout_ms,
+            environment: Default::default(),
             managed: true,
             payload: None,
         }
@@ -67,6 +69,18 @@ impl Request {
         }
         if self.timeout_ms == 0 || self.timeout_ms > 7 * 24 * 60 * 60 * 1000 {
             bail!("Invalid worker timeout");
+        }
+        for (name, value) in &self.environment {
+            if name.is_empty()
+                || name.bytes().enumerate().any(|(index, byte)| {
+                    !(byte.is_ascii_alphabetic()
+                        || byte == b'_'
+                        || (index > 0 && byte.is_ascii_digit()))
+                })
+                || value.contains('\0')
+            {
+                bail!("Invalid environment name or NUL byte in value");
+            }
         }
         if !NATIVE_MODULES.contains(&self.module.as_str()) {
             bail!("Unsupported native module: {}", self.module);
@@ -319,6 +333,28 @@ mod tests {
             MAX_REQUEST_BYTES
         )
         .is_err());
+    }
+    #[test]
+    fn environment_and_execution_timeout_are_validated_before_dispatch() {
+        let mut request = Request::new("stat", serde_yaml::Value::Null, true, 1000);
+        request
+            .environment
+            .insert("VALID_1".into(), "literal $(value)".into());
+        assert!(request.validate().is_ok());
+        for (name, value) in [
+            ("1BAD", "x"),
+            ("BAD=NAME", "x"),
+            ("", "x"),
+            ("VALID", "nul\0value"),
+        ] {
+            request.environment = std::collections::BTreeMap::from([(name.into(), value.into())]);
+            assert!(request.validate().is_err());
+        }
+        request.environment.clear();
+        request.timeout_ms = 0;
+        assert!(request.validate().is_err());
+        request.timeout_ms = 7 * 24 * 60 * 60 * 1000 + 1;
+        assert!(request.validate().is_err());
     }
     #[test]
     fn identity_and_version_handshakes_are_strict() {

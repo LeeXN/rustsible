@@ -60,6 +60,27 @@ The compatibility surface currently includes Linux architecture facts,
 `systemd.name/enabled/state/daemon_reload`, `copy.force`, and `default(omit)`.
 The systemd module rejects non-systemd hosts explicitly.
 
+Tasks support `changed_when`, `failed_when`, `until`, `retries`, `delay`,
+`timeout`, and play/task `environment`. Conditions use strict booleans; lists
+are combined with AND. Registers update after every attempt, including each
+loop item. `retries` counts additional attempts (default 3 when `until` is
+present); `delay` defaults to 5 seconds. Exhausted `attempts` follows the pinned
+Ansible 2.21 retry-count convention. A task timeout limits each target execution
+and terminates its descendants; uncertain or unreachable results stop retries.
+Task environment values override play values and remain private to the request.
+
+`command` accepts exactly one of `cmd` or `argv`, plus `chdir`, `creates`,
+`removes`, `stdin`, `stdin_add_newline`, `strip_empty_ends`, and
+`expand_argument_vars`. `shell` accepts the same parameters except `argv`.
+Arguments may also use the task's `args` mapping. File guards support globs,
+relative to `chdir`, with `creates` checked first. In check mode they predict
+changes without running the command; commands without a guard are skipped.
+`argv` preserves argument boundaries, and target environment expansion does
+not evaluate shell syntax. Unknown variables remain literal; set
+`expand_argument_vars: false` to disable expansion. Stdin gains a final newline
+and stdout/stderr lose trailing CR/LF by default; the corresponding boolean
+parameters can disable either behavior.
+
 `copy`, `template`, `lineinfile`, and `get_url` prepare content in a private
 same-filesystem directory and commit it with an atomic rename. File operations
 use directory descriptors to pin the destination across ancestor renames. The

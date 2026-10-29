@@ -84,21 +84,74 @@ pub fn tokenize_args(input: &str) -> Result<Vec<String>> {
     Ok(tokens)
 }
 
-pub fn extract_command_arg(args: &Value) -> Result<String> {
-    match args {
-        Value::String(cmd) => Ok(cmd.clone()),
-        Value::Mapping(map) => {
-            if map.len() != 1 {
-                return Err(anyhow::anyhow!(
-                    "Command modules accept only the 'cmd' parameter"
-                ));
-            }
-            if let Some(Value::String(cmd)) = map.get(Value::String("cmd".to_string())) {
-                Ok(cmd.clone())
-            } else {
-                Err(anyhow::anyhow!("Module requires a valid command string"))
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CommandArgs {
+    pub cmd: Option<String>,
+    pub argv: Option<Vec<String>>,
+    pub chdir: Option<String>,
+    pub creates: Option<String>,
+    pub removes: Option<String>,
+    pub stdin: Option<String>,
+    #[serde(default = "yes")]
+    pub stdin_add_newline: bool,
+    #[serde(default = "yes")]
+    pub strip_empty_ends: bool,
+    #[serde(default = "yes")]
+    pub expand_argument_vars: bool,
+}
+fn yes() -> bool {
+    true
+}
+impl CommandArgs {
+    pub fn parse(args: &Value, shell: bool) -> Result<Self> {
+        let args = if let Value::String(command) = args {
+            serde_yaml::to_value(std::collections::BTreeMap::from([("cmd", command)]))?
+        } else {
+            args.clone()
+        };
+        let parsed: Self = serde_yaml::from_value(args)?;
+        if parsed.cmd.is_some() == parsed.argv.is_some() {
+            anyhow::bail!("Command requires exactly one of cmd or argv");
+        }
+        if shell && parsed.argv.is_some() {
+            anyhow::bail!("Shell does not accept argv");
+        }
+        if parsed
+            .cmd
+            .as_ref()
+            .is_some_and(|cmd| cmd.trim().is_empty() || cmd.contains('\0'))
+        {
+            anyhow::bail!("Command must be nonempty without NUL bytes");
+        }
+        if !shell {
+            let argv = parsed.arguments()?;
+            if argv.first().is_none_or(String::is_empty)
+                || argv.iter().any(|arg| arg.contains('\0'))
+            {
+                anyhow::bail!(
+                    "Command requires a nonempty executable and arguments without NUL bytes"
+                );
             }
         }
-        _ => Err(anyhow::anyhow!("Module requires a valid command string")),
+        for path in [&parsed.chdir, &parsed.creates, &parsed.removes]
+            .into_iter()
+            .flatten()
+        {
+            if path.is_empty() || path.contains('\0') {
+                anyhow::bail!("Command paths must be nonempty without NUL bytes");
+            }
+        }
+        Ok(parsed)
+    }
+    pub fn arguments(&self) -> Result<Vec<String>> {
+        if let Some(argv) = &self.argv {
+            Ok(argv.clone())
+        } else {
+            tokenize_args(self.cmd.as_deref().unwrap_or_default())
+        }
+    }
+    pub fn has_prediction(&self) -> bool {
+        self.creates.is_some() || self.removes.is_some()
     }
 }

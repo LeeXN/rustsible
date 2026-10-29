@@ -38,32 +38,21 @@ fn run(
     scratch: &std::path::Path,
     payload: Option<&std::path::Path>,
 ) -> Result<ModuleResult> {
+    for (name, value) in &request.environment {
+        // This runs only in the request's isolated module process, before any
+        // tool or HTTP client starts; the persistent worker never inherits it.
+        std::env::set_var(name, value);
+    }
     let args = request
         .args
         .as_mapping()
         .context("Native module arguments must be a mapping")?;
     if matches!(request.module.as_str(), "command" | "shell") {
-        if args.len() != 1 {
-            bail!("Command modules accept only cmd");
-        }
-        let command = request
-            .args
-            .get("cmd")
-            .and_then(serde_yaml::Value::as_str)
-            .filter(|value| !value.trim().is_empty() && !value.contains('\0'))
-            .context("Command requires non-empty cmd without NUL bytes")?;
-        if request.module == "command" {
-            rustsible_protocol::tokenize_args(command)?;
-        }
-        if request.check {
-            return Ok(ModuleResult {
-                skipped: true,
-                msg: "Check mode: command was not executed".into(),
-                ..ModuleResult::default()
-            });
-        }
-        return crate::process::execute(command, request.module == "shell", scratch);
+        let args =
+            rustsible_protocol::CommandArgs::parse(&request.args, request.module == "shell")?;
+        return crate::process::execute(&args, request.module == "shell", request.check, scratch);
     }
+
     match request.module.as_str() {
         "service" | "systemd" => {
             return crate::services::execute(

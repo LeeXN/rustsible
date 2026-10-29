@@ -17,6 +17,7 @@ pub struct Play {
     pub tasks: Vec<Task>,
     pub handlers: Vec<Handler>,
     pub vars: Mapping,
+    pub environment: Mapping,
     /// Distinguishes an explicit play setting from inventory/default values.
     pub become_override: Option<bool>,
     pub is_become: bool, // renamed from 'become' to avoid Rust keyword
@@ -173,6 +174,13 @@ impl Play {
                 check_mode: None,
                 register: None,
                 when: None,
+                changed_when: None,
+                failed_when: None,
+                until: None,
+                retries: None,
+                delay: None,
+                timeout: None,
+                environment: Mapping::new(),
                 notify: Vec::new(),
                 ignore_errors: false,
                 no_log: false,
@@ -547,6 +555,9 @@ impl Play {
 
     fn apply_play_settings(&self, task: &Task, host: &Host) -> Task {
         let mut effective_task = task.clone();
+        let mut environment = self.environment.clone();
+        environment.extend(task.environment.clone());
+        effective_task.environment = environment;
         effective_task.is_become = task
             .become_override
             .or(self.become_override)
@@ -610,6 +621,7 @@ mod tests {
             tasks: Vec::new(),
             handlers: Vec::new(),
             vars: Mapping::new(),
+            environment: Mapping::new(),
             become_override: None,
             is_become: false,
             become_user: "root".to_string(),
@@ -641,6 +653,13 @@ mod tests {
             check_mode: None,
             register: None,
             when: None,
+            changed_when: None,
+            failed_when: None,
+            until: None,
+            retries: None,
+            delay: None,
+            timeout: None,
+            environment: Mapping::new(),
             notify: Vec::new(),
             ignore_errors: false,
             no_log: false,
@@ -733,6 +752,9 @@ esac
         let hosts = ["slow", "fast", "last"]
             .map(|name| create_test_host(name, "localhost", 22, None, None));
         let mut play = create_test_play();
+        // Warm each lease before exercising scheduling. Copying debug workers
+        // under parallel test IO can exceed the business latch's timeout.
+        play.gather_facts = true;
         let mut work = create_command_task(
             "work",
             &format!("/bin/sh {} {{{{ inventory_hostname }}}}", script.display()),
@@ -750,7 +772,7 @@ esac
         for host in &hosts {
             let result = &state.contexts[&host.name].registered["work_result"];
             assert_eq!(result["rc"].as_i64(), Some(0));
-            assert_eq!(state.stats[&host.name].ok, 2);
+            assert_eq!(state.stats[&host.name].ok, 3);
         }
     }
 

@@ -110,10 +110,17 @@ pub struct Task {
     /// Distinguishes an explicit task override from the default user.
     pub become_user_override: Option<String>,
     pub connection: Option<String>,
-    /// A task can explicitly enter or leave check mode.
+    /// A task may enter check mode, but cannot disable a global dry run.
     pub check_mode: Option<bool>,
     pub register: Option<String>,
     pub when: Option<Value>,
+    pub changed_when: Option<Value>,
+    pub failed_when: Option<Value>,
+    pub until: Option<Value>,
+    pub retries: Option<Value>,
+    pub delay: Option<Value>,
+    pub timeout: Option<Value>,
+    pub environment: Mapping,
     pub notify: Vec<String>,
     pub ignore_errors: bool,
     /// Hide task payloads and errors from terminal/log output.
@@ -287,7 +294,7 @@ impl Task {
                 let mut iter_task = self.clone();
                 iter_task.loop_items = None;
 
-                let mut result = match iter_task.execute_module(
+                let mut result = match iter_task.execute_attempts(
                     host,
                     &mut engine,
                     &iter_context,
@@ -353,7 +360,7 @@ impl Task {
                 ConnectionConfig::require_resolved(&definitions, &vars)?;
             }
             let mut result =
-                self.execute_module(host, &mut engine, &context, &vars, check_mode, workers)?;
+                self.execute_attempts(host, &mut engine, &context, &vars, check_mode, workers)?;
             result.no_log = self.no_log;
             results.push(result);
         }
@@ -434,6 +441,153 @@ impl Task {
         Ok(final_result)
     }
 
+    /// Register projections are rebuilt after each attempt and condition. Data
+    /// from a command stays data; evaluating result conditions never re-renders it.
+    fn execute_attempts(
+        &self,
+        host: &Host,
+        engine: &mut Environment<'_>,
+        context: &TemplateContext,
+        vars: &HashMap<String, Value>,
+        check: bool,
+        workers: &crate::worker::Runtime,
+    ) -> Result<TaskResult> {
+        let has_until = self
+            .until
+            .as_ref()
+            .is_some_and(|condition| !condition.as_sequence().is_some_and(Vec::is_empty));
+        let retries = self
+            .integer_keyword(
+                &self.retries,
+                if has_until { 3 } else { 0 },
+                "retries",
+                engine,
+                context,
+            )?
+            .max(0);
+        let total = u32::try_from(retries)?
+            .checked_add(1)
+            .context("Task retries is too large")?;
+        let delay = self.number_keyword(&self.delay, 5.0, "delay", engine, context)?;
+        let delay = if delay < 0.0 { 1.0 } else { delay };
+        if delay > 604800.0 {
+            return Err(anyhow!("Task delay exceeds seven days"));
+        }
+        let mut attempt_vars = vars.clone();
+        for attempt in 1..=total {
+            let context = crate::playbook::templar::create_context(&attempt_vars)?;
+            let mut result =
+                self.execute_module(host, engine, &context, &attempt_vars, check, workers)?;
+            if total > 1 {
+                result
+                    .values
+                    .insert("attempts".into(), Value::Number(attempt.into()));
+            }
+            if result.unreachable || result.uncertain || result.skipped {
+                return Ok(result);
+            }
+            let condition_result = (|| -> Result<bool> {
+                for (condition, failure) in [(&self.changed_when, false), (&self.failed_when, true)]
+                {
+                    if let Some(register) = &self.register {
+                        attempt_vars.insert(register.clone(), result.registered_value());
+                    }
+                    if let Some(condition) = condition {
+                        if condition.as_sequence().is_some_and(Vec::is_empty) {
+                            continue;
+                        }
+                        let context = crate::playbook::templar::create_context(&attempt_vars)?;
+                        let value = self.evaluate_condition(condition, engine, &context)?;
+                        if failure {
+                            result.failed = value;
+                        } else {
+                            result.changed = value;
+                        }
+                    }
+                }
+                if let Some(register) = &self.register {
+                    attempt_vars.insert(register.clone(), result.registered_value());
+                }
+                if total == 1 {
+                    return Ok(true);
+                }
+                if let Some(condition) = self.until.as_ref().filter(|_| has_until) {
+                    let context = crate::playbook::templar::create_context(&attempt_vars)?;
+                    self.evaluate_condition(condition, engine, &context)
+                } else {
+                    Ok(!result.failed)
+                }
+            })();
+            match condition_result {
+                Ok(true) => return Ok(result),
+                Err(error) => {
+                    result.failed = true;
+                    result.msg = format!("Task result condition failed: {error}");
+                    return Ok(result);
+                }
+                Ok(false) if attempt == total => {
+                    result.failed = true;
+                    result.msg = format!(
+                        "Task retry condition was not satisfied after {total} attempts; {}",
+                        result.msg
+                    );
+                    // Pinned Ansible 2.21 reports the retry count on exhaustion.
+                    result
+                        .values
+                        .insert("attempts".into(), Value::Number((total - 1).into()));
+                    return Ok(result);
+                }
+                Ok(false) => std::thread::sleep(std::time::Duration::from_secs_f64(delay)),
+            }
+        }
+        unreachable!("Positive attempt count always returns a result")
+    }
+
+    fn number_keyword(
+        &self,
+        value: &Option<Value>,
+        default: f64,
+        name: &str,
+        engine: &mut Environment<'_>,
+        context: &TemplateContext,
+    ) -> Result<f64> {
+        let Some(value) = value else {
+            return Ok(default);
+        };
+        let value = if let Value::String(text) = value {
+            crate::playbook::templar::render_value(text, engine, context, true)?
+        } else {
+            value.clone()
+        };
+        let number = value
+            .as_f64()
+            .or_else(|| value.as_str().and_then(|value| value.parse().ok()))
+            .filter(|value| value.is_finite())
+            .with_context(|| format!("Task {name} must resolve to a finite number"))?;
+        Ok(number)
+    }
+    fn integer_keyword(
+        &self,
+        value: &Option<Value>,
+        default: i64,
+        name: &str,
+        engine: &mut Environment<'_>,
+        context: &TemplateContext,
+    ) -> Result<i64> {
+        let Some(value) = value else {
+            return Ok(default);
+        };
+        let value = if let Value::String(text) = value {
+            crate::playbook::templar::render_value(text, engine, context, true)?
+        } else {
+            value.clone()
+        };
+        value
+            .as_i64()
+            .or_else(|| value.as_str().and_then(|value| value.parse().ok()))
+            .with_context(|| format!("Task {name} must resolve to an integer"))
+    }
+
     fn execute_module(
         &self,
         host: &Host,
@@ -478,8 +632,33 @@ impl Task {
                 }
             }
         }
+        let timeout = self.integer_keyword(&self.timeout, 0, "timeout", engine, &context)?;
+        if !(0..=604800).contains(&timeout) {
+            return Err(anyhow!("Task timeout must be between zero and seven days"));
+        }
+        let mut environment = std::collections::BTreeMap::new();
+        for (name, value) in &self.environment {
+            let name = name.as_str().context("Environment names must be strings")?;
+            let value = if let Value::String(text) = value {
+                crate::playbook::templar::render_value(text, engine, &context, true)?
+            } else {
+                value.clone()
+            };
+            let text = match value {
+                Value::String(text) => text,
+                Value::Number(value) => value.to_string(),
+                Value::Bool(value) => value.to_string(),
+                _ => {
+                    return Err(anyhow!(
+                        "Environment values must resolve to scalar strings, numbers or booleans"
+                    ))
+                }
+            };
+            environment.insert(name.to_owned(), text);
+        }
         let invocation =
-            Invocation::prepare(module_name, &Value::Mapping(resolved_args), check_mode)?;
+            Invocation::prepare(module_name, &Value::Mapping(resolved_args), check_mode)?
+                .with_execution(environment, (timeout > 0).then_some(timeout as u64 * 1000));
         if !invocation.needs_connection() {
             return Ok(TaskResult::from_module_result(
                 &host.name,
@@ -943,6 +1122,13 @@ mod tests {
             check_mode: None,
             register: None,
             when: None,
+            changed_when: None,
+            failed_when: None,
+            until: None,
+            retries: None,
+            delay: None,
+            timeout: None,
+            environment: Mapping::new(),
             notify: Vec::new(),
             ignore_errors: false,
             no_log: false,

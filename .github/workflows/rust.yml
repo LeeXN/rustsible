@@ -82,6 +82,8 @@ jobs:
         run: bash tests/ssh/run.sh target/${{ matrix.target }}/release/rustsible target/workers
       - name: SSH connection reuse and reset acceptance
         run: bash tests/ssh/run.sh target/${{ matrix.target }}/release/rustsible target/workers sessions
+      - name: Task controls over SSH and three execution identities
+        run: bash tests/ssh/run.sh target/${{ matrix.target }}/release/rustsible target/workers controls
       - name: Native execution without Python or curl (glibc)
         run: bash tests/ssh/run.sh target/${{ matrix.target }}/release/rustsible target/workers native glibc target/${{ matrix.target }}/release/examples/http_fixture
       - name: Native execution without Python or curl (musl)
