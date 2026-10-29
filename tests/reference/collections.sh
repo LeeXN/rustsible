@@ -15,7 +15,7 @@ cat > "$collection_root/roles/app/tasks/verify.yml" <<'YAML'
       - listen_port == 9090
       - role_label == 'selected'
 - copy:
-    content: '{{ role_name }}'
+    content: '{{ role_name }}|{{ ansible_role_name }}|{{ ansible_collection_name }}'
     dest: '{{ output }}/role-name'
 YAML
 cat > "$collection_root/playbooks/deploy.yml" <<'YAML'
@@ -33,4 +33,4 @@ mv "$fixture_dir/collection-output" "$fixture_dir/reference-collection"
 mkdir "$fixture_dir/collection-output"
 "$binary" playbook --collections-path "$fixture_dir/collections" -i "$fixture_dir/inventory" example.declarative.deploy -e "output=$fixture_dir/collection-output" > "$fixture_dir/native-collection.log" 2>&1
 diff -r "$fixture_dir/reference-collection" "$fixture_dir/collection-output"
-[[ $(cat "$fixture_dir/collection-output/role-name") == example.declarative.app ]]
+[[ $(cat "$fixture_dir/collection-output/role-name") == 'app|example.declarative.app|example.declarative' ]]

@@ -304,7 +304,7 @@ fn native_inventory_lookup_filter_and_collection_roles_keep_external_text_litera
         directory.join("rustsible-collection.json"),
         serde_json::to_vec(&metadata)?,
     )?;
-    fs::write(directory.join("roles/demo/tasks/main.yml"),"- probe: {path: /etc/passwd}\n  register: role_probe\n- ansible.builtin.assert:\n    that:\n      - role_probe.probe.exists\n      - ansible_role_name == 'example.native.demo'\n")?;
+    fs::write(directory.join("roles/demo/tasks/main.yml"),"- probe: {path: /etc/passwd}\n  register: role_probe\n- ansible.builtin.assert:\n    that:\n      - role_probe.probe.exists\n      - ansible_role_name == 'example.native.demo'\n      - role_name == 'demo'\n      - ansible_collection_name == 'example.native'\n")?;
     let literal = "literal {{ MUST_NOT_RENDER }}";
     fs::write(
         root.join("hosts.json"),

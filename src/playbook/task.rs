@@ -445,7 +445,22 @@ impl Task {
             );
         }
         if let Some(name) = &self.scope.role_name {
-            data.insert("role_name".into(), Value::String(name.clone()));
+            let collection = self
+                .scope
+                .collections
+                .first()
+                .map(String::as_str)
+                .unwrap_or("");
+            let short = if collection.is_empty() {
+                name.as_str()
+            } else {
+                name.rsplit('.').next().unwrap_or(name)
+            };
+            data.insert("role_name".into(), Value::String(short.into()));
+            data.insert(
+                "ansible_collection_name".into(),
+                Value::String(collection.into()),
+            );
             data.insert("ansible_role_name".into(), Value::String(name.clone()));
         }
         data.extend(self.scope.locals.clone());
