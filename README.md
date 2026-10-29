@@ -99,8 +99,10 @@ streams it into a private target directory, verifies its checksum again, then
 checks protocol version, build ID, architecture, execution UID and capabilities.
 Use `--worker-dir DIRECTORY` to select a different release worker directory and
 inventory `rustsible_remote_tmp: /absolute/executable/directory` to replace the
-remote `/tmp` default. The parent must exist, be owned by root or the execution
-identity, and have the sticky bit when writable by other users. `noexec`, missing
+remote `/tmp` default. The parent must exist; it and its ancestors must be owned
+by root or the execution identity, with the sticky bit wherever other users can
+write. Validation walks actual parent directories, and cleanup verifies the
+original directory inode even after an ancestor rename. `noexec`, missing
 or damaged artifacts, unsupported architectures and mismatched builds fail
 explicitly. No Python fallback is used.
 

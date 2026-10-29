@@ -266,7 +266,7 @@ impl Client {
 impl Drop for Client {
     fn drop(&mut self) {
         if let Err(error) = self.session.shutdown() {
-            log::warn!("Worker lease cleanup failed: {error:#}");
+            eprintln!("Worker lease cleanup failed: {error:#}");
         }
     }
 }
@@ -279,14 +279,25 @@ fn bootstrap(base: &str, length: u64, checksum: &str) -> String {
 rustsible_umask=$(umask)
 umask 077
 exec 3< {base}
-directory_uid=$(stat -c %u /proc/self/fd/3/.)
-directory_mode=$(stat -c %a /proc/self/fd/3/.)
-if [ "$directory_uid" != 0 ] && [ "$directory_uid" != "$(id -u)" ]; then
-    echo 'Unsafe worker directory owner; choose rustsible_remote_tmp owned by root or the execution identity' >&2; exit 1
-fi
-if [ $((0$directory_mode & 0022)) != 0 ] && [ $((0$directory_mode & 01000)) = 0 ]; then
-    echo 'Unsafe writable worker directory: sticky bit required' >&2; exit 1
-fi
+execution_uid=$(id -u)
+root_identity=$(stat -c '%d:%i' /)
+# Walk actual parent inodes in a subshell: checking path strings could race
+# an ancestor rename, and business commands must retain the original cwd.
+(
+    CDPATH= cd -P -- /proc/self/fd/3
+    while :; do
+        directory_uid=$(stat -c %u .)
+        directory_mode=$(stat -c %a .)
+        if [ "$directory_uid" != 0 ] && [ "$directory_uid" != "$execution_uid" ]; then
+            echo 'Unsafe worker directory ancestor owner; choose rustsible_remote_tmp under root or the execution identity' >&2; exit 1
+        fi
+        if [ $((0$directory_mode & 0022)) != 0 ] && [ $((0$directory_mode & 01000)) = 0 ]; then
+            echo 'Unsafe writable worker directory ancestor: sticky bit required' >&2; exit 1
+        fi
+        [ "$(stat -c '%d:%i' .)" != "$root_identity" ] || break
+        cd -P ..
+    done
+)
 d=$(mktemp -d /proc/self/fd/3/.rustsible-worker-XXXXXXXXXX)
 trap 'rm -rf -- "$d"' EXIT
 trap 'exit 1' HUP INT TERM
@@ -410,6 +421,19 @@ mod tests {
             .execute(&config(temporary.path()), "shell", args, false)
             .unwrap_err();
         assert!(format!("{error:#}").contains("sticky bit"), "{error:#}");
+        let nested = temporary.path().join("private-base");
+        fs::create_dir(&nested).unwrap();
+        fs::set_permissions(&nested, fs::Permissions::from_mode(0o700)).unwrap();
+        let error = Runtime::default()
+            .execute(
+                &config(&nested),
+                "setup",
+                Value::Mapping(Default::default()),
+                false,
+            )
+            .unwrap_err();
+        assert!(format!("{error:#}").contains("ancestor"), "{error:#}");
+        assert_eq!(fs::read_dir(nested).unwrap().count(), 0);
         assert_eq!(fs::read(business).unwrap(), b"original");
         assert!(fs::read_dir(temporary.path()).unwrap().all(|entry| !entry
             .unwrap()

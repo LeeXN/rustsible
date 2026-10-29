@@ -15,9 +15,9 @@
 | 16–19 常用模块与 CLI | 未实现 | 第三阶段 |
 | 20–22 Vault、扩展与发布验收 | 未实现 | 第四阶段 |
 
-当前验证包括 fmt、Clippy、全量测试、83.63% 行覆盖率、release 构建；真实 x86_64 SSH 的 deploy/root/app、check 前后业务状态一致、幂等、facts/register、权限/属主和清理；固定 ansible-core 2.21.0 的模板及条件对照；非法参数修改前失败，实际中断任务只执行一次、阻止后续循环项/后续 play。普通 Cargo 测试与参考环境分开。依赖审计保留既有 unsafe-libyaml 停止维护警告。
+当前验证包括 fmt、Clippy、全量测试、超过 80% 的行覆盖率、release 构建；真实 x86_64 SSH 的 deploy/root/app、check 前后业务状态一致、幂等、facts/register、权限/属主和清理；固定 ansible-core 2.21.0 的模板及条件对照；非法参数修改前失败，实际中断任务只执行一次、阻止后续循环项/后续 play。普通 Cargo 测试与参考环境分开。依赖审计保留既有 unsafe-libyaml 停止维护警告。
 
-已有独立原生 worker、版本化协议、清单生成器与双架构离线包脚本。setup/stat/command/shell 不再调用旧模块路径；get_url 仍依赖目标端 Python。M1 仍需 07–08；无 Python 的整个内置模块集、真实 systemd、最终发布组合验收尚未完成。06 的原生 x86_64/aarch64 运行证据与离线包校验见 [CI 40812345570](https://github.com/LeeXN/rustsible/actions/runs/40812345570)；该验收不代表尚未迁移的模块也已完成无 Python 验证。
+已有独立原生 worker、版本化协议、清单生成器与双架构离线包脚本。setup/stat/command/shell 不再调用旧模块路径；get_url 仍依赖目标端 Python。M1 仍需 07–08；无 Python 的整个内置模块集、真实 systemd、最终发布组合验收尚未完成。06 的原生 x86_64/aarch64 运行证据与离线包校验见 [PR #9 的 CI 检查](https://github.com/LeeXN/rustsible/pull/9/checks)；该验收不代表尚未迁移的模块也已完成无 Python 验证。
 
 已启用 ubuntu-24.04 / ubuntu-24.04-arm 的完整质量门禁与真实 SSH 作业，两种架构都已实际完成 glibc/musl 的原生执行、三身份与密码 sudo、check、noexec、中断及后代回收；musl 场景也在目标环境运行了静态控制端。双架构包包含相同构建的两个 worker，解包后在断网的无 Python/curl 容器中实际完成 setup/stat。不能用交叉编译或工作流配置本身代替运行结果。
 

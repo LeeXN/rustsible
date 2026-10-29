@@ -206,7 +206,9 @@ fn timeout_and_invalid_protocol_never_report_success() {
 fn managed_directory_is_removed_by_worker_even_without_a_bootstrap_exit_trap() {
     use std::os::unix::fs::PermissionsExt;
     let parent = tempfile::tempdir().unwrap();
-    let directory = parent.path().join(".rustsible-worker-0123456789");
+    let base = parent.path().join("base");
+    fs::create_dir(&base).unwrap();
+    let directory = base.join(".rustsible-worker-0123456789");
     fs::create_dir(&directory).unwrap();
     fs::set_permissions(&directory, fs::Permissions::from_mode(0o700)).unwrap();
     let binary = directory.join("worker");
@@ -228,6 +230,11 @@ fn managed_directory_is_removed_by_worker_even_without_a_bootstrap_exit_trap() {
         &binary,
     );
     wait_file(&marker);
+    let moved = parent.path().join("moved-base");
+    fs::rename(&base, &moved).unwrap();
+    fs::create_dir_all(&directory).unwrap();
+    let unrelated = directory.join("unrelated");
+    fs::write(&unrelated, b"keep replacement data").unwrap();
     drop(input);
     let output = child.wait_with_output().unwrap();
     assert!(output.status.success());
@@ -239,7 +246,12 @@ fn managed_directory_is_removed_by_worker_even_without_a_bootstrap_exit_trap() {
         Outcome::Uncertain
     );
     assert!(
-        !directory.exists(),
+        !moved.join(".rustsible-worker-0123456789").exists(),
         "worker relied on the missing bootstrap shell to clean up"
+    );
+    assert_eq!(
+        fs::read(unrelated).unwrap(),
+        b"keep replacement data",
+        "cleanup followed the stale ancestor pathname"
     );
 }

@@ -11,7 +11,7 @@ use std::{
     io::{self, Read},
     os::{
         fd::FromRawFd,
-        unix::fs::{MetadataExt, PermissionsExt},
+        unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt},
     },
     time::Duration,
 };
@@ -125,7 +125,7 @@ fn run() -> Result<()> {
 
 /// The bootstrap normally removes its directory. On abrupt SSH disconnect its
 /// shell may die before EXIT runs, so the worker also owns a bounded cleanup.
-struct ManagedDirectory(Option<std::path::PathBuf>);
+struct ManagedDirectory(Option<fs::File>);
 impl ManagedDirectory {
     fn detect() -> Result<Self> {
         let executable = std::env::current_exe()?;
@@ -139,12 +139,16 @@ impl ManagedDirectory {
                 })
         });
         if let Some(directory) = directory {
-            let metadata = fs::symlink_metadata(directory)?;
+            let file = fs::OpenOptions::new()
+                .read(true)
+                .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW)
+                .open(directory)?;
+            let metadata = file.metadata()?;
             if metadata.is_dir()
                 && metadata.uid() == unsafe { libc::geteuid() }
                 && metadata.permissions().mode() & 0o777 == 0o700
             {
-                return Ok(Self(Some(directory.to_path_buf())));
+                return Ok(Self(Some(file)));
             }
         }
         Ok(Self(None))
@@ -152,10 +156,30 @@ impl ManagedDirectory {
 }
 impl Drop for ManagedDirectory {
     fn drop(&mut self) {
-        if let Some(directory) = &self.0 {
-            if fs::remove_dir_all(directory)
-                .is_err_and(|error| error.kind() != io::ErrorKind::NotFound)
-            {
+        if let Some(file) = &self.0 {
+            // Holding the directory open prevents inode reuse; current_exe
+            // follows our executable's actual location after ancestor renames.
+            // Never remove a replacement at a formerly valid pathname.
+            let cleanup = (|| -> Result<()> {
+                let executable = std::env::current_exe()?;
+                let directory = executable
+                    .parent()
+                    .ok_or_else(|| anyhow::anyhow!("Worker executable has no parent"))?;
+                let expected = file.metadata()?;
+                let current = match fs::symlink_metadata(directory) {
+                    Ok(current) => current,
+                    Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
+                    Err(error) => return Err(error.into()),
+                };
+                if !current.is_dir()
+                    || (current.dev(), current.ino()) != (expected.dev(), expected.ino())
+                {
+                    bail!("Worker directory identity changed");
+                }
+                fs::remove_dir_all(directory)?;
+                Ok(())
+            })();
+            if cleanup.is_err() {
                 eprintln!("Native worker private-directory cleanup failed");
             }
         }
