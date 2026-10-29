@@ -195,6 +195,21 @@ impl Client {
             bail!("Worker artifact SHA-256 mismatch");
         }
         binary.rewind()?;
+        let mut header = [0u8; 64];
+        binary
+            .read_exact(&mut header)
+            .context("Incomplete worker ELF header")?;
+        // Reject mislabeled architectures before a POSIX shell can try its
+        // ENOEXEC script fallback on a foreign binary. Hello checks it again.
+        let machine = if arch == "x86_64" { 62u16 } else { 183u16 };
+        if &header[..4] != b"\x7fELF"
+            || header[4..7] != [2, 1, 1]
+            || !matches!(u16::from_le_bytes([header[16], header[17]]), 2 | 3)
+            || u16::from_le_bytes([header[18], header[19]]) != machine
+        {
+            bail!("Worker artifact is not a Linux ELF64 executable for target architecture {arch}");
+        }
+        binary.rewind()?;
         let bootstrap = bootstrap(&base, metadata.len(), &artifact.sha256);
         let command = if config.use_become {
             let sudo = format!(
@@ -358,7 +373,7 @@ mod tests {
         let damaged = temporary.path().join("workers");
         fs::create_dir(&damaged).unwrap();
         let bundle = crate::testing::worker_bundle();
-        let manifest: Manifest =
+        let mut manifest: Manifest =
             serde_json::from_slice(&fs::read(bundle.join("manifest.json")).unwrap()).unwrap();
         fs::write(
             damaged.join("manifest.json"),
@@ -366,11 +381,30 @@ mod tests {
         )
         .unwrap();
         fs::write(damaged.join(&manifest.workers[0].file), b"damaged binary").unwrap();
-        assert!(Runtime::new(Some(damaged))
+        assert!(Runtime::new(Some(damaged.clone()))
             .execute(&config(temporary.path()), "shell", args.clone(), false)
             .unwrap_err()
             .to_string()
             .contains("SHA-256"));
+        let mut foreign = fs::read(bundle.join(&manifest.workers[0].file)).unwrap();
+        let machine = if std::env::consts::ARCH == "x86_64" {
+            183u16
+        } else {
+            62u16
+        };
+        foreign[18..20].copy_from_slice(&machine.to_le_bytes());
+        manifest.workers[0].sha256 = rustsible_protocol::sha256(&mut foreign.as_slice()).unwrap();
+        fs::write(damaged.join(&manifest.workers[0].file), foreign).unwrap();
+        fs::write(
+            damaged.join("manifest.json"),
+            serde_json::to_vec(&manifest).unwrap(),
+        )
+        .unwrap();
+        assert!(Runtime::new(Some(damaged))
+            .execute(&config(temporary.path()), "shell", args.clone(), false)
+            .unwrap_err()
+            .to_string()
+            .contains("target architecture"));
         fs::set_permissions(temporary.path(), fs::Permissions::from_mode(0o777)).unwrap();
         let error = Runtime::default()
             .execute(&config(temporary.path()), "shell", args, false)

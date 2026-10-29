@@ -105,14 +105,14 @@ jobs:
       - name: Package both controllers with both static workers
         run: |
           for arch in x86_64 aarch64; do
-            bash scripts/package.sh target/native/native-$arch/rustsible target/packages/$arch target/native/native-x86_64/rustsible-worker target/native/native-aarch64/rustsible-worker
+            bash scripts/package.sh target/native/native-$arch/rustsible "$RUNNER_TEMP/rustsible-packages/$arch" target/native/native-x86_64/rustsible-worker target/native/native-aarch64/rustsible-worker
           done
       - name: Run the extracted package offline without Python or curl
         run: |
-          mkdir target/extracted
-          tar -xzf target/packages/x86_64.tar.gz -C target/extracted
+          mkdir "$RUNNER_TEMP/rustsible-extracted"
+          tar -xzf "$RUNNER_TEMP/rustsible-packages/x86_64.tar.gz" -C "$RUNNER_TEMP/rustsible-extracted"
           docker pull alpine:3.22
-          docker run --rm --network none --mount type=bind,src="$PWD/target/extracted/x86_64",dst=/release,readonly alpine:3.22 sh -eu -c '
+          docker run --rm --network none --mount type=bind,src="$RUNNER_TEMP/rustsible-extracted/x86_64",dst=/release,readonly alpine:3.22 sh -eu -c '
             ! command -v python3
             ! command -v curl
             cd /release
@@ -125,5 +125,5 @@ jobs:
       - uses: actions/upload-artifact@v4
         with:
           name: offline-linux-packages
-          path: target/packages/*.tar.gz
+          path: ${{ runner.temp }}/rustsible-packages/*.tar.gz
           if-no-files-found: error
