@@ -17,6 +17,8 @@ pub struct Play {
     pub tasks: Vec<Task>,
     pub handlers: Vec<Handler>,
     pub vars: Mapping,
+    pub vars_files: Vec<Value>,
+    pub source_file: Option<std::path::PathBuf>,
     pub environment: Mapping,
     /// Distinguishes an explicit play setting from inventory/default values.
     pub become_override: Option<bool>,
@@ -30,6 +32,8 @@ pub struct Play {
     pub connection: Option<String>,
     /// Ansible gathers facts by default; only an explicit false disables it.
     pub gather_facts: bool,
+    pub gather_subset: Option<Value>,
+    pub gather_timeout: Option<Value>,
     #[allow(dead_code)]
     pub tags: Vec<String>, // Keep this for future use
 }
@@ -50,12 +54,130 @@ struct HostStats {
 #[derive(Default)]
 pub(crate) struct RunState {
     pub(crate) workers: crate::worker::Runtime,
+    pub(crate) extra: std::sync::Arc<HashMap<String, Value>>,
+    globals: std::sync::Arc<HashMap<String, Value>>,
+    inventory: HashMap<String, HashMap<String, Value>>,
     contexts: HashMap<String, RuntimeVariables>,
     excluded: HashSet<String>,
     stats: HashMap<String, HostStats>,
 }
 
 impl RunState {
+    pub(crate) fn prepare(
+        &mut self,
+        inventory: &crate::inventory::Inventory,
+        playbook_dir: &std::path::Path,
+        config: Option<&std::path::Path>,
+    ) -> Result<()> {
+        let groups = inventory.group_members();
+        let mut globals = HashMap::from([
+            ("groups".into(), serde_yaml::to_value(&groups)?),
+            (
+                "playbook_dir".into(),
+                Value::String(playbook_dir.to_string_lossy().into_owned()),
+            ),
+        ]);
+        if let Some(source) = &inventory.source {
+            globals.insert(
+                "inventory_file".into(),
+                Value::String(source.to_string_lossy().into_owned()),
+            );
+            globals.insert(
+                "inventory_dir".into(),
+                Value::String(
+                    source
+                        .parent()
+                        .context("Inventory has no parent")?
+                        .to_string_lossy()
+                        .into_owned(),
+                ),
+            );
+        }
+        if let Some(source) = config {
+            globals.insert(
+                "ansible_config_file".into(),
+                Value::String(source.to_string_lossy().into_owned()),
+            );
+        }
+        self.globals = std::sync::Arc::new(globals);
+        for host in inventory.filter_hosts("all") {
+            self.inventory
+                .insert(host.name.clone(), host.inventory_variables());
+            let scope = self.contexts.entry(host.name.clone()).or_default();
+            scope.extra = self.extra.clone();
+            scope.defaults = host.defaults.clone();
+            scope.globals = self.globals.clone();
+            scope.magic.insert(
+                "inventory_hostname".into(),
+                Value::String(host.name.clone()),
+            );
+            scope.magic.insert(
+                "group_names".into(),
+                serde_yaml::to_value(
+                    groups
+                        .iter()
+                        .filter(|(name, members)| {
+                            name.as_str() != "all" && members.contains(&host.name)
+                        })
+                        .map(|(name, _)| name)
+                        .collect::<Vec<_>>(),
+                )?,
+            );
+        }
+        Ok(())
+    }
+    fn hostvars(&self) -> Result<Value> {
+        let mut snapshot = HashMap::<String, Value>::new();
+        for _ in 0..65 {
+            let mut next = HashMap::new();
+            let hosts = serde_yaml::to_value(&snapshot)?;
+            for (name, definitions) in &self.inventory {
+                let scope = self
+                    .contexts
+                    .get(name)
+                    .context("Missing host variable scope")?;
+                let (definitions, mut data) = scope.layers(definitions, &[], None)?;
+                data.insert("hostvars".into(), hosts.clone());
+                let mut values =
+                    crate::playbook::templar::resolve_definitions(&definitions, &data)?;
+                // Never serialize hostvars into itself. References resolve
+                // from the previous snapshot until an acyclic chain settles.
+                values.remove("hostvars");
+                next.insert(name.clone(), serde_yaml::to_value(values)?);
+            }
+            if next == snapshot {
+                return Ok(serde_yaml::to_value(next)?);
+            }
+            snapshot = next;
+        }
+        bail!("Cross-host variable references exceeded the depth limit of 64");
+    }
+    pub(crate) fn variable_globals(&self) -> Result<std::sync::Arc<HashMap<String, Value>>> {
+        // Hostvars is a task-boundary view, as in the pinned executor. A loop
+        // updates direct set_fact values locally; qualified hostvars lookups
+        // observe those updates on the next task.
+        let mut globals = (*self.globals).clone();
+        globals.insert("hostvars".into(), self.hostvars()?);
+        Ok(std::sync::Arc::new(globals))
+    }
+    pub(crate) fn variables_for(
+        &self,
+        host: &str,
+        globals: &std::sync::Arc<HashMap<String, Value>>,
+    ) -> Result<HashMap<String, Value>> {
+        let mut scope = self
+            .contexts
+            .get(host)
+            .context("Missing host scope")?
+            .clone();
+        scope.globals = globals.clone();
+        let (definitions, data) = scope.layers(
+            self.inventory.get(host).context("Missing inventory host")?,
+            &[],
+            None,
+        )?;
+        crate::playbook::templar::resolve_definitions(&definitions, &data)
+    }
     pub(crate) fn print_recap(&self) {
         println!("\n{}", "PLAY RECAP".bold());
         let mut names: Vec<_> = self.stats.keys().collect();
@@ -78,8 +200,52 @@ impl RunState {
 
     fn merge_result(&mut self, host: &str, task: &Task, result: &TaskResult) -> Result<()> {
         let persistent = self.contexts.entry(host.to_string()).or_default();
-        if !result.failed && !result.skipped && result.values.contains_key("ansible_facts") {
-            Play::merge_facts(&mut persistent.facts, result)?;
+        let mut updates = Vec::new();
+        if let Some(Value::Sequence(items)) = result.values.get("results") {
+            for item in items {
+                if item.get("failed").and_then(Value::as_bool) != Some(true)
+                    && item.get("skipped").and_then(Value::as_bool) != Some(true)
+                {
+                    if let Some(facts) = item.get("ansible_facts") {
+                        updates.push(facts);
+                    }
+                }
+            }
+        } else if !result.failed && !result.skipped {
+            if let Some(facts) = result.values.get("ansible_facts") {
+                updates.push(facts);
+            }
+        }
+        for facts in updates {
+            let facts = facts
+                .as_mapping()
+                .context("Module ansible_facts must be a mapping")?;
+            let variables = facts
+                .iter()
+                .map(|(name, value)| {
+                    Ok((
+                        name.as_str()
+                            .context("Fact names must be strings")?
+                            .to_owned(),
+                        value.clone(),
+                    ))
+                })
+                .collect::<Result<HashMap<_, _>>>()?;
+            match crate::modules::registry::Builtin::lookup(&task.module)? {
+                crate::modules::registry::Builtin::SetFact => {
+                    crate::inventory::host::merge_variable_layer(
+                        &mut persistent.registered,
+                        &variables,
+                    )
+                }
+                crate::modules::registry::Builtin::IncludeVars => {
+                    crate::inventory::host::merge_variable_layer(
+                        &mut persistent.included,
+                        &variables,
+                    )
+                }
+                _ => Play::merge_facts(&mut persistent.facts, facts)?,
+            }
         }
         if let Some(register) = &task.register {
             let value = Play::registered_value(result);
@@ -137,10 +303,21 @@ impl Play {
 
         let definitions: HashMap<String, HashMap<String, Value>> = hosts
             .iter()
-            .map(|host| (host.name.clone(), host.all_variables()))
+            .map(|host| (host.name.clone(), host.inventory_variables()))
             .collect();
         for host in hosts {
-            state.contexts.entry(host.name.clone()).or_default();
+            let scope = state.contexts.entry(host.name.clone()).or_default();
+            scope.extra = state.extra.clone();
+            scope.defaults = host.defaults.clone();
+            scope.globals = state.globals.clone();
+            scope
+                .magic
+                .entry("inventory_hostname".into())
+                .or_insert_with(|| Value::String(host.name.clone()));
+            state
+                .inventory
+                .entry(host.name.clone())
+                .or_insert_with(|| host.inventory_variables());
         }
         let mut active_hosts: HashSet<String> = hosts
             .iter()
@@ -164,7 +341,17 @@ impl Play {
             let gather_task = Task {
                 name: "Gathering Facts".to_string(),
                 module: "setup".to_string(),
-                args: Mapping::new(),
+                args: [
+                    ("gather_subset", &self.gather_subset),
+                    ("gather_timeout", &self.gather_timeout),
+                ]
+                .into_iter()
+                .filter_map(|(name, value)| {
+                    value
+                        .as_ref()
+                        .map(|value| (Value::String(name.into()), value.clone()))
+                })
+                .collect(),
                 source_file: None,
                 become_override: None,
                 is_become: false,
@@ -514,18 +701,31 @@ impl Play {
         forks: usize,
     ) -> Vec<(&'a Host, Task, Result<TaskResult>)> {
         let runtime = &state.workers;
+        let globals = state.variable_globals();
         crate::scheduler::map(&hosts, forks, |&host| {
             let effective_task = play.apply_play_settings(task, host);
             let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                 match (state.contexts.get(&host.name), definitions.get(&host.name)) {
-                    (Some(vars), Some(definitions)) => effective_task.execute_with_definitions(
-                        host,
-                        vars,
-                        definitions,
-                        &play.vars,
-                        check_mode,
-                        runtime,
-                    ),
+                    (Some(vars), Some(definitions)) => {
+                        let mut vars = vars.clone();
+                        vars.globals = globals
+                            .as_ref()
+                            .map_err(|error| {
+                                anyhow::anyhow!("Cannot construct hostvars: {error:#}")
+                            })?
+                            .clone();
+                        let implicit_gather = task.module == "setup" && task.source_file.is_none();
+                        let variables =
+                            play.variables_for_host(&vars, definitions, implicit_gather)?;
+                        effective_task.execute_with_definitions(
+                            host,
+                            &vars,
+                            definitions,
+                            &variables,
+                            check_mode,
+                            runtime,
+                        )
+                    }
                     _ => Err(anyhow::anyhow!(
                         "Internal error: no variable context for host '{}'",
                         host.name
@@ -555,6 +755,11 @@ impl Play {
 
     fn apply_play_settings(&self, task: &Task, host: &Host) -> Task {
         let mut effective_task = task.clone();
+        effective_task.become_override = task.become_override.or(self.become_override);
+        effective_task.become_user_override = task
+            .become_user_override
+            .clone()
+            .or_else(|| self.become_user_override.clone());
         let mut environment = self.environment.clone();
         environment.extend(task.environment.clone());
         effective_task.environment = environment;
@@ -575,25 +780,97 @@ impl Play {
         effective_task
     }
 
-    fn merge_facts(context: &mut HashMap<String, Value>, result: &TaskResult) -> Result<()> {
-        let facts = result
-            .values
-            .get("ansible_facts")
-            .and_then(Value::as_mapping)
-            .context("Fact gathering did not return ansible_facts")?;
+    fn variables_for_host(
+        &self,
+        runtime: &RuntimeVariables,
+        definitions: &HashMap<String, Value>,
+        allow_unresolved: bool,
+    ) -> Result<Mapping> {
+        let mut variables = self.vars.clone();
+        let base = self
+            .source_file
+            .as_ref()
+            .and_then(|path| path.parent())
+            .map(std::path::Path::to_path_buf)
+            .unwrap_or(std::env::current_dir()?);
+        let mut engine = crate::playbook::templar::environment();
+        for entry in &self.vars_files {
+            let mut keywords = HashMap::new();
+            if let Some(value) = self.become_override {
+                keywords.insert("ansible_become".into(), Value::Bool(value));
+            }
+            if let Some(value) = &self.become_user_override {
+                keywords.insert("ansible_become_user".into(), Value::String(value.clone()));
+            }
+            let (definitions, data) =
+                runtime.layers(definitions, &[&variables], Some(&keywords))?;
+            let resolved = crate::playbook::templar::resolve_definitions(&definitions, &data)?;
+            let context = crate::playbook::templar::create_context(&resolved)?;
+            let candidates = entry
+                .as_sequence()
+                .map(Vec::as_slice)
+                .unwrap_or(std::slice::from_ref(entry));
+            let mut selected = None;
+            let mut unresolved = false;
+            for candidate in candidates {
+                let value =
+                    match crate::playbook::templar::render_value(
+                        candidate
+                            .as_str()
+                            .context("vars_files paths must be strings")?,
+                        &mut engine,
+                        &context,
+                        true,
+                    ) {
+                        Ok(value) => value,
+                        Err(error)
+                            if allow_unresolved
+                                && error.downcast_ref::<minijinja::Error>().is_some_and(
+                                    |error| error.kind() == minijinja::ErrorKind::UndefinedError,
+                                ) =>
+                        {
+                            unresolved = true;
+                            continue;
+                        }
+                        Err(error) => return Err(error),
+                    };
+                let path = value
+                    .as_str()
+                    .context("vars_files path must resolve to a string")?;
+                let path = base.join(path);
+                if path.exists() {
+                    selected = Some(path);
+                    break;
+                }
+            }
+            // Static files can set connection variables before gathering;
+            // fact-dependent paths wait until their facts actually exist.
+            if selected.is_none() && unresolved {
+                continue;
+            }
+            let selected = selected.context("No vars_files candidate exists")?;
+            crate::vars::merge(&mut variables, crate::vars::load(&selected)?);
+        }
+        Ok(variables)
+    }
+
+    fn merge_facts(context: &mut HashMap<String, Value>, facts: &Mapping) -> Result<()> {
         let mut merged = context
             .get("ansible_facts")
             .and_then(Value::as_mapping)
             .cloned()
             .unwrap_or_default();
-        merged.extend(facts.clone());
-        context.insert("ansible_facts".to_string(), Value::Mapping(merged));
         for (key, value) in facts {
             let Value::String(key) = key else {
                 bail!("Fact names must be strings");
             };
-            context.insert(format!("ansible_{key}"), value.clone());
+            merged.insert(
+                Value::String(key.strip_prefix("ansible_").unwrap_or(key).to_owned()),
+                value.clone(),
+            );
+            context.insert(key.clone(), value.clone());
         }
+        context.insert("ansible_facts".to_string(), Value::Mapping(merged));
         Ok(())
     }
 
@@ -622,6 +899,8 @@ mod tests {
             handlers: Vec::new(),
             vars: Mapping::new(),
             environment: Mapping::new(),
+            vars_files: Vec::new(),
+            source_file: None,
             become_override: None,
             is_become: false,
             become_user: "root".to_string(),
@@ -629,6 +908,8 @@ mod tests {
             fail_fast: false,
             connection: None,
             gather_facts: false,
+            gather_subset: None,
+            gather_timeout: None,
             tags: Vec::new(),
         }
     }

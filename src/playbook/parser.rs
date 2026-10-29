@@ -90,6 +90,7 @@ pub fn parse_playbook(playbook_path: &str) -> Result<Playbook> {
         .canonicalize()
         .context("Cannot resolve playbook source path")?;
     for play in &mut plays {
+        play.source_file = Some(source.clone());
         for task in play
             .tasks
             .iter_mut()
@@ -105,6 +106,7 @@ pub fn parse_playbook(playbook_path: &str) -> Result<Playbook> {
 }
 
 const SUPPORTED_PLAY_KEYWORDS: &[&str] = &[
+    "vars_files",
     "name",
     "environment",
     "hosts",
@@ -116,6 +118,8 @@ const SUPPORTED_PLAY_KEYWORDS: &[&str] = &[
     "connection",
     "fail_fast",
     "gather_facts",
+    "gather_subset",
+    "gather_timeout",
 ];
 
 const UNSUPPORTED_PLAY_KEYWORDS: &[&str] = &[
@@ -129,8 +133,6 @@ const UNSUPPORTED_PLAY_KEYWORDS: &[&str] = &[
     "diff",
     "fact_path",
     "force_handlers",
-    "gather_subset",
-    "gather_timeout",
     "ignore_errors",
     "no_log",
     "max_fail_percentage",
@@ -147,7 +149,6 @@ const UNSUPPORTED_PLAY_KEYWORDS: &[&str] = &[
     "tags",
     "throttle",
     "timeout",
-    "vars_files",
     "vars_prompt",
 ];
 
@@ -249,6 +250,25 @@ fn parse_play(play_map: Mapping, ordinal: usize) -> Result<Play> {
     )?;
 
     let vars = parse_variables(play_map.get(Value::String("vars".to_string())), "Play vars")?;
+    let vars_files = match play_map.get(Value::String("vars_files".into())) {
+        None => Vec::new(),
+        Some(Value::String(path)) => vec![Value::String(path.clone())],
+        Some(Value::Sequence(paths)) => paths.clone(),
+        _ => bail!("Play vars_files must be a string or list"),
+    };
+    for entry in &vars_files {
+        let paths = entry
+            .as_sequence()
+            .map(Vec::as_slice)
+            .unwrap_or(std::slice::from_ref(entry));
+        if paths.is_empty()
+            || paths
+                .iter()
+                .any(|path| path.as_str().is_none_or(str::is_empty))
+        {
+            bail!("vars_files entries must be nonempty paths or fallback lists");
+        }
+    }
     let become_override = parse_optional_bool(&play_map, "become", "Play")?;
     let is_become = become_override.unwrap_or(false);
     let become_user_override = parse_optional_nonempty_string(&play_map, "become_user", "Play")?;
@@ -258,6 +278,24 @@ fn parse_play(play_map: Mapping, ordinal: usize) -> Result<Play> {
     let connection = parse_optional_nonempty_string(&play_map, "connection", "Play")?;
     let fail_fast = parse_optional_bool(&play_map, "fail_fast", "Play")?.unwrap_or(false);
     let gather_facts = parse_optional_bool(&play_map, "gather_facts", "Play")?.unwrap_or(true);
+    let gather_subset = play_map.get(Value::String("gather_subset".into())).cloned();
+    let gather_timeout = play_map
+        .get(Value::String("gather_timeout".into()))
+        .cloned();
+    if gather_subset.as_ref().is_some_and(|value| {
+        !value.is_string()
+            && !value
+                .as_sequence()
+                .is_some_and(|values| values.iter().all(Value::is_string))
+    }) {
+        bail!("Play gather_subset must be a string or list of strings");
+    }
+    if gather_timeout
+        .as_ref()
+        .is_some_and(|value| !value.is_string() && !value.is_number())
+    {
+        bail!("Play gather_timeout must be an integer or template");
+    }
 
     debug!(
         "Finished parsing play '{}' with {} tasks and {} handlers",
@@ -272,6 +310,8 @@ fn parse_play(play_map: Mapping, ordinal: usize) -> Result<Play> {
         tasks,
         handlers,
         vars,
+        vars_files,
+        source_file: None,
         environment: parse_environment(&play_map)?,
         become_override,
         is_become,
@@ -280,6 +320,8 @@ fn parse_play(play_map: Mapping, ordinal: usize) -> Result<Play> {
         fail_fast,
         connection,
         gather_facts,
+        gather_subset,
+        gather_timeout,
         tags: Vec::new(),
     })
 }
@@ -378,7 +420,7 @@ fn parse_task(task_map: Mapping, index: usize, kind: TaskKind) -> Result<Task> {
         bail!("Handler keyword 'register' is recognized but not supported");
     }
     if let Some(register) = &register {
-        validate_variable_name(register, "register")?;
+        crate::vars::validate_name(register, "register")?;
     }
 
     let when = task_map.get(Value::String("when".to_string())).cloned();
@@ -490,6 +532,9 @@ fn parse_module_args(module: &str, value: &Value) -> Result<(String, Mapping)> {
     let mut args = Mapping::new();
     match value {
         Value::Null => {}
+        Value::String(value) if normalized == "include_vars" => {
+            args.insert(Value::String("file".into()), Value::String(value.clone()));
+        }
         Value::String(value) if normalized == "meta" => {
             args.insert(Value::String("action".into()), Value::String(value.clone()));
         }
@@ -554,7 +599,7 @@ fn parse_variables(value: Option<&Value>, label: &str) -> Result<Mapping> {
         let Value::String(name) = key else {
             bail!("{} names must be strings", label);
         };
-        validate_variable_name(name, label)?;
+        crate::vars::validate_name(name, label)?;
     }
     Ok(variables.clone())
 }
@@ -601,19 +646,6 @@ fn parse_string_list(value: Option<&Value>, label: &str) -> Result<Vec<String>> 
             .collect(),
         Some(_) => bail!("{} must be a string or sequence of strings", label),
     }
-}
-
-fn validate_variable_name(name: &str, label: &str) -> Result<()> {
-    let mut characters = name.chars();
-    let valid_start = characters
-        .next()
-        .is_some_and(|character| character == '_' || character.is_ascii_alphabetic());
-    if !valid_start
-        || !characters.all(|character| character == '_' || character.is_ascii_alphanumeric())
-    {
-        bail!("{} contains invalid variable name '{}'", label, name);
-    }
-    Ok(())
 }
 
 fn validate_condition(condition: &Value, label: &str) -> Result<()> {
@@ -665,10 +697,10 @@ fn parse_loop_control(
     let loop_var = parse_optional_nonempty_string(control, "loop_var", "Task loop_control")?;
     let index_var = parse_optional_nonempty_string(control, "index_var", "Task loop_control")?;
     if let Some(name) = &loop_var {
-        validate_variable_name(name, "loop_var")?;
+        crate::vars::validate_name(name, "loop_var")?;
     }
     if let Some(name) = &index_var {
-        validate_variable_name(name, "index_var")?;
+        crate::vars::validate_name(name, "index_var")?;
     }
     Ok((loop_var, index_var))
 }

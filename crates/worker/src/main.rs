@@ -1,4 +1,5 @@
 mod accounts;
+mod facts;
 mod files;
 mod filesystem;
 mod http;
@@ -157,8 +158,20 @@ fn run() -> Result<()> {
         } else {
             None
         };
+        let timeout = if request.module == "setup" {
+            request.timeout_ms.min(
+                request
+                    .args
+                    .get("gather_timeout")
+                    .and_then(serde_yaml::Value::as_u64)
+                    .unwrap_or(10)
+                    .saturating_mul(1000),
+            )
+        } else {
+            request.timeout_ms
+        };
         let execution = supervisor::run(
-            Duration::from_millis(request.timeout_ms),
+            Duration::from_millis(timeout),
             request.managed,
             !matches!(request.module.as_str(), "setup" | "stat") && !request.check,
             !request.check && matches!(request.module.as_str(), "service" | "systemd" | "package"),

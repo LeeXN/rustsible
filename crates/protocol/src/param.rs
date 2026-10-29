@@ -89,3 +89,14 @@ pub fn validate_identity(value: &str) -> Result<()> {
     }
     Ok(())
 }
+pub fn validate_variable_name(name: &str, label: &str) -> anyhow::Result<()> {
+    let mut characters = name.chars();
+    if !characters
+        .next()
+        .is_some_and(|character| character == '_' || character.is_ascii_alphabetic())
+        || !characters.all(|character| character == '_' || character.is_ascii_alphanumeric())
+    {
+        anyhow::bail!("{label} contains invalid variable name '{name}'");
+    }
+    Ok(())
+}

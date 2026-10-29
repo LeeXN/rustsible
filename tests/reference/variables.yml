@@ -1,0 +1,44 @@
+- hosts: localhost
+  gather_facts: false
+  vars:
+    configuration: play
+  vars_files:
+    - [missing.yml, variables-data.yml]
+  tasks:
+    - set_fact:
+        later: target
+        accumulated: []
+    - include_vars:
+        file: variables-data.yml
+        name: loaded
+    - set_fact:
+        accumulated: '{{ accumulated + [item] }}'
+      loop: '{{ loaded.sequence }}'
+    - set_fact:
+        qualified: []
+    - set_fact:
+        qualified: '{{ hostvars[inventory_hostname].qualified + [item] }}'
+      loop: [1, 2]
+    - command: /bin/true
+      register: probe
+      until: probe is mapping
+      changed_when: probe is mapping
+      retries: 1
+      delay: 0
+      notify: current_result
+    - copy:
+        content: '{{ configuration }}|{{ loaded.configuration }}|{{ accumulated | join(",") }}|{{ qualified | join(",") }}|{{ delayed }}|{{ number }}|{{ groups.all | join(",") }}|{{ group_names | join(",") }}'
+        dest: '@OUTPUT@/variables'
+      vars:
+        configuration: task
+  handlers:
+    - name: current_result
+      copy:
+        content: notified
+        dest: '@OUTPUT@/condition'
+- hosts: localhost
+  gather_facts: false
+  tasks:
+    - copy:
+        content: '{{ loaded.delayed }}|{{ hostvars.localhost.accumulated | join(",") }}|{{ probe }}'
+        dest: '@OUTPUT@/persistent'

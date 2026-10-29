@@ -1,5 +1,25 @@
 use anyhow::{bail, Context, Result};
 use serde_yaml::Value;
+pub const SETUP_SUBSETS: &[&str] = &[
+    "all",
+    "min",
+    "platform",
+    "distribution",
+    "network",
+    "architecture",
+    "system",
+    "kernel",
+    "machine",
+    "distribution_version",
+    "distribution_major_version",
+    "distribution_release",
+    "os_family",
+    "date_time",
+    "interfaces",
+    "all_ipv4_addresses",
+    "all_ipv6_addresses",
+    "default_ipv4",
+];
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CheckSupport {
     ReadOnly,
@@ -14,6 +34,8 @@ pub enum Builtin {
     Shell,
     Debug,
     Meta,
+    SetFact,
+    IncludeVars,
     Copy,
     File,
     Template,
@@ -28,11 +50,13 @@ pub enum Builtin {
 }
 
 impl Builtin {
-    pub const ALL: [Self; 15] = [
+    pub const ALL: [Self; 17] = [
         Self::Command,
         Self::Shell,
         Self::Debug,
         Self::Meta,
+        Self::SetFact,
+        Self::IncludeVars,
         Self::Copy,
         Self::File,
         Self::Template,
@@ -64,6 +88,8 @@ impl Builtin {
             Self::Shell => "shell",
             Self::Debug => "debug",
             Self::Meta => "meta",
+            Self::SetFact => "set_fact",
+            Self::IncludeVars => "include_vars",
             Self::Copy => "copy",
             Self::File => "file",
             Self::Template => "template",
@@ -79,7 +105,12 @@ impl Builtin {
     }
     pub fn check_support(self) -> CheckSupport {
         match self {
-            Self::Debug | Self::Meta | Self::Setup | Self::Stat => CheckSupport::ReadOnly,
+            Self::Debug
+            | Self::Meta
+            | Self::SetFact
+            | Self::IncludeVars
+            | Self::Setup
+            | Self::Stat => CheckSupport::ReadOnly,
             _ => CheckSupport::Predict,
         }
     }
@@ -107,6 +138,8 @@ impl Builtin {
             ],
             Self::Debug => &["msg", "var", "_var_value"],
             Self::Meta => &["action"],
+            Self::SetFact => &[],
+            Self::IncludeVars => &["file", "dir", "name"],
             Self::Copy => &["src", "content", "dest", "mode", "owner", "group", "force"],
             Self::File => &["path", "dest", "state", "src", "mode", "owner", "group"],
             Self::Template => &["src", "content", "dest", "mode", "owner", "group", "vars"],
@@ -141,7 +174,7 @@ impl Builtin {
             ],
             Self::Service => &["name", "state", "enabled"],
             Self::Systemd => &["name", "state", "enabled", "daemon_reload"],
-            Self::Setup => &[],
+            Self::Setup => &["gather_subset", "filter", "gather_timeout"],
             Self::Stat => &["path", "checksum_algorithm"],
             Self::GetUrl => &["url", "dest", "owner", "group", "mode", "force", "checksum"],
             Self::Package => &["name", "state", "update_cache"],
@@ -151,6 +184,25 @@ impl Builtin {
     /// Shared structural/type validation also runs in direct module APIs,
     /// before an implementation can perform its first state change.
     pub fn validate_parameters(self, args: &Value) -> Result<()> {
+        if self == Self::SetFact {
+            let mapping = args
+                .as_mapping()
+                .context("set_fact requires a variable mapping")?;
+            if mapping.is_empty() || mapping.keys().all(|key| key.as_str() == Some("cacheable")) {
+                bail!("set_fact requires at least one variable");
+            }
+            for (name, value) in mapping {
+                let name = name.as_str().context("set_fact names must be strings")?;
+                if name == "cacheable" {
+                    if value.as_bool() != Some(false) {
+                        bail!("Persistent fact caching is not supported; cacheable must be false");
+                    }
+                } else {
+                    crate::param::validate_variable_name(name, "set_fact")?;
+                }
+            }
+            return Ok(());
+        }
         if matches!(self, Self::Command | Self::Shell) {
             crate::CommandArgs::parse(args, self == Self::Shell)?;
             return Ok(());
@@ -164,6 +216,15 @@ impl Builtin {
                 .as_str()
                 .context("Module parameter names must be strings")?;
             let valid = match key {
+                "gather_subset" | "filter" if self == Self::Setup => {
+                    value.is_string()
+                        || value
+                            .as_sequence()
+                            .is_some_and(|values| values.iter().all(Value::is_string))
+                }
+                "gather_timeout" if self == Self::Setup => value
+                    .as_u64()
+                    .is_some_and(|value| (1..=604800).contains(&value)),
                 "msg" | "var" | "_var_value" if self == Self::Debug => true,
                 "vars" => value.is_mapping(),
                 "force" | "enabled" | "daemon_reload" | "backup" | "create" | "append"
@@ -201,6 +262,19 @@ impl Builtin {
             Ok(())
         };
         match self {
+            Self::IncludeVars => {
+                if args.get("file").is_some() == args.get("dir").is_some() {
+                    bail!("include_vars requires exactly one of file or dir");
+                }
+                required(if args.get("file").is_some() {
+                    "file"
+                } else {
+                    "dir"
+                })?;
+                if let Some(name) = string("name") {
+                    crate::param::validate_variable_name(name, "include_vars name")?;
+                }
+            }
             Self::Meta => {
                 if string("action") != Some("reset_connection") {
                     bail!("Only meta action reset_connection is currently supported");
@@ -280,6 +354,34 @@ impl Builtin {
         }
         if self == Self::Stat {
             crate::param::digest_hex_length(string("checksum_algorithm").unwrap_or("sha1"))?;
+        }
+        if self == Self::Setup {
+            if let Some(filters) = args.get("filter").and_then(Value::as_sequence) {
+                if filters
+                    .iter()
+                    .filter_map(Value::as_str)
+                    .any(|value| value.contains('\0'))
+                {
+                    bail!("Fact filters cannot contain NUL bytes");
+                }
+            }
+            if let Some(subsets) = args.get("gather_subset") {
+                let names = if let Some(value) = subsets.as_str() {
+                    value.split(',').collect::<Vec<_>>()
+                } else {
+                    subsets
+                        .as_sequence()
+                        .context("gather_subset requires strings")?
+                        .iter()
+                        .filter_map(Value::as_str)
+                        .collect()
+                };
+                for name in names {
+                    if !SETUP_SUBSETS.contains(&name.strip_prefix('!').unwrap_or(name)) {
+                        bail!("Unsupported native facts subset: {name}");
+                    }
+                }
+            }
         }
         if self == Self::GetUrl {
             if let Some(checksum) = string("checksum") {

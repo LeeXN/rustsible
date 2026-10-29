@@ -109,6 +109,10 @@ if [[ $mode == controls ]]; then
     source "$repo_dir/tests/ssh/controls.sh"
     exit 0
 fi
+if [[ $mode == variables ]]; then
+    source "$repo_dir/tests/ssh/variables.sh"
+    exit 0
+fi
 cat > "$fixture_dir/playbook.yml" <<'EOF'
 - hosts: all
   become: false

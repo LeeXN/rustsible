@@ -43,6 +43,21 @@ mkdir "$fixture_dir/execution-output"
 "$binary" playbook -i "$fixture_dir/inventory" "$fixture_dir/execution.yml" > "$fixture_dir/native-execution.log" 2>&1
 diff -r "$fixture_dir/reference-execution" "$fixture_dir/execution-output"
 [[ ! -e $fixture_dir/execution-output/should-not-exist ]]
+mkdir "$fixture_dir/facts-output"
+sed "s|@OUTPUT@|$fixture_dir/facts-output|g" "$repo_dir/tests/reference/facts.yml" > "$fixture_dir/facts.yml"
+uv tool run --from ansible-core==2.21.0 ansible-playbook -i "$fixture_dir/inventory" "$fixture_dir/facts.yml" > "$fixture_dir/reference-facts.log" 2>&1
+mv "$fixture_dir/facts-output" "$fixture_dir/reference-facts"
+mkdir "$fixture_dir/facts-output"
+"$binary" playbook -i "$fixture_dir/inventory" "$fixture_dir/facts.yml" > "$fixture_dir/native-facts.log" 2>&1
+diff -r "$fixture_dir/reference-facts" "$fixture_dir/facts-output"
+cp "$repo_dir/tests/reference/variables-data.yml" "$fixture_dir/variables-data.yml"
+mkdir "$fixture_dir/variables-output"
+sed "s|@OUTPUT@|$fixture_dir/variables-output|g" "$repo_dir/tests/reference/variables.yml" > "$fixture_dir/variables.yml"
+uv tool run --from ansible-core==2.21.0 ansible-playbook -i "$fixture_dir/inventory" "$fixture_dir/variables.yml" -e configuration=extra -e item=extra -e probe=extra > "$fixture_dir/reference-variables.log" 2>&1
+mv "$fixture_dir/variables-output" "$fixture_dir/reference-variables"
+mkdir "$fixture_dir/variables-output"
+"$binary" playbook -i "$fixture_dir/inventory" "$fixture_dir/variables.yml" -e configuration=extra -e item=extra -e probe=extra > "$fixture_dir/native-variables.log" 2>&1
+diff -r "$fixture_dir/reference-variables" "$fixture_dir/variables-output"
 if uv tool run --from ansible-core==2.21.0 ansible-playbook \
     -i "$fixture_dir/inventory" "$fixture_dir/non_boolean.yml" > "$fixture_dir/reference-condition.log" 2>&1; then
     echo 'Reference unexpectedly accepted a string condition' >&2; exit 1
@@ -51,4 +66,4 @@ if "$binary" playbook -i "$fixture_dir/inventory" "$fixture_dir/non_boolean.yml"
     echo 'Rustsible unexpectedly accepted a string condition' >&2; exit 1
 fi
 [[ ! -e $fixture_dir/result/unsafe-condition ]]
-printf 'Ansible 2.21.0 comparison passed: templates/types, native files, retry counts/exhaustion, loop registration, result conditions, handler deduplication, environment, command stdin/chdir and check prediction\n'
+printf 'Ansible 2.21.0 comparison passed: templates/types, native files, retries/conditions, environment, command prediction, fact names/fields/filtering, variable sources and host scope\n'

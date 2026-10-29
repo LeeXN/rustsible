@@ -6,12 +6,14 @@ mod task;
 pub(crate) mod templar;
 
 use crate::inventory::Inventory;
-use anyhow::Result;
+use anyhow::{Context, Result};
 use log::{debug, error, info};
 use std::collections::HashSet;
 
 pub use handlers::Handler;
 pub use play::Play;
+pub(crate) use play::RunState;
+pub(crate) use task::render_module_arguments;
 pub use task::{Task, TaskResult};
 
 /// Options that affect a complete playbook execution.
@@ -24,6 +26,8 @@ pub struct ExecutionOptions {
     pub check_mode: bool,
     pub forks: usize,
     pub worker_dir: Option<std::path::PathBuf>,
+    pub extra_vars: Vec<String>,
+    pub config_file: Option<std::path::PathBuf>,
 }
 
 impl Default for ExecutionOptions {
@@ -33,6 +37,8 @@ impl Default for ExecutionOptions {
             check_mode: false,
             forks: 5,
             worker_dir: None,
+            extra_vars: Vec::new(),
+            config_file: None,
         }
     }
 }
@@ -49,6 +55,12 @@ pub fn execute_with_options(
     info!("Loading playbook from file: {}", playbook_file);
 
     let playbook = parser::parse_playbook(playbook_file)?;
+    let mut inventory = inventory.clone();
+    let playbook_source = std::path::Path::new(playbook_file).canonicalize()?;
+    if inventory.source.as_ref().and_then(|path| path.parent()) != playbook_source.parent() {
+        inventory
+            .load_variable_files(playbook_source.parent().expect("Canonical playbook parent"))?;
+    }
     info!("Playbook contains {} plays", playbook.plays.len());
 
     let limited_hosts: Option<HashSet<String>> = options.limit.as_deref().map(|pattern| {
@@ -71,6 +83,12 @@ pub fn execute_with_options(
     let mut failures = Vec::new();
     let mut state = play::RunState::default();
     state.workers = crate::worker::Runtime::new(options.worker_dir.clone());
+    state.extra = std::sync::Arc::new(crate::vars::extra(&options.extra_vars)?);
+    state.prepare(
+        &inventory,
+        playbook_source.parent().context("Playbook has no parent")?,
+        options.config_file.as_deref(),
+    )?;
 
     for (index, play) in playbook.plays.iter().enumerate() {
         info!(

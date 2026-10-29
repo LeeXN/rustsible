@@ -62,7 +62,10 @@ impl Invocation {
             && self.args.get("removes").is_none()
     }
     pub fn needs_connection(&self) -> bool {
-        self.module != Builtin::Debug && !self.skip_check()
+        !matches!(
+            self.module,
+            Builtin::Debug | Builtin::SetFact | Builtin::IncludeVars
+        ) && !self.skip_check()
     }
     pub(crate) fn execute(
         mut self,
@@ -85,6 +88,21 @@ impl Invocation {
         let result = (|| {
             if self.module == Builtin::Debug {
                 return super::debug::execute_without_connection(&self.args);
+            }
+            if self.module == Builtin::IncludeVars {
+                return crate::vars::include(&self.args);
+            }
+            if self.module == Builtin::SetFact {
+                let mut facts = self
+                    .args
+                    .as_mapping()
+                    .context("set_fact requires a mapping")?
+                    .clone();
+                facts.remove(Value::String("cacheable".into()));
+                return Ok(ModuleResult {
+                    values: HashMap::from([("ansible_facts".into(), Value::Mapping(facts))]),
+                    ..Default::default()
+                });
             }
             let config = config.context("Target module needs a connection configuration")?;
             if self.module == Builtin::Meta {
