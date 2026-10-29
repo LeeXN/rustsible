@@ -49,10 +49,12 @@ struct Directory {
 }
 fn safe(file: &File, directory: bool, mode: u32) -> Result<()> {
     let metadata = file.metadata()?;
+    // Atomic status replacement can unlink an already pinned, immutable
+    // snapshot. Zero links is safe; multiple links still expose private state.
     if metadata.uid() != unsafe { libc::geteuid() }
         || metadata.mode() & 0o7777 != mode
         || metadata.is_dir() != directory
-        || (!directory && (!metadata.is_file() || metadata.nlink() != 1))
+        || (!directory && (!metadata.is_file() || metadata.nlink() > 1))
     {
         bail!("Unsafe async state ownership, permissions or file type");
     }
@@ -527,4 +529,42 @@ pub fn status(args: &Value, check: bool) -> Result<ModuleResult> {
         .values
         .extend(job.metadata(state.started, state.finished));
     Ok(result)
+}
+
+#[cfg(test)]
+mod snapshot_tests {
+    use super::*;
+    use std::io::{Seek, Write};
+    #[test]
+    fn replaced_state_snapshot_remains_readable_without_allowing_exposed_links() -> Result<()> {
+        let directory = tempfile::tempdir()?;
+        let path = directory.path().join("status.json");
+        let mut original = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&path)?;
+        original.write_all(b"old complete state")?;
+        original.rewind()?;
+        let replacement = directory.path().join("replacement");
+        let mut next = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&replacement)?;
+        next.write_all(b"new complete state")?;
+        fs::rename(&replacement, &path)?;
+        assert_eq!(original.metadata()?.nlink(), 0);
+        safe(&original, false, 0o600)?;
+        let mut old = String::new();
+        original.read_to_string(&mut old)?;
+        assert_eq!(old, "old complete state");
+        assert_eq!(fs::read_to_string(&path)?, "new complete state");
+        fs::hard_link(&path, directory.path().join("exposed"))?;
+        assert!(safe(&File::open(&path)?, false, 0o600).is_err());
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o644))?;
+        assert!(safe(&File::open(&path)?, false, 0o600).is_err());
+        Ok(())
+    }
 }
