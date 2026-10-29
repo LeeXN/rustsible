@@ -630,7 +630,7 @@ impl Loader<'_> {
                         for key in mapping.keys().filter_map(Value::as_str) {
                             if !matches!(
                                 short_name(key),
-                                "import_playbook" | "vars" | "name" | "when"
+                                "import_playbook" | "vars" | "name" | "when" | "tags"
                             ) {
                                 bail!("Unsupported import_playbook keyword: {key}");
                             }
@@ -646,6 +646,10 @@ impl Loader<'_> {
                             &source,
                         )?;
                         let mut imported = self.playbook(&file, &variables)?;
+                        let tags = super::tags::parse(mapping.get(Value::String("tags".into())))?;
+                        for play in &mut imported {
+                            play.tags.extend(tags.clone());
+                        }
                         if let Some(condition) = mapping.get(Value::String("when".into())) {
                             validate_condition(condition, "import_playbook when")?;
                             let mut parent = flush_task();
@@ -841,6 +845,7 @@ const SUPPORTED_PLAY_KEYWORDS: &[&str] = &[
     "gather_facts",
     "gather_subset",
     "gather_timeout",
+    "tags",
 ];
 
 const UNSUPPORTED_PLAY_KEYWORDS: &[&str] = &[
@@ -856,7 +861,6 @@ const UNSUPPORTED_PLAY_KEYWORDS: &[&str] = &[
     "order",
     "port",
     "remote_user",
-    "tags",
     "timeout",
     "vars_prompt",
 ];
@@ -892,6 +896,7 @@ const SUPPORTED_TASK_KEYWORDS: &[&str] = &[
     "with_items",
     "loop",
     "loop_control",
+    "tags",
 ];
 
 const UNSUPPORTED_TASK_KEYWORDS: &[&str] = &[
@@ -909,7 +914,6 @@ const UNSUPPORTED_TASK_KEYWORDS: &[&str] = &[
     "port",
     "remote_user",
     "rescue",
-    "tags",
 ];
 
 #[derive(Clone, Copy)]
@@ -1109,7 +1113,7 @@ impl Loader<'_> {
             import_condition: None,
             gather_subset,
             gather_timeout,
-            tags: Vec::new(),
+            tags: super::tags::parse(play_map.get(Value::String("tags".into())))?,
         };
         play.validate_strategy()?;
         Ok(play)
@@ -1337,6 +1341,7 @@ fn parse_task(task_map: Mapping, index: usize, kind: TaskKind) -> Result<Task> {
                     | "register"
                     | "run_once"
                     | "timeout"
+                    | "tags"
                     | "vars"
                     | "when"
             ) {
@@ -1463,7 +1468,7 @@ fn parse_task_parts(
         ignore_unreachable,
         no_log,
         vars,
-        tags: Vec::new(),
+        tags: super::tags::parse(task_map.get(Value::String("tags".into())))?,
         loop_items,
         loop_var_name,
         index_var_name,
@@ -2076,17 +2081,12 @@ mod tests {
     }
 
     #[test]
-    fn tags_are_rejected_until_tag_selection_is_implemented() {
-        for content in [
-            "---\n- hosts: all\n  tags: deploy\n  tasks: []\n",
-            "---\n- hosts: all\n  tasks:\n    - command: true\n      tags: deploy\n",
-        ] {
-            let temp_file = create_temp_playbook(content);
-            let error =
-                parse_playbook(temp_file.path().to_str().unwrap(), &ParseOptions::default())
-                    .unwrap_err();
-            assert!(format!("{error:?}").contains("recognized but not supported"));
-        }
+    fn tags_parse_for_plays_and_tasks() {
+        let source = create_temp_playbook("- hosts: all\n  tags: deploy\n  tasks:\n    - debug: {msg: selected}\n      tags: [config]\n");
+        let playbook =
+            parse_playbook(source.path().to_str().unwrap(), &ParseOptions::default()).unwrap();
+        assert_eq!(playbook.plays[0].tags, ["deploy"]);
+        assert_eq!(playbook.plays[0].tasks[0].tags, ["config"]);
     }
 
     #[test]

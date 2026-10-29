@@ -51,8 +51,7 @@ pub struct Play {
     pub import_condition: Option<Value>,
     pub gather_subset: Option<Value>,
     pub gather_timeout: Option<Value>,
-    #[allow(dead_code)]
-    pub tags: Vec<String>, // Keep this for future use
+    pub tags: Vec<String>,
 }
 
 #[derive(Debug, Default, Clone)]
@@ -107,6 +106,7 @@ struct BlockFrame {
 #[derive(Default)]
 pub(crate) struct RunState {
     pub(crate) workers: std::sync::Arc<crate::worker::Runtime>,
+    pub(crate) tags: std::sync::Arc<super::TagSelection>,
     pub(crate) extra: std::sync::Arc<HashMap<String, Value>>,
     globals: std::sync::Arc<HashMap<String, Value>>,
     host_state: std::sync::Arc<std::sync::Mutex<HostState>>,
@@ -198,6 +198,7 @@ impl RunState {
     fn fork_for(&self, host: &str) -> Self {
         Self {
             workers: self.workers.clone(),
+            tags: self.tags.clone(),
             extra: self.extra.clone(),
             globals: self.globals.clone(),
             host_state: self.host_state.clone(),
@@ -317,6 +318,20 @@ impl RunState {
         let mut globals = (*self.globals).clone();
         globals.insert("hostvars".into(), self.hostvars()?);
         Ok(std::sync::Arc::new(globals))
+    }
+    pub(crate) fn scope_for(
+        &self,
+        host: &str,
+        globals: &std::sync::Arc<HashMap<String, Value>>,
+    ) -> Result<RuntimeVariables> {
+        let mut scope = self
+            .host_state()?
+            .contexts
+            .get(host)
+            .context("Missing host scope")?
+            .clone();
+        scope.globals = globals.clone();
+        Ok(scope)
     }
     pub(crate) fn variables_for(
         &self,
@@ -821,7 +836,11 @@ impl Play {
                 ignore_unreachable: None,
                 no_log: None,
                 vars: Mapping::new(),
-                tags: Vec::new(),
+                tags: if self.tags.is_empty() {
+                    vec!["always".into()]
+                } else {
+                    self.tags.clone()
+                },
                 loop_items: None,
                 loop_var_name: None,
                 index_var_name: None,
@@ -889,8 +908,6 @@ impl Play {
         status: &mut PlayStatus<'_>,
     ) -> Result<()> {
         let hosts = status.hosts;
-        let check_mode = options.check_mode;
-        let forks = options.forks;
         let mut pending = tasks
             .into_iter()
             .map(|task| Scheduled::Task(Box::new(task), members.clone(), false))
@@ -924,7 +941,6 @@ impl Play {
                             {
                                 continue;
                             }
-                            let errors = status.failures.remove(host).expect("Observed failure");
                             let last = errors.last().expect("Nonempty failures");
                             if !last.fatal_peer {
                                 status.fatal_peers.remove(host);
@@ -952,6 +968,20 @@ impl Play {
                                     ])),
                                 );
                             }
+                            if status.flushing == 0 {
+                                let origin = hosts
+                                    .iter()
+                                    .find(|candidate| candidate.name == *host)
+                                    .context("Missing rescue host")?;
+                                let mut selected = false;
+                                for task in &frame.rescue {
+                                    selected |= self.task_selected(task, origin, state)?;
+                                }
+                                if !selected {
+                                    continue;
+                                }
+                            }
+                            let errors = status.failures.remove(host).expect("Observed failure");
                             let stats = status
                                 .stats
                                 .get_mut(host)
@@ -1036,18 +1066,7 @@ impl Play {
                     .filter(|host| status.active_hosts.contains(*host))
                     .cloned()
                     .collect::<HashSet<_>>();
-                let bind = |tasks: &[Task]| {
-                    tasks
-                        .iter()
-                        .cloned()
-                        .map(|mut child| {
-                            if let Some(parent) = &task.raw().parent {
-                                child.inherit(parent);
-                            }
-                            child
-                        })
-                        .collect::<Vec<_>>()
-                };
+                let bind = |tasks: &[Task]| task.bind_children(tasks);
                 let frame = std::rc::Rc::new(std::cell::RefCell::new(BlockFrame {
                     members: members.clone(),
                     rescue: bind(&group.rescue),
@@ -1107,6 +1126,13 @@ impl Play {
                 }
                 continue;
             }
+            if status.flushing == 0 {
+                let mut tags = task.effective().tags;
+                tags.extend(self.tags.clone());
+                if state.tags.literal(&tags) == Some(false) {
+                    continue;
+                }
+            }
             let mut expansions = Vec::<(Vec<Task>, Vec<Handler>, HashSet<String>)>::new();
             let mut expansion_keys = HashMap::<String, usize>::new();
             if status.active_hosts.is_empty() {
@@ -1143,12 +1169,15 @@ impl Play {
                 task,
                 runnable_hosts,
                 state,
+                status.flushing > 0,
                 &status.definitions,
-                check_mode,
-                forks,
+                options,
             );
 
             for (host, effective_task, task_result) in task_results {
+                if task_result.as_ref().is_ok_and(|result| result.filtered) {
+                    continue;
+                }
                 let mut result = match task_result {
                     Ok(result) => result,
                     Err(error) => {
@@ -1631,10 +1660,12 @@ impl Play {
         task: &Task,
         hosts: Vec<&'a Host>,
         state: &RunState,
+        handler: bool,
         definitions: &HashMap<String, HashMap<String, Value>>,
-        check_mode: bool,
-        forks: usize,
+        options: &crate::playbook::ExecutionOptions,
     ) -> Vec<(&'a Host, Task, Result<TaskResult>)> {
+        let check_mode = options.check_mode;
+        let forks = options.forks;
         let runtime = &state.workers;
         let globals = state.variable_globals();
         let Some(first) = hosts.first() else {
@@ -1693,6 +1724,7 @@ impl Play {
                             check_mode,
                             &crate::playbook::task::TaskExecution {
                                 workers: runtime,
+                                tags: (!handler).then_some(state.tags.as_ref()),
                                 delegation: Some(Delegation { play, state }),
                             },
                         )
@@ -1756,8 +1788,34 @@ impl Play {
         results
     }
 
-    fn apply_play_settings(&self, task: &Task, host: &Host) -> Task {
+    pub(crate) fn task_selected(&self, task: &Task, host: &Host, state: &RunState) -> Result<bool> {
+        if let Some(group) = &task.group {
+            for tasks in [&group.tasks, &group.rescue, &group.always] {
+                for child in task.bind_children(tasks) {
+                    if self.task_selected(&child, host, state)? {
+                        return Ok(true);
+                    }
+                }
+            }
+            return Ok(false);
+        }
+        let task = self.apply_play_settings(task, host);
+        if let Some(value) = state.tags.literal(&task.tags) {
+            return Ok(value);
+        }
+        let globals = state.variable_globals()?;
+        let runtime = state.scope_for(&host.name, &globals)?;
+        let definitions = host.inventory_variables();
+        let variables = self.variables_for_host(&runtime, &definitions, true)?;
+        let (definitions, data) = task.variable_layers(host, &runtime, &definitions, &variables)?;
+        state.tags.selected(
+            &task.tags,
+            &crate::playbook::templar::resolve_definitions(&definitions, &data)?,
+        )
+    }
+    pub(crate) fn apply_play_settings(&self, task: &Task, host: &Host) -> Task {
         let mut effective_task = task.effective();
+        effective_task.tags.extend(self.tags.clone());
         effective_task.ignore_errors = effective_task.ignore_errors.or(self.ignore_errors);
         effective_task.ignore_unreachable = effective_task
             .ignore_unreachable
@@ -1794,7 +1852,7 @@ impl Play {
         effective_task
     }
 
-    fn variables_for_host(
+    pub(crate) fn variables_for_host(
         &self,
         runtime: &RuntimeVariables,
         definitions: &HashMap<String, Value>,

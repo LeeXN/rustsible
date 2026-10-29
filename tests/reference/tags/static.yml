@@ -1,0 +1,2 @@
+- copy: {content: selected, dest: '{{ out }}/static'}
+  notify: finish

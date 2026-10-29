@@ -9,11 +9,17 @@ fn main() -> Result<()> {
     // Delay logger initialization until after parsing arguments
     let app = cli::build_cli();
     let matches = app.get_matches();
-    let config = rustsible::config::Config::load(
+    let mut config = rustsible::config::Config::load(
         matches
             .get_one::<std::path::PathBuf>("config")
             .map(std::path::PathBuf::as_path),
     )?;
+
+    if let Some((_, sub)) = matches.subcommand() {
+        if let Ok(Some(path)) = sub.try_get_one::<std::path::PathBuf>("private-key") {
+            config.set_private_key(path)?;
+        }
+    }
 
     // Set log level based on the number of verbose flags
     let log_level = match matches.subcommand() {
@@ -66,13 +72,48 @@ fn main() -> Result<()> {
                     .map(|values| values.cloned().collect())
                     .unwrap_or_default(),
                 check_mode: sub_matches.get_flag("check"),
+                diff: sub_matches.get_flag("diff"),
+                credentials: if sub_matches.get_flag("syntax-check")
+                    || sub_matches.get_flag("list-hosts")
+                    || sub_matches.get_flag("list-tasks")
+                {
+                    Default::default()
+                } else {
+                    credentials(sub_matches)?
+                },
+                tags: playbook::TagSelection::new(
+                    &sub_matches
+                        .get_many::<String>("tags")
+                        .map(|values| values.cloned().collect::<Vec<_>>())
+                        .unwrap_or_default(),
+                    &sub_matches
+                        .get_many::<String>("skip-tags")
+                        .map(|values| values.cloned().collect::<Vec<_>>())
+                        .unwrap_or_default(),
+                ),
                 forks,
                 worker_dir: sub_matches
                     .get_one::<std::path::PathBuf>("worker-dir")
                     .cloned()
                     .or_else(|| config.worker_dir.clone()),
             };
-            let result = playbook::execute_with_options(playbook_file, &inventory, &options);
+            let inspection = if sub_matches.get_flag("syntax-check") {
+                Some(playbook::Inspection::Syntax)
+            } else if sub_matches.get_flag("list-hosts") {
+                Some(playbook::Inspection::Hosts)
+            } else if sub_matches.get_flag("list-tasks") {
+                Some(playbook::Inspection::Tasks)
+            } else {
+                None
+            };
+            let result = if let Some(mode) = inspection {
+                playbook::inspect(playbook_file, &inventory, &options, mode).and_then(|report| {
+                    println!("{}", serde_json::to_string_pretty(&report)?);
+                    Ok(())
+                })
+            } else {
+                playbook::execute_with_options(playbook_file, &inventory, &options)
+            };
 
             if let Err(e) = result {
                 eprintln!("Error executing playbook: {e:#}");
@@ -98,6 +139,7 @@ fn main() -> Result<()> {
 
             let forks = config.host_limit(sub_matches)?;
             let options = modules::AdHocOptions {
+                credentials: credentials(sub_matches)?,
                 inventory: Some(std::sync::Arc::new(inventory.clone())),
                 config_file: config.file.clone(),
                 // Omitting --become deliberately leaves the decision to each
@@ -112,6 +154,7 @@ fn main() -> Result<()> {
                 background: *sub_matches.get_one::<u64>("background").unwrap_or(&0),
                 poll: *sub_matches.get_one::<u64>("poll").unwrap_or(&15),
                 check_mode: sub_matches.get_flag("check"),
+                diff: sub_matches.get_flag("diff"),
                 forks,
                 worker_dir: sub_matches
                     .get_one::<std::path::PathBuf>("worker-dir")
@@ -214,6 +257,13 @@ fn required_cli_string<'a>(value: Option<&'a String>, description: &str) -> Resu
             description
         )
     })
+}
+
+fn credentials(matches: &clap::ArgMatches) -> Result<rustsible::ssh::credentials::Credentials> {
+    rustsible::ssh::credentials::Credentials::read(
+        matches.get_flag("ask-pass"),
+        matches.get_flag("ask-become-pass"),
+    )
 }
 
 #[cfg(test)]

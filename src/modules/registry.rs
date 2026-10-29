@@ -398,7 +398,10 @@ mod tests {
                 assert_eq!(Builtin::lookup(&name).unwrap(), module);
             }
             assert!(module.validate_capabilities(true, false, false).is_ok());
-            assert!(module.validate_capabilities(false, true, false).is_err());
+            assert_eq!(
+                module.validate_capabilities(false, true, false).is_ok(),
+                module.supports_diff()
+            );
         }
         assert!(Builtin::Command
             .validate_capabilities(false, false, true)

@@ -1176,3 +1176,54 @@ fn git_checkout_revision_update_dirty_rejection_and_check_are_observable() {
         .failed
     );
 }
+
+#[test]
+fn native_diff_predicts_text_limits_binary_and_large_data_and_keeps_force_false() {
+    let temporary = tempfile::tempdir().unwrap();
+    let path = temporary.path().join("diff");
+    fs::write(&path, b"before").unwrap();
+    let diff = |bytes: &[u8], check, force: bool| {
+        let mut request = request("copy", json!({"dest":path,"force":force}), check);
+        request.diff = true;
+        let (child, input) = start(request, Some(bytes), None);
+        finish(child, input)
+    };
+    let predicted = diff(b"after", true, true);
+    assert!(!predicted.failed && predicted.changed, "{}", predicted.msg);
+    assert_eq!(
+        predicted.values["diff"]["before"]["content"].as_str(),
+        Some("before")
+    );
+    assert_eq!(
+        predicted.values["diff"]["after"]["content"].as_str(),
+        Some("after")
+    );
+    assert_eq!(fs::read(&path).unwrap(), b"before");
+    assert!(!diff(b"ignored", false, false).values.contains_key("diff"));
+    assert_eq!(fs::read(&path).unwrap(), b"before");
+    let binary = diff(b"a\0b", false, true);
+    assert!(!binary.failed, "{}", binary.msg);
+    assert_eq!(
+        binary.values["diff"]["after"]["binary"].as_bool(),
+        Some(true)
+    );
+    assert!(binary.values["diff"]["after"].get("content").is_none());
+    assert_eq!(
+        binary.values["diff"]["after"]["sha256"]
+            .as_str()
+            .unwrap()
+            .len(),
+        64
+    );
+    let large = diff(&vec![b'x'; 70000], true, true);
+    assert!(!large.failed, "{}", large.msg);
+    assert!(large.values["diff"]["after"].get("content").is_none());
+    assert!(serde_json::to_vec(&large.values).unwrap().len() < 4096);
+    let mut request = request("file", json!({"path":path,"mode":"0600"}), false);
+    request.diff = true;
+    fs::set_permissions(&path, fs::Permissions::from_mode(0o0)).unwrap();
+    let (child, input) = start(request, None, None);
+    let repaired = finish(child, input);
+    assert!(!repaired.failed, "{}", repaired.msg);
+    assert_eq!(fs::metadata(&path).unwrap().mode() & 0o777, 0o600);
+}

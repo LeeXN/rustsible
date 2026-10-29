@@ -142,13 +142,25 @@ impl Builtin {
         }
     }
     pub fn validate_capabilities(self, _check: bool, diff: bool, asynchronous: bool) -> Result<()> {
-        if diff {
+        if diff && !self.supports_diff() {
             bail!("Module '{}' does not support diff", self.name());
         }
         if asynchronous && !self.supports_async() {
             bail!("Module '{}' does not support async", self.name());
         }
         Ok(())
+    }
+    pub fn supports_diff(self) -> bool {
+        matches!(
+            self,
+            Self::File
+                | Self::Copy
+                | Self::Template
+                | Self::Lineinfile
+                | Self::GetUrl
+                | Self::Git
+                | Self::Unarchive
+        )
     }
     pub fn supports_async(self) -> bool {
         matches!(

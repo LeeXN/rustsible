@@ -14,7 +14,8 @@ pub fn execute(
     payload: Option<&std::path::Path>,
 ) -> ModuleResult {
     let _changes = rustsible_protocol::change::ChangeScope::enter(request.check);
-    match run(request, scratch, payload) {
+    let before = crate::diff::before(request);
+    let mut result = match run(request, scratch, payload) {
         Ok(mut result) => {
             result.changed |= rustsible_protocol::change::known_changed();
             result
@@ -31,7 +32,9 @@ pub fn execute(
             result.msg = format!("{error:#}");
             result
         }
-    }
+    };
+    crate::diff::finish(request, payload, before, &mut result);
+    result
 }
 fn run(
     request: &Request,

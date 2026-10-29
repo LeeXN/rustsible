@@ -81,6 +81,10 @@ health_host/health_port/health_url 配成隔离服务；默认地址为
 `artifacts.yml` 展示固定 Git 版本和归档部署。将仓库、版本、目标路径和
 控制端归档改为隔离测试值；目标端需预装 Git，解包不调用 tar/unzip。
 
+`selection.yml` 可用 `--tags deploy` 选择部署任务，或 `--tags diagnostics`
+显式选择默认跳过的诊断任务。`--list-tasks`/`--list-hosts`/`--syntax-check`
+只读取控制端内容，输出 JSON；`--check --diff` 可预演支持的文件差异。
+
 ## 安全提示
 - 示例 inventory 只应放测试值，不要提交真实密码或私钥。
 - `package`、`service` 和 `user` 会调用目标系统工具，通常需要 `become`。

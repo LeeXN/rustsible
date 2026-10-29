@@ -1,0 +1,29 @@
+- hosts: localhost
+  gather_facts: false
+  vars:
+    chosen: [alpha]
+  roles:
+    - role: tagged
+      tags: alpha
+  tasks:
+    - import_tasks: static.yml
+      tags: alpha
+    - include_tasks: children.yml
+      tags: always
+    - include_tasks:
+        file: apply.yml
+        apply:
+          tags: alpha
+      tags: always
+    - block:
+        - copy: {content: selected, dest: '{{ out }}/block'}
+      tags: alpha
+    - copy: {content: selected, dest: '{{ out }}/templated'}
+      tags: '{{ chosen }}'
+    - copy: {content: selected, dest: '{{ out }}/untagged'}
+    - copy: {content: selected, dest: '{{ out }}/never'}
+      tags: never
+  handlers:
+    - name: finish
+      copy: {content: handled, dest: '{{ out }}/handled'}
+      tags: never

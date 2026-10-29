@@ -169,6 +169,29 @@ mkdir "$fixture_dir/artifact-output"
 "$binary" playbook -i "$fixture_dir/inventory" "$fixture_dir/artifacts.yml" > "$fixture_dir/native-artifacts.log" 2>&1
 diff -r --exclude=.git "$fixture_dir/reference-artifacts" "$fixture_dir/artifact-output"
 [[ $(stat -c %a "$fixture_dir/artifact-output/files/tool") == 755 ]]
+cp -a "$repo_dir/tests/reference/tags" "$fixture_dir/tags"
+for selection in alpha never tagged untagged all; do
+    mkdir "$fixture_dir/tags-output"
+    selection_options=(--tags "$selection")
+    if [[ $selection == all ]]; then selection_options+=(--skip-tags alpha); fi
+    uv tool run --from ansible-core==2.21.0 ansible-playbook -i "$fixture_dir/inventory" "$fixture_dir/tags/main.yml" -e "out=$fixture_dir/tags-output" "${selection_options[@]}" > "$fixture_dir/reference-tags-$selection.log" 2>&1
+    mv "$fixture_dir/tags-output" "$fixture_dir/reference-tags-$selection"
+    mkdir "$fixture_dir/tags-output"
+    "$binary" playbook -i "$fixture_dir/inventory" "$fixture_dir/tags/main.yml" -e "out=$fixture_dir/tags-output" "${selection_options[@]}" > "$fixture_dir/native-tags-$selection.log" 2>&1
+    diff -r "$fixture_dir/reference-tags-$selection" "$fixture_dir/tags-output"
+    mv "$fixture_dir/tags-output" "$fixture_dir/native-tags-$selection"
+done
+mkdir "$fixture_dir/tags-output"
+if uv tool run --from ansible-core==2.21.0 ansible-playbook -i "$fixture_dir/inventory" "$fixture_dir/tags/failure.yml" -e "out=$fixture_dir/tags-output" --tags alpha > "$fixture_dir/reference-tags-failure.log" 2>&1; then echo 'Reference incorrectly cleared a tag-filtered rescue failure' >&2; exit 1; fi
+mv "$fixture_dir/tags-output" "$fixture_dir/reference-tags-failure"
+mkdir "$fixture_dir/tags-output"
+if "$binary" playbook -i "$fixture_dir/inventory" "$fixture_dir/tags/failure.yml" -e "out=$fixture_dir/tags-output" --tags alpha > "$fixture_dir/native-tags-failure.log" 2>&1; then echo 'Native executor incorrectly cleared a tag-filtered rescue failure' >&2; exit 1; fi
+diff -r "$fixture_dir/reference-tags-failure" "$fixture_dir/tags-output"
+[[ ! -e $fixture_dir/tags-output/rescued && ! -e $fixture_dir/tags-output/after ]]
+uv tool run --from ansible-core==2.21.0 ansible-playbook -i "$fixture_dir/inventory" "$fixture_dir/tags/import.yml" -e "out=$fixture_dir/tags-output" --tags alpha > "$fixture_dir/reference-import-tags.log" 2>&1
+mv "$fixture_dir/tags-output/imported" "$fixture_dir/reference-imported"
+"$binary" playbook -i "$fixture_dir/inventory" "$fixture_dir/tags/import.yml" -e "out=$fixture_dir/tags-output" --tags alpha > "$fixture_dir/native-import-tags.log" 2>&1
+diff "$fixture_dir/reference-imported" "$fixture_dir/tags-output/imported"
 if uv tool run --from ansible-core==2.21.0 ansible-playbook \
     -i "$fixture_dir/inventory" "$fixture_dir/non_boolean.yml" > "$fixture_dir/reference-condition.log" 2>&1; then
     echo 'Reference unexpectedly accepted a string condition' >&2; exit 1
@@ -177,4 +200,4 @@ if "$binary" playbook -i "$fixture_dir/inventory" "$fixture_dir/non_boolean.yml"
     echo 'Rustsible unexpectedly accepted a string condition' >&2; exit 1
 fi
 [[ ! -e $fixture_dir/result/unsafe-condition ]]
-printf 'Ansible 2.21.0 comparison passed: templates/types, native files, retries/conditions, environment, command prediction, facts, variables, imports/roles, handlers/rescue, serial/run_once, failure thresholds, delegation, free strategy native async/poll/status, assertions, target wait/HTTP readiness and Git/archive deployment\n'
+printf 'Ansible 2.21.0 comparison passed: templates/types, native files, retries/conditions, environment, command prediction, facts, variables, imports/roles, handlers/rescue, serial/run_once, failure thresholds, delegation, free strategy native async/poll/status, assertions, target wait/HTTP readiness Git/archive deployment and inherited/static/dynamic tags\n'
