@@ -42,15 +42,21 @@ fn account(name: &str) -> Result<Option<Account>> {
         .transpose()
 }
 fn group(value: &str) -> Result<u32> {
+    group_entry(value)?
+        .map(|(_, gid)| gid)
+        .context("Requested primary/supplementary group does not exist")
+}
+fn group_entry(value: &str) -> Result<Option<(String, u32)>> {
     validate_name(value)?;
-    let entry =
-        query("group", value)?.context("Requested primary/supplementary group does not exist")?;
-    entry
-        .split(':')
-        .nth(2)
-        .context("Invalid group database response")?
-        .parse()
-        .map_err(Into::into)
+    query("group", value)?
+        .map(|entry| {
+            let fields = entry.splitn(4, ':').collect::<Vec<_>>();
+            if fields.len() != 4 {
+                bail!("Invalid group database response");
+            }
+            Ok((fields[0].to_owned(), fields[2].parse()?))
+        })
+        .transpose()
 }
 fn validate_name(value: &str) -> Result<()> {
     if value.is_empty()
@@ -295,4 +301,95 @@ fn result(changed: bool, msg: &str) -> ModuleResult {
         msg: msg.into(),
         ..ModuleResult::default()
     }
+}
+
+pub fn execute_group(args: &Value, check: bool) -> Result<ModuleResult> {
+    Builtin::Group.validate_parameters(args)?;
+    let name = get_param::<String>(args, "name")?;
+    validate_name(&name)?;
+    if name.chars().any(char::is_whitespace) {
+        bail!("Group name cannot contain whitespace");
+    }
+    let state = optional::<String>(args, "state")?
+        .unwrap_or_else(|| "present".into())
+        .to_ascii_lowercase();
+    let gid = optional::<u32>(args, "gid")?;
+    let system = optional::<bool>(args, "system")?.unwrap_or(false);
+    let current = group_entry(&name)?;
+    if current.as_ref().is_some_and(|(actual, _)| actual != &name) {
+        bail!("Group name resolved to a numeric ID alias; use the actual group name");
+    }
+    let changed = if state == "absent" {
+        current.is_some()
+    } else {
+        current.is_none()
+            || gid.is_some_and(|gid| current.as_ref().is_some_and(|(_, old)| *old != gid))
+    };
+    let operation = if state == "absent" {
+        "groupdel"
+    } else if current.is_none() {
+        "groupadd"
+    } else {
+        "groupmod"
+    };
+    let mut argv = Vec::new();
+    if state == "present" {
+        if current.is_none() && system {
+            argv.push("--system".into());
+        }
+        if let Some(gid) = gid {
+            if changed {
+                if group_entry(&gid.to_string())?.is_some_and(|(actual, _)| actual != name) {
+                    bail!("Requested group ID is already in use");
+                }
+                argv.extend(["--gid".into(), gid.to_string()]);
+            }
+        }
+    }
+    argv.extend(["--".into(), name.clone()]);
+    if changed {
+        // Ordinary SSH login PATH often omits administrative directories even
+        // for read-only prediction. Explicit PATH tools still take priority.
+        let executable = if tools::available(operation) {
+            Some(operation.to_owned())
+        } else {
+            ["/usr/sbin", "/sbin"]
+                .iter()
+                .map(|directory| format!("{directory}/{operation}"))
+                .find(|path| tools::available(path))
+        }
+        .with_context(|| format!("Required group account tool is unavailable: {operation}"))?;
+        if !check {
+            tools::mutate(&executable, &argv, "Manage group")?;
+        }
+    }
+    let mut final_gid = if state == "absent" {
+        current.as_ref().map(|(_, gid)| *gid)
+    } else {
+        gid.or_else(|| current.as_ref().map(|(_, gid)| *gid))
+    };
+    if changed && !check {
+        let observed = group_entry(&name)?;
+        if state == "absent" {
+            if observed.is_some() {
+                bail!("Group removal could not be confirmed");
+            }
+        } else {
+            let (actual_name, actual_gid) =
+                observed.context("Group creation/modification could not be confirmed")?;
+            if actual_name != name || gid.is_some_and(|gid| gid != actual_gid) {
+                bail!("Group identity does not match the requested state");
+            }
+            final_gid = Some(actual_gid);
+        }
+    }
+    let mut result = result(changed, "Group is current or would be updated");
+    result.values.insert("name".into(), Value::String(name));
+    result.values.insert("state".into(), Value::String(state));
+    if let Some(gid) = final_gid {
+        result
+            .values
+            .insert("gid".into(), Value::Number(gid.into()));
+    }
+    Ok(result)
 }

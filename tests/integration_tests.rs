@@ -1861,6 +1861,7 @@ fn documented_subset_examples_remain_parseable() -> Result<()> {
         "reuse/main.yml",
         "rolling/playbook.yml",
         "async/playbook.yml",
+        "assertions.yml",
     ] {
         let path = manifest_dir.join("examples").join(relative_path);
         let error = run_playbook(path.to_str().unwrap(), &inventory).unwrap_err();

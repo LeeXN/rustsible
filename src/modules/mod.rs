@@ -1,3 +1,4 @@
+mod assertion;
 pub mod debug;
 pub mod param;
 pub mod registry;

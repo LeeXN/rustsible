@@ -65,6 +65,7 @@ fn run(
         }
         "package" => return crate::packages::execute(&request.args, request.check),
         "user" => return crate::accounts::execute(&request.args, request.check),
+        "group" => return crate::accounts::execute_group(&request.args, request.check),
         "copy" | "template" => {
             return crate::files::copy(
                 &request.args,

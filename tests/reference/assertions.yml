@@ -1,0 +1,27 @@
+- hosts: localhost
+  gather_facts: false
+  vars:
+    amount: 3
+  tasks:
+    - assert:
+        that: [amount == 3, true]
+        success_msg: accepted
+      register: passed
+    - block:
+        - assert:
+            that: amount < 1
+            fail_msg: expected assertion
+      rescue:
+        - copy:
+            content: '{{ ansible_failed_result.assertion }}|{{ "false" if not ansible_failed_result.evaluated_to else "true" }}|{{ ansible_failed_result.msg }}'
+            dest: '@OUTPUT@/assertion'
+    - block:
+        - fail:
+            msg: expected fail
+      rescue:
+        - copy:
+            content: '{{ ansible_failed_result.msg }}'
+            dest: '@OUTPUT@/failure'
+    - copy:
+        content: '{{ passed.msg }}'
+        dest: '@OUTPUT@/passed'

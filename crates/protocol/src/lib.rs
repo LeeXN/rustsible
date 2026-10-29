@@ -32,6 +32,7 @@ pub const NATIVE_MODULES: &[&str] = &[
     "systemd",
     "package",
     "async_status",
+    "group",
 ];
 
 #[derive(Serialize, Deserialize)]

@@ -330,6 +330,28 @@ pub(crate) fn evaluate_condition(
     }
 }
 
+/// One boolean condition model is shared by task controls and assert. Values
+/// returned from evaluating an expression are never evaluated a second time.
+pub(crate) fn evaluate_conditions(
+    condition: &Value,
+    environment: &mut Environment<'_>,
+    context: &TemplateContext,
+) -> Result<bool> {
+    match condition {
+        Value::String(expression) => evaluate_condition(expression, environment, context),
+        Value::Bool(value) => Ok(*value),
+        Value::Sequence(conditions) => {
+            for condition in conditions {
+                if !evaluate_conditions(condition, environment, context)? {
+                    return Ok(false);
+                }
+            }
+            Ok(true)
+        }
+        _ => bail!("A condition must be a string, boolean, or sequence of conditions"),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

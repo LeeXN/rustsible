@@ -519,7 +519,11 @@ impl Task {
 
                 if let Some(when) = &self.when {
                     let mut condition_engine = crate::playbook::templar::environment();
-                    if !self.evaluate_condition(when, &mut condition_engine, &iter_context)? {
+                    if !crate::playbook::templar::evaluate_conditions(
+                        when,
+                        &mut condition_engine,
+                        &iter_context,
+                    )? {
                         debug!("Skipping loop iteration due to when condition");
                         let mut result = TaskResult::new(&host.name);
                         result.skipped = true;
@@ -643,7 +647,11 @@ impl Task {
             let context = crate::playbook::templar::create_context(&vars)?;
             if let Some(when) = &self.when {
                 let mut condition_engine = crate::playbook::templar::environment();
-                if !self.evaluate_condition(when, &mut condition_engine, &context)? {
+                if !crate::playbook::templar::evaluate_conditions(
+                    when,
+                    &mut condition_engine,
+                    &context,
+                )? {
                     debug!("Skipping task due to when condition");
                     let mut result = TaskResult::new(&host.name);
                     result.skipped = true;
@@ -815,7 +823,9 @@ impl Task {
                             continue;
                         }
                         let context = crate::playbook::templar::create_context(&attempt_vars)?;
-                        let value = self.evaluate_condition(condition, engine, &context)?;
+                        let value = crate::playbook::templar::evaluate_conditions(
+                            condition, engine, &context,
+                        )?;
                         if failure {
                             result.failed = value;
                         } else {
@@ -831,7 +841,7 @@ impl Task {
                 }
                 if let Some(condition) = self.until.as_ref().filter(|_| has_until) {
                     let context = crate::playbook::templar::create_context(&attempt_vars)?;
-                    self.evaluate_condition(condition, engine, &context)
+                    crate::playbook::templar::evaluate_conditions(condition, engine, &context)
                 } else {
                     Ok(!result.failed)
                 }
@@ -1260,31 +1270,6 @@ impl Task {
             .unwrap_or_else(|| path.to_path_buf())
     }
 
-    fn evaluate_condition(
-        &self,
-        condition: &Value,
-        engine: &mut Environment<'_>,
-        context: &TemplateContext,
-    ) -> Result<bool> {
-        match condition {
-            Value::String(condition) => {
-                crate::playbook::templar::evaluate_condition(condition, engine, context)
-            }
-            Value::Bool(value) => Ok(*value),
-            Value::Sequence(conditions) => {
-                for condition in conditions {
-                    if !self.evaluate_condition(condition, engine, context)? {
-                        return Ok(false);
-                    }
-                }
-                Ok(true)
-            }
-            _ => Err(anyhow!(
-                "A when condition must be a string, boolean, or sequence of conditions"
-            )),
-        }
-    }
-
     fn resolve_loop_items(
         &self,
         items: &Value,
@@ -1375,7 +1360,9 @@ pub(crate) fn render_module_arguments(
             || (module_name == "debug" && matches!(key.as_str(), "msg" | "var"));
         let is_mode_param = matches!(module_name, "file" | "copy" | "template") && key == "mode";
 
-        if module_name == "template" && matches!(key.as_str(), "content" | "vars") {
+        if (module_name == "template" && matches!(key.as_str(), "content" | "vars"))
+            || (module_name == "assert" && key == "that")
+        {
             resolved.insert(Value::String(key.clone()), value.clone());
             continue;
         }
@@ -1590,6 +1577,14 @@ pub(crate) fn print_task_result(
 
     let message = if result.no_log {
         "output censored because no_log is enabled"
+    } else if !result.failed
+        && result
+            .values
+            .get("_ansible_verbose_always")
+            .and_then(Value::as_bool)
+            == Some(false)
+    {
+        ""
     } else {
         result.msg.as_str()
     };
@@ -1956,18 +1951,19 @@ mod tests {
 
     #[test]
     fn when_sequence_uses_and_semantics() {
-        let task = create_test_task();
         let mut engine = crate::playbook::templar::environment();
         let context = TemplateContext::new();
         let all_true = Value::Sequence(vec![Value::Bool(true), Value::Bool(true)]);
         let one_false = Value::Sequence(vec![Value::Bool(true), Value::Bool(false)]);
 
-        assert!(task
-            .evaluate_condition(&all_true, &mut engine, &context)
-            .unwrap());
-        assert!(!task
-            .evaluate_condition(&one_false, &mut engine, &context)
-            .unwrap());
+        assert!(
+            crate::playbook::templar::evaluate_conditions(&all_true, &mut engine, &context)
+                .unwrap()
+        );
+        assert!(
+            !crate::playbook::templar::evaluate_conditions(&one_false, &mut engine, &context)
+                .unwrap()
+        );
     }
 
     #[test]

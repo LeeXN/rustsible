@@ -48,10 +48,13 @@ pub enum Builtin {
     GetUrl,
     Package,
     AsyncStatus,
+    Assert,
+    Fail,
+    Group,
 }
 
 impl Builtin {
-    pub const ALL: [Self; 18] = [
+    pub const ALL: [Self; 21] = [
         Self::Command,
         Self::Shell,
         Self::Debug,
@@ -70,6 +73,9 @@ impl Builtin {
         Self::GetUrl,
         Self::Package,
         Self::AsyncStatus,
+        Self::Assert,
+        Self::Fail,
+        Self::Group,
     ];
 
     pub fn lookup(name: &str) -> Result<Self> {
@@ -104,11 +110,16 @@ impl Builtin {
             Self::GetUrl => "get_url",
             Self::Package => "package",
             Self::AsyncStatus => "async_status",
+            Self::Assert => "assert",
+            Self::Fail => "fail",
+            Self::Group => "group",
         }
     }
     pub fn check_support(self) -> CheckSupport {
         match self {
             Self::Debug
+            | Self::Assert
+            | Self::Fail
             | Self::Meta
             | Self::SetFact
             | Self::IncludeVars
@@ -204,6 +215,9 @@ impl Builtin {
             Self::GetUrl => &["url", "dest", "owner", "group", "mode", "force", "checksum"],
             Self::Package => &["name", "state", "update_cache"],
             Self::AsyncStatus => &["jid", "mode", "_async_dir"],
+            Self::Assert => &["that", "fail_msg", "msg", "success_msg", "quiet"],
+            Self::Fail => &["msg"],
+            Self::Group => &["name", "gid", "state", "system"],
         }
     }
 
@@ -252,10 +266,20 @@ impl Builtin {
                     .as_u64()
                     .is_some_and(|value| (1..=604800).contains(&value)),
                 "msg" | "var" | "_var_value" if self == Self::Debug => true,
+                "that" if self == Self::Assert => {
+                    value.is_bool()
+                        || value.is_string()
+                        || value.as_sequence().is_some_and(|conditions| {
+                            conditions
+                                .iter()
+                                .all(|value| value.is_string() || value.is_bool())
+                        })
+                }
+                "quiet" if self == Self::Assert => value.is_bool(),
                 "vars" => value.is_mapping(),
                 "force" | "enabled" | "daemon_reload" | "backup" | "create" | "append"
                 | "create_home" | "system" | "remove" | "update_cache" => value.is_bool(),
-                "uid" | "gid" if self == Self::User => {
+                "uid" | "gid" if matches!(self, Self::User | Self::Group) => {
                     value.as_u64().is_some_and(|id| id < u32::MAX as u64)
                 }
                 "groups" if self == Self::User => {
@@ -300,6 +324,17 @@ impl Builtin {
                 if let Some(name) = string("name") {
                     crate::param::validate_variable_name(name, "include_vars name")?;
                 }
+            }
+            Self::Assert => {
+                if args.get("that").is_none() {
+                    bail!("assert requires that");
+                }
+                if args.get("fail_msg").is_some() && args.get("msg").is_some() {
+                    bail!("assert fail_msg and its msg alias are mutually exclusive");
+                }
+            }
+            Self::Group => {
+                required("name")?;
             }
             Self::AsyncStatus => {
                 required("jid")?;
@@ -377,7 +412,7 @@ impl Builtin {
         }
         let states: &[&str] = match self {
             Self::File => &["file", "directory", "link", "absent", "touch"],
-            Self::User | Self::Lineinfile => &["present", "absent"],
+            Self::User | Self::Lineinfile | Self::Group => &["present", "absent"],
             Self::Package => &["present", "absent", "latest"],
             Self::Service | Self::Systemd => &["started", "stopped", "restarted", "reloaded"],
             _ => &[],
