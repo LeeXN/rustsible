@@ -3,6 +3,7 @@
 mod args;
 pub mod change;
 pub mod param;
+pub mod protection;
 pub mod registry;
 mod result;
 use anyhow::{bail, Context, Result};

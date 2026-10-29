@@ -284,6 +284,7 @@ impl Invocation {
             Ok(mut result) => {
                 result.failed |= result.rc.is_some_and(|rc| rc != 0);
                 result.changed |= super::result::known_changed();
+                runtime.vault.protect_result(&mut result);
                 result
             }
             Err(error) => {
@@ -298,6 +299,7 @@ impl Invocation {
                     );
                     result.no_log |= specification.no_log;
                 }
+                runtime.vault.protect_result(&mut result);
                 result
             }
         }

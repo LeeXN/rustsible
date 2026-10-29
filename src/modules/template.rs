@@ -1,8 +1,7 @@
 use crate::playbook::templar;
 use anyhow::{Context, Result};
-use minijinja::value::Serde;
 use serde_yaml::Value;
-use std::{collections::HashMap, fs, path::Path};
+use std::{collections::HashMap, path::Path};
 
 /// Render on the controller; the target only receives bytes and installation
 /// metadata, so it never evaluates controller variables or templates.
@@ -19,6 +18,13 @@ pub(crate) fn render(template_args: &Value, data: &HashMap<String, Value>) -> Re
             ));
         }
         if let Some(content_value) = content_value {
+            if crate::vault::is_value(content_value) {
+                return Ok(crate::vault::Vault::current()
+                    .materialize(content_value)?
+                    .as_str()
+                    .context("Vault template content must be a string")?
+                    .to_owned());
+            }
             template_string = match content_value {
                 Value::String(s) => s.clone(),
                 _ => return Err(anyhow::anyhow!("Template content must be a string")),
@@ -29,8 +35,9 @@ pub(crate) fn render(template_args: &Value, data: &HashMap<String, Value>) -> Re
             if !src_path.exists() {
                 return Err(anyhow::anyhow!("Template file does not exist: {}", src));
             }
-            template_string = fs::read_to_string(src)
-                .with_context(|| format!("Failed to read template file: {}", src))?;
+            template_string = crate::vault::Vault::current()
+                .read_text(src_path)?
+                .to_string();
         } else if src_value.is_some() {
             return Err(anyhow::anyhow!("Template src must be a string"));
         } else {
@@ -60,7 +67,5 @@ pub(crate) fn render(template_args: &Value, data: &HashMap<String, Value>) -> Re
         .get("src")
         .and_then(Value::as_str)
         .unwrap_or("<inline template>");
-    templar::environment()
-        .render_named_str(source_name, &template_string, Serde(&context))
-        .map_err(Into::into)
+    context.render_named(&templar::environment(), source_name, &template_string)
 }

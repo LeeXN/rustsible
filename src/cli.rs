@@ -6,6 +6,8 @@ pub fn build_cli() -> Command {
         .version(env!("CARGO_PKG_VERSION"))
         .subcommand_required(true)
         .arg_required_else_help(true)
+        .args(vault_args())
+        .subcommand(vault_command())
         .arg(
             Arg::new("config")
                 .long("config")
@@ -181,6 +183,77 @@ fn extra_vars_arg() -> Arg {
         .action(ArgAction::Append)
         .value_name("VARS")
         .help("Extra variables as name=value, a YAML/JSON mapping, or @file")
+}
+
+fn vault_args() -> [Arg; 3] {
+    [
+        Arg::new("vault-password-file")
+            .long("vault-password-file")
+            .global(true)
+            .action(ArgAction::Append)
+            .value_parser(clap::value_parser!(std::path::PathBuf))
+            .value_name("FILE")
+            .help("Read a Vault password from a regular non-executable file"),
+        Arg::new("vault-id")
+            .long("vault-id")
+            .global(true)
+            .action(ArgAction::Append)
+            .value_name("ID@SOURCE")
+            .help("Vault password source: ID@FILE or ID@prompt"),
+        Arg::new("ask-vault-pass")
+            .long("ask-vault-pass")
+            .global(true)
+            .action(ArgAction::SetTrue)
+            .help("Prompt for a Vault password on the controlling terminal"),
+    ]
+}
+fn vault_command() -> Command {
+    let mut command = Command::new("vault")
+        .about("Encrypt, decrypt, view or rekey Ansible Vault files")
+        .subcommand_required(true);
+    for action in ["encrypt", "decrypt", "view", "rekey"] {
+        let mut sub = Command::new(action).arg(
+            Arg::new("input")
+                .value_parser(clap::value_parser!(std::path::PathBuf))
+                .value_name("FILE")
+                .required(true)
+                .index(1),
+        );
+        if action != "view" {
+            sub = sub.arg(
+                Arg::new("output")
+                    .long("output")
+                    .value_parser(clap::value_parser!(std::path::PathBuf))
+                    .value_name("FILE")
+                    .help("Output file; '-' writes stdout (default: replace input)"),
+            );
+        }
+        if matches!(action, "encrypt" | "rekey") {
+            sub = sub.arg(
+                Arg::new("encrypt-vault-id")
+                    .long("encrypt-vault-id")
+                    .value_name("ID"),
+            );
+        }
+        if action == "rekey" {
+            sub = sub
+                .arg(
+                    Arg::new("new-vault-password-file")
+                        .long("new-vault-password-file")
+                        .action(ArgAction::Append)
+                        .value_parser(clap::value_parser!(std::path::PathBuf))
+                        .value_name("FILE"),
+                )
+                .arg(
+                    Arg::new("new-vault-id")
+                        .long("new-vault-id")
+                        .action(ArgAction::Append)
+                        .value_name("ID@SOURCE"),
+                );
+        }
+        command = command.subcommand(sub);
+    }
+    command
 }
 
 fn connection_args() -> [Arg; 3] {

@@ -338,6 +338,50 @@ connection password variables override prompted defaults. `--private-key FILE`
 overrides configuration/environment defaults; inventory/play/task connection
 variables and -e retain their higher precedence.
 
+## Ansible Vault
+
+Vault supports AES256 envelopes 1.1/1.2, file encryption and `!vault` UTF-8
+scalar values. Supply `--vault-password-file FILE`, `--ask-vault-pass`, or repeat
+`--vault-id ID@FILE`/`ID@prompt`. IDs are hints: matching labels are tried first,
+then remaining sources in their supplied order. Password sources are bounded
+regular non-executable files or the hidden terminal prompt; provider scripts
+are rejected. Password bytes never enter argv, template variables or persisted
+configuration. Vault configuration-file/environment options are outside this
+CLI subset.
+
+```bash
+rustsible vault encrypt secrets.yml --vault-id prod@password-file
+rustsible vault view secrets.yml --vault-id prod@password-file
+rustsible vault rekey secrets.yml --vault-password-file old-password-file \
+  --new-vault-id prod@new-password-file
+rustsible vault decrypt secrets.yml --vault-password-file password-file
+rustsible playbook site.yml -i inventory --vault-id prod@password-file
+```
+
+File commands replace their input atomically, preserving ownership/mode/ACLs/
+xattrs; a new `--output FILE` uses mode 0600. `--output -` writes stdout; input
+`-` reads stdin. View always writes stdout. Encrypt/rekey temporary files contain
+ciphertext; decrypt/view are explicit plaintext outputs. New encryption with
+multiple sources requires `--encrypt-vault-id ID`. Rekey with only a new password
+file preserves the existing label. File commands need no workers or inventory.
+
+Controller loaders decrypt playbooks, task/role/variable files, copy sources and
+template sources in memory. `!vault` scalars decrypt when the template engine
+accesses them and remain ordinary strings, including text containing Jinja
+syntax; they are never parsed into guessed YAML types or rendered again.
+Unused encrypted scalars require no password. File-based templates remain
+explicit template sources. Target remote_src archives are not decrypted.
+
+After protected content is accessed, diagnostics and failure payloads are
+censored and file diff requests are suppressed for that run. Use no_log for
+successful tasks that deliberately print secrets; raw register data stays in
+memory. Background jobs launched from that protected context persist their
+private display policy for later async_status calls, including a new run without
+Vault passwords. Register their job IDs when using poll=0. Inspection still
+avoids target connections; decrypting its controller input can require a Vault
+password prompt. Input limits are 16 MiB plaintext, 80 MiB encrypted envelope,
+64 KiB per password and 32 password sources.
+
 ## Target readiness and HTTP
 
 `wait_for` supports a TCP host/port, file presence/absence, or a multiline

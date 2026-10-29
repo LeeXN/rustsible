@@ -192,6 +192,31 @@ uv tool run --from ansible-core==2.21.0 ansible-playbook -i "$fixture_dir/invent
 mv "$fixture_dir/tags-output/imported" "$fixture_dir/reference-imported"
 "$binary" playbook -i "$fixture_dir/inventory" "$fixture_dir/tags/import.yml" -e "out=$fixture_dir/tags-output" --tags alpha > "$fixture_dir/native-import-tags.log" 2>&1
 diff "$fixture_dir/reference-imported" "$fixture_dir/tags-output/imported"
+printf 'fixture-password\n' > "$fixture_dir/vault-password"
+printf 'second-password\n' > "$fixture_dir/vault-other-password"
+chmod 0600 "$fixture_dir/vault-password" "$fixture_dir/vault-other-password"
+printf 'literal {{ must_not_execute }}' > "$fixture_dir/vault-literal"
+"$binary" vault encrypt "$fixture_dir/vault-literal" --vault-id "prod@$fixture_dir/vault-password" > "$fixture_dir/native-vault-encrypt.log" 2>&1
+uv tool run --from ansible-core==2.21.0 ansible-vault decrypt "$fixture_dir/vault-literal" --vault-id "prod@$fixture_dir/vault-password" --output "$fixture_dir/reference-vault-plain" > "$fixture_dir/reference-vault-decrypt.log" 2>&1
+printf 'literal {{ must_not_execute }}' > "$fixture_dir/vault-expected"
+cmp "$fixture_dir/vault-expected" "$fixture_dir/reference-vault-plain"
+{ printf 'literal: !vault |\n'; sed 's/^/  /' "$fixture_dir/vault-literal"; printf 'primary: first\n'; } > "$fixture_dir/vault-vars.yml"
+printf 'secondary: second\n' > "$fixture_dir/vault-other.yml"
+uv tool run --from ansible-core==2.21.0 ansible-vault encrypt "$fixture_dir/vault-other.yml" --vault-id "dev@$fixture_dir/vault-other-password" > "$fixture_dir/reference-vault-encrypt.log" 2>&1
+"$binary" vault decrypt "$fixture_dir/vault-other.yml" --vault-id "dev@$fixture_dir/vault-other-password" --output "$fixture_dir/native-vault-plain" > "$fixture_dir/native-vault-decrypt.log" 2>&1
+printf 'secondary: second\n' > "$fixture_dir/vault-other-expected"
+cmp "$fixture_dir/vault-other-expected" "$fixture_dir/native-vault-plain"
+printf '{{ primary }}|{{ secondary }}|{{ literal }}' > "$fixture_dir/vault-template.j2"
+"$binary" vault encrypt "$fixture_dir/vault-template.j2" --vault-password-file "$fixture_dir/vault-password" > "$fixture_dir/native-vault-template.log" 2>&1
+mkdir "$fixture_dir/vault-output"
+sed "s|@OUTPUT@|$fixture_dir/vault-output|g; s|@VARIABLES@|$fixture_dir/vault-vars.yml|g; s|@OTHER_VARIABLES@|$fixture_dir/vault-other.yml|g; s|@TEMPLATE@|$fixture_dir/vault-template.j2|g" "$repo_dir/tests/reference/vault.yml" > "$fixture_dir/vault.yml"
+vault_options=(--vault-id "prod@$fixture_dir/vault-password" --vault-id "dev@$fixture_dir/vault-other-password")
+uv tool run --from ansible-core==2.21.0 ansible-playbook -i "$fixture_dir/inventory" "$fixture_dir/vault.yml" "${vault_options[@]}" > "$fixture_dir/reference-vault-playbook.log" 2>&1
+mv "$fixture_dir/vault-output" "$fixture_dir/reference-vault-output"
+mkdir "$fixture_dir/vault-output"
+"$binary" playbook -i "$fixture_dir/inventory" "$fixture_dir/vault.yml" "${vault_options[@]}" --diff -vvv > "$fixture_dir/native-vault-playbook.log" 2>&1
+diff -r "$fixture_dir/reference-vault-output" "$fixture_dir/vault-output"
+if grep -q 'fixture-password\|literal {{ must_not_execute }}' "$fixture_dir/native-vault-playbook.log"; then echo 'Vault diagnostics leaked a protected value' >&2; exit 1; fi
 if uv tool run --from ansible-core==2.21.0 ansible-playbook \
     -i "$fixture_dir/inventory" "$fixture_dir/non_boolean.yml" > "$fixture_dir/reference-condition.log" 2>&1; then
     echo 'Reference unexpectedly accepted a string condition' >&2; exit 1
@@ -200,4 +225,4 @@ if "$binary" playbook -i "$fixture_dir/inventory" "$fixture_dir/non_boolean.yml"
     echo 'Rustsible unexpectedly accepted a string condition' >&2; exit 1
 fi
 [[ ! -e $fixture_dir/result/unsafe-condition ]]
-printf 'Ansible 2.21.0 comparison passed: templates/types, native files, retries/conditions, environment, command prediction, facts, variables, imports/roles, handlers/rescue, serial/run_once, failure thresholds, delegation, free strategy native async/poll/status, assertions, target wait/HTTP readiness Git/archive deployment and inherited/static/dynamic tags\n'
+printf 'Ansible 2.21.0 comparison passed: templates/types, native files, retries/conditions, environment, command prediction, facts, variables, imports/roles, handlers/rescue, serial/run_once, failure thresholds, delegation, free strategy native async/poll/status, assertions, target wait/HTTP readiness Git/archive deployment inherited/static/dynamic tags and bidirectional Vault encryption\n'

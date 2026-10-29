@@ -1,3 +1,4 @@
+mod context;
 pub mod filters;
 mod handlers;
 mod parser;
@@ -31,6 +32,7 @@ pub struct ExecutionOptions {
     pub diff: bool,
     pub tags: TagSelection,
     pub credentials: crate::ssh::credentials::Credentials,
+    pub vault: std::sync::Arc<crate::vault::Vault>,
     pub forks: usize,
     pub worker_dir: Option<std::path::PathBuf>,
     pub extra_vars: Vec<String>,
@@ -46,6 +48,7 @@ impl Default for ExecutionOptions {
             diff: false,
             tags: TagSelection::default(),
             credentials: Default::default(),
+            vault: crate::vault::Vault::current(),
             forks: 5,
             worker_dir: None,
             extra_vars: Vec::new(),
@@ -98,6 +101,17 @@ pub fn execute_with_options(
     inventory: &Inventory,
     options: &ExecutionOptions,
 ) -> Result<()> {
+    let _vault = options.vault.enter();
+    options
+        .vault
+        .protect(execute_in_scope(playbook_file, inventory, options))
+}
+
+fn execute_in_scope(
+    playbook_file: &str,
+    inventory: &Inventory,
+    options: &ExecutionOptions,
+) -> Result<()> {
     info!("Loading playbook from file: {}", playbook_file);
 
     let LoadedPlaybook {
@@ -130,6 +144,7 @@ pub fn execute_with_options(
     state.workers = std::sync::Arc::new(
         crate::worker::Runtime::new(options.worker_dir.clone())
             .with_credentials(options.credentials.clone())
+            .with_vault(options.vault.clone())
             .with_diff(options.diff),
     );
     state.extra = std::sync::Arc::new(extra);
@@ -200,6 +215,17 @@ pub enum Inspection {
 /// a connection. Dynamic includes remain selected placeholders, as their paths
 /// and contents can depend on facts and results unavailable before execution.
 pub fn inspect(
+    file: &str,
+    inventory: &Inventory,
+    options: &ExecutionOptions,
+    mode: Inspection,
+) -> Result<serde_json::Value> {
+    let _vault = options.vault.enter();
+    options
+        .vault
+        .protect(inspect_in_scope(file, inventory, options, mode))
+}
+fn inspect_in_scope(
     file: &str,
     inventory: &Inventory,
     options: &ExecutionOptions,

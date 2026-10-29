@@ -1,5 +1,4 @@
 use anyhow::{bail, Context, Result};
-use minijinja::value::Serde;
 use minijinja::{Environment, UndefinedBehavior};
 use serde_yaml::Value;
 use std::collections::HashMap;
@@ -95,7 +94,7 @@ impl RuntimeVariables {
     }
 }
 
-pub(crate) type TemplateContext = HashMap<String, serde_json::Value>;
+pub(crate) use super::context::TemplateContext;
 pub(crate) const OMIT_SENTINEL: &str = "__rustsible_internal_omit_4f5e7d9b__";
 
 pub(crate) fn environment() -> Environment<'static> {
@@ -147,7 +146,8 @@ pub(crate) fn render_value(
                     .start_offset as usize;
                 let expression =
                     environment.compile_expression_owned(source[start..end].to_owned())?;
-                let result = expression.eval(Serde(context))?;
+                let result =
+                    context.checked(expression.eval(context.value()).map_err(Into::into))?;
                 if result.is_undefined() {
                     return Err(minijinja::Error::new(
                         minijinja::ErrorKind::UndefinedError,
@@ -155,14 +155,19 @@ pub(crate) fn render_value(
                     )
                     .into());
                 }
-                return serde_yaml::to_value(result)
-                    .context("Cannot represent template result as YAML");
+                return context.checked(
+                    serde_yaml::to_value(result)
+                        .context("Cannot represent template result as YAML"),
+                );
             }
         }
     }
-    Ok(Value::String(
-        environment.render_str(input, Serde(context))?,
-    ))
+    context.checked(
+        environment
+            .render_str(input, context.value())
+            .map(Value::String)
+            .map_err(Into::into),
+    )
 }
 
 /// Resolve only definitions, never runtime data. Missing dependencies remain
@@ -198,6 +203,7 @@ pub(crate) fn resolve_definitions(
                     references(value, environment, names, depth + 1)?;
                 }
             }
+            Value::Tagged(_) if crate::vault::is_value(value) => {}
             Value::Tagged(value) => references(&value.value, environment, names, depth + 1)?,
             _ => {}
         }
@@ -226,6 +232,7 @@ pub(crate) fn resolve_definitions(
                 })
                 .collect::<Result<serde_yaml::Mapping>>()
                 .map(Value::Mapping),
+            Value::Tagged(_) if crate::vault::is_value(value) => Ok(value.clone()),
             Value::Tagged(value) => {
                 let mut value = (**value).clone();
                 value.value = render(&value.value, environment, context, depth + 1)?;
@@ -299,17 +306,7 @@ pub(crate) fn resolve_definitions(
 }
 
 pub(crate) fn create_context(vars: &HashMap<String, Value>) -> Result<TemplateContext> {
-    let mut context = TemplateContext::new();
-    for (name, value) in vars {
-        context.insert(
-            name.clone(),
-            serde_json::to_value(value).with_context(|| {
-                format!("Cannot represent variable '{name}' in template context")
-            })?,
-        );
-    }
-    context.insert("omit".to_string(), OMIT_SENTINEL.into());
-    Ok(context)
+    TemplateContext::new(vars)
 }
 
 /// Ansible 2.21 requires boolean condition results. In particular the string

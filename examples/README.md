@@ -85,6 +85,18 @@ health_host/health_port/health_url 配成隔离服务；默认地址为
 显式选择默认跳过的诊断任务。`--list-tasks`/`--list-hosts`/`--syntax-check`
 只读取控制端内容，输出 JSON；`--check --diff` 可预演支持的文件差异。
 
+`vault.yml` 读取 `-e vault_variables=/绝对路径/vars.yml` 指定的变量文件，
+并以 0600 部署 `example_value`。先准备仅含演示数据的变量文件，再加密：
+
+```bash
+(umask 077; printf 'example_value: example-only\n' > /tmp/vault-example-vars.yml)
+rustsible vault encrypt /tmp/vault-example-vars.yml --vault-id prod@prompt
+rustsible playbook examples/vault.yml -i examples/inventory/hosts --limit localhost \
+  -e vault_variables=/tmp/vault-example-vars.yml --vault-id prod@prompt --check --diff
+```
+
+密码在终端内隐藏输入；示例通过 no_log 遮蔽结果，不附带真实密码或凭证。
+
 ## 安全提示
 - 示例 inventory 只应放测试值，不要提交真实密码或私钥。
 - `package`、`service` 和 `user` 会调用目标系统工具，通常需要 `become`。

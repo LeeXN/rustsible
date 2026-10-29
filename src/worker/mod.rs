@@ -43,7 +43,7 @@ impl Source {
         Self::Bytes(Cursor::new(bytes))
     }
     pub fn file(path: &str) -> Result<Self> {
-        let file = OpenOptions::new()
+        let mut file = OpenOptions::new()
             .read(true)
             .custom_flags(libc::O_NONBLOCK)
             .open(path)
@@ -51,16 +51,38 @@ impl Source {
         if !file.metadata()?.is_file() {
             bail!("Local source must be a regular file");
         }
+        let mut header = Vec::with_capacity(15);
+        file.by_ref().take(15).read_to_end(&mut header)?;
+        file.rewind()?;
+        if header.len() == 15 && crate::vault::Vault::is_encrypted(&header) {
+            let mut bytes = zeroize::Zeroizing::new(Vec::new());
+            file.take(crate::vault::MAX_ENVELOPE as u64 + 1)
+                .read_to_end(&mut bytes)?;
+            return Ok(Self::bytes(
+                crate::vault::Vault::current().decrypt(&bytes)?.to_vec(),
+            ));
+        }
         Ok(Self::File(file))
     }
 }
 
-#[derive(Default)]
 pub(crate) struct Runtime {
     directory: Option<PathBuf>,
+    pub(crate) vault: Arc<crate::vault::Vault>,
     credentials: crate::ssh::credentials::Credentials,
     diff: bool,
     leases: Mutex<HashMap<String, Arc<Mutex<Option<Client>>>>>,
+}
+impl Default for Runtime {
+    fn default() -> Self {
+        Self {
+            directory: None,
+            vault: crate::vault::Vault::current(),
+            credentials: Default::default(),
+            diff: false,
+            leases: Default::default(),
+        }
+    }
 }
 impl Runtime {
     pub fn new(directory: Option<PathBuf>) -> Self {
@@ -68,6 +90,10 @@ impl Runtime {
             directory,
             ..Self::default()
         }
+    }
+    pub fn with_vault(mut self, vault: Arc<crate::vault::Vault>) -> Self {
+        self.vault = vault;
+        self
     }
     pub fn with_diff(mut self, diff: bool) -> Self {
         self.diff = diff;
@@ -113,10 +139,18 @@ impl Runtime {
         mut request: Request,
         mut source: Option<&mut Source>,
     ) -> Result<ModuleResult> {
+        let _vault = self.vault.enter();
+        if self.vault.used() {
+            request.diff = false;
+            if let Some(asynchronous) = &mut request.asynchronous {
+                asynchronous.no_log = true;
+            }
+        }
         let mut private_config = config.clone();
         self.credentials.apply(&mut private_config);
         let config = &private_config;
-        request.diff |= self.diff
+        request.diff |= !self.vault.used()
+            && self.diff
             && rustsible_protocol::registry::Builtin::lookup(&request.module)?.supports_diff();
         let module = request.module.clone();
         let check = request.check;

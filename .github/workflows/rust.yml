@@ -117,6 +117,10 @@ jobs:
         run: bash tests/ssh/run.sh target/${{ matrix.target }}/release/rustsible target/workers operator glibc target/${{ matrix.target }}/release/examples/prompt_fixture
       - name: Operator CLI on musl
         run: bash tests/ssh/run.sh target/${{ matrix.target }}/release/rustsible target/workers operator musl target/${{ matrix.target }}/release/examples/prompt_fixture
+      - name: Vault encrypted deployment and controller atomic rewrites
+        run: bash tests/ssh/run.sh target/${{ matrix.target }}/release/rustsible target/workers vault glibc target/${{ matrix.target }}/release/examples/prompt_fixture
+      - name: Vault deployment on musl without Python
+        run: bash tests/ssh/run.sh target/${{ matrix.target }}/release/rustsible target/workers vault musl target/${{ matrix.target }}/release/examples/prompt_fixture
       - name: Native execution without Python or curl (glibc)
         run: bash tests/ssh/run.sh target/${{ matrix.target }}/release/rustsible target/workers native glibc target/${{ matrix.target }}/release/examples/http_fixture
       - name: Native execution without Python or curl (musl)
