@@ -75,6 +75,8 @@ pub struct TaskGroup {
 /// Task result structure for tracking execution status
 #[derive(Debug, Clone)]
 pub struct TaskResult {
+    /// run_once shares data and host policy without inventing extra executions.
+    pub(crate) inherited_result: bool,
     pub(crate) meta: Option<String>,
     pub(crate) includes: Vec<IncludeRequest>,
     pub(crate) notifications: Vec<String>,
@@ -112,6 +114,7 @@ impl TaskResult {
         let mut values = HashMap::new();
         insert_output_values(&mut values, String::new(), String::new(), None);
         TaskResult {
+            inherited_result: false,
             meta: None,
             includes: Vec::new(),
             notifications: Vec::new(),
@@ -137,6 +140,7 @@ impl TaskResult {
         );
 
         TaskResult {
+            inherited_result: false,
             meta: None,
             includes: Vec::new(),
             notifications: Vec::new(),
@@ -176,6 +180,9 @@ pub struct Task {
     /// Distinguishes an explicit task override from the default user.
     pub become_user_override: Option<String>,
     pub connection: Option<String>,
+    pub throttle: Option<usize>,
+    pub run_once: Option<bool>,
+    pub any_errors_fatal: Option<bool>,
     /// A task may enter check mode, but cannot disable a global dry run.
     pub check_mode: Option<bool>,
     pub register: Option<String>,
@@ -292,6 +299,9 @@ impl Task {
             .clone()
             .or_else(|| parent.connection.clone());
         self.check_mode = self.check_mode.or(parent.check_mode);
+        self.throttle = self.throttle.or(parent.throttle);
+        self.run_once = self.run_once.or(parent.run_once);
+        self.any_errors_fatal = self.any_errors_fatal.or(parent.any_errors_fatal);
         self.ignore_errors = self.ignore_errors.or(parent.ignore_errors);
         self.ignore_unreachable = self.ignore_unreachable.or(parent.ignore_unreachable);
         self.no_log = self.no_log.or(parent.no_log);
@@ -1603,6 +1613,9 @@ mod tests {
             loop_items: None,
             loop_var_name: None,
             index_var_name: None,
+            throttle: None,
+            run_once: None,
+            any_errors_fatal: None,
         }
     }
 

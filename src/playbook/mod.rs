@@ -2,6 +2,7 @@ pub mod filters;
 mod handlers;
 mod parser;
 mod play;
+mod strategy;
 mod task;
 pub(crate) mod templar;
 
@@ -132,7 +133,7 @@ pub fn execute_with_options(
         if let Err(e) = play_result {
             error!("Play '{}' failed: {}", play.name, e);
             // Continue with next play unless fail_fast is enabled
-            if play.fail_fast {
+            if play.fail_fast || state.abort_book {
                 state.print_recap();
                 return Err(e);
             }

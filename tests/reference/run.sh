@@ -69,6 +69,27 @@ mkdir "$fixture_dir/reuse-output"
 "$binary" --config "$fixture_dir/reuse/ansible.cfg" playbook -i "$fixture_dir/inventory" "$fixture_dir/reuse/main.yml" > "$fixture_dir/native-reuse.log" 2>&1
 diff -r "$fixture_dir/reference-reuse" "$fixture_dir/reuse-output"
 [[ ! -e $fixture_dir/reuse-output/must-not-run ]]
+printf 'a ansible_connection=local\nb ansible_connection=local\nc ansible_connection=local\nd ansible_connection=local\n' > "$fixture_dir/strategy-inventory"
+mkdir "$fixture_dir/strategy-output"
+sed "s|@OUTPUT@|$fixture_dir/strategy-output|g" "$repo_dir/tests/reference/strategy.yml" > "$fixture_dir/strategy.yml"
+uv tool run --from ansible-core==2.21.0 ansible-playbook -i "$fixture_dir/strategy-inventory" "$fixture_dir/strategy.yml" > "$fixture_dir/reference-strategy.log" 2>&1
+mv "$fixture_dir/strategy-output" "$fixture_dir/reference-strategy"
+mkdir "$fixture_dir/strategy-output"
+"$binary" playbook -i "$fixture_dir/strategy-inventory" "$fixture_dir/strategy.yml" > "$fixture_dir/native-strategy.log" 2>&1
+diff -r "$fixture_dir/reference-strategy" "$fixture_dir/strategy-output"
+for percentage in 49 50; do
+    mkdir "$fixture_dir/limit-$percentage"
+    sed "s|@OUTPUT@|$fixture_dir/limit-$percentage|g; s|@PERCENTAGE@|$percentage|g" "$repo_dir/tests/reference/failure-limit.yml" > "$fixture_dir/limit-$percentage.yml"
+    if uv tool run --from ansible-core==2.21.0 ansible-playbook -i "$fixture_dir/strategy-inventory" "$fixture_dir/limit-$percentage.yml" > "$fixture_dir/reference-limit-$percentage.log" 2>&1; then
+        echo 'Reference unexpectedly accepted a failed rollout' >&2; exit 1
+    fi
+    mv "$fixture_dir/limit-$percentage" "$fixture_dir/reference-limit-$percentage"
+    mkdir "$fixture_dir/limit-$percentage"
+    if "$binary" playbook -i "$fixture_dir/strategy-inventory" "$fixture_dir/limit-$percentage.yml" > "$fixture_dir/native-limit-$percentage.log" 2>&1; then
+        echo 'Rustsible unexpectedly accepted a failed rollout' >&2; exit 1
+    fi
+    diff -r "$fixture_dir/reference-limit-$percentage" "$fixture_dir/limit-$percentage"
+done
 if uv tool run --from ansible-core==2.21.0 ansible-playbook \
     -i "$fixture_dir/inventory" "$fixture_dir/non_boolean.yml" > "$fixture_dir/reference-condition.log" 2>&1; then
     echo 'Reference unexpectedly accepted a string condition' >&2; exit 1

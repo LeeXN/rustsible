@@ -1766,7 +1766,7 @@ fn test_unknown_module_returns_nonzero_exit_status() -> Result<()> {
 fn playbook_cli_prints_the_complete_parse_error_chain() -> Result<()> {
     let inventory_file = local_inventory();
     let playbook_file = fixture_file(
-        "---\n- name: unsupported serial\n  hosts: localhost\n  serial: 1\n  tasks: []\n",
+        "---\n- name: unsupported module defaults\n  hosts: localhost\n  module_defaults: {}\n  tasks: []\n",
     );
 
     let output = controller()
@@ -1780,7 +1780,7 @@ fn playbook_cli_prints_the_complete_parse_error_chain() -> Result<()> {
     let stderr = String::from_utf8(output.stderr)?;
     assert!(stderr.contains("Failed to parse play 1 in document 1"));
     assert!(
-        stderr.contains("Play keyword 'serial' is recognized but not supported"),
+        stderr.contains("Play keyword 'module_defaults' is recognized but not supported"),
         "stderr omitted the root cause: {stderr}"
     );
     Ok(())
