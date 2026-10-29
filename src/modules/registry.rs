@@ -252,11 +252,7 @@ impl Builtin {
                 }
             }
             Self::User => required("name")?,
-            Self::Package => {
-                if args.get("name").is_none() {
-                    bail!("Package requires name");
-                }
-            }
+            Self::Package if args.get("name").is_none() => bail!("Package requires name"),
             _ => {}
         }
         let states: &[&str] = match self {
