@@ -13,40 +13,48 @@ use std::{
 use zeroize::Zeroizing;
 impl Vault {
     pub fn from_cli(matches: &ArgMatches) -> Result<Arc<Self>> {
-        let mut sources = Vec::new();
-        if let Some(paths) = matches.get_many::<PathBuf>("vault-password-file") {
-            for (index, path) in matches
-                .indices_of("vault-password-file")
-                .into_iter()
-                .flatten()
-                .zip(paths)
-            {
-                sources.push((index, None, Some(path.clone())));
+        // Clap propagates global append arguments by replacement between
+        // subcommands. Collect independent scopes instead, in argv order.
+        let mut ordered = Vec::new();
+        let mut scope = Some(matches);
+        while let Some(matches) = scope {
+            let mut sources = Vec::new();
+            if let Some(paths) = matches.get_many::<PathBuf>("vault-password-file") {
+                for (index, path) in matches
+                    .indices_of("vault-password-file")
+                    .into_iter()
+                    .flatten()
+                    .zip(paths)
+                {
+                    sources.push((index, None, Some(path.clone())));
+                }
             }
-        }
-        if let Some(ids) = matches.get_many::<String>("vault-id") {
-            for (index, spec) in matches
-                .indices_of("vault-id")
-                .into_iter()
-                .flatten()
-                .zip(ids)
-            {
-                let (id, path) = source(spec)?;
-                sources.push((index, id, path));
+            if let Some(ids) = matches.get_many::<String>("vault-id") {
+                for (index, spec) in matches
+                    .indices_of("vault-id")
+                    .into_iter()
+                    .flatten()
+                    .zip(ids)
+                {
+                    let (id, path) = source(spec)?;
+                    sources.push((index, id, path));
+                }
             }
+            if matches.get_flag("ask-vault-pass") {
+                sources.push((
+                    matches.index_of("ask-vault-pass").unwrap_or(usize::MAX),
+                    None,
+                    None,
+                ));
+            }
+            sources.sort_by_key(|source| source.0);
+            ordered.extend(sources);
+            scope = matches.subcommand().map(|(_, sub)| sub);
         }
-        if matches.get_flag("ask-vault-pass") {
-            sources.push((
-                matches.index_of("ask-vault-pass").unwrap_or(usize::MAX),
-                None,
-                None,
-            ));
-        }
-        if sources.len() > 32 {
+        if ordered.len() > 32 {
             bail!("At most 32 Vault password sources are supported");
         }
-        sources.sort_by_key(|source| source.0);
-        let secrets = sources
+        let secrets = ordered
             .into_iter()
             .map(|(_, id, path)| {
                 let password = password(path.as_deref(), id.as_deref())?;

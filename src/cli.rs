@@ -25,7 +25,7 @@ pub fn build_cli() -> Command {
                 .value_parser(clap::value_parser!(std::path::PathBuf)),
         )
         .subcommand(
-            Command::new("playbook")
+            Command::new("playbook").args(vault_args())
                 .arg(extra_vars_arg())
                 .args(connection_args())
                 .arg(Arg::new("diff").long("diff").action(ArgAction::SetTrue).help("Show bounded structured differences from supported modules"))
@@ -78,7 +78,7 @@ pub fn build_cli() -> Command {
                 ),
         )
         .subcommand(
-            Command::new("ad-hoc")
+            Command::new("ad-hoc").args(vault_args())
                 .arg(extra_vars_arg())
                 .args(connection_args())
                 .arg(Arg::new("diff").long("diff").action(ArgAction::SetTrue).help("Show bounded structured differences from supported modules"))
@@ -158,7 +158,7 @@ pub fn build_cli() -> Command {
                 ),
         )
         .subcommand(
-            Command::new("inventory-debug")
+            Command::new("inventory-debug").args(vault_args())
                 .about("Debug and display information about inventory files")
                 .arg(
                     Arg::new("inventory")
@@ -189,30 +189,28 @@ fn vault_args() -> [Arg; 3] {
     [
         Arg::new("vault-password-file")
             .long("vault-password-file")
-            .global(true)
             .action(ArgAction::Append)
             .value_parser(clap::value_parser!(std::path::PathBuf))
             .value_name("FILE")
             .help("Read a Vault password from a regular non-executable file"),
         Arg::new("vault-id")
             .long("vault-id")
-            .global(true)
             .action(ArgAction::Append)
             .value_name("ID@SOURCE")
             .help("Vault password source: ID@FILE or ID@prompt"),
         Arg::new("ask-vault-pass")
             .long("ask-vault-pass")
-            .global(true)
             .action(ArgAction::SetTrue)
             .help("Prompt for a Vault password on the controlling terminal"),
     ]
 }
 fn vault_command() -> Command {
     let mut command = Command::new("vault")
+        .args(vault_args())
         .about("Encrypt, decrypt, view or rekey Ansible Vault files")
         .subcommand_required(true);
     for action in ["encrypt", "decrypt", "view", "rekey"] {
-        let mut sub = Command::new(action).arg(
+        let mut sub = Command::new(action).args(vault_args()).arg(
             Arg::new("input")
                 .value_parser(clap::value_parser!(std::path::PathBuf))
                 .value_name("FILE")

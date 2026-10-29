@@ -460,6 +460,20 @@ fn multiple_vault_ids_are_hints_and_new_outputs_are_private() -> Result<()> {
             .output()?,
     );
     assert_eq!(result.stdout, b"multi-id-payload");
+    let before_root = root.join("before-root");
+    success(
+        command()
+            .arg("--vault-id")
+            .arg(format!("dev@{}", dev.display()))
+            .args(["vault", "encrypt"])
+            .arg(&input)
+            .arg("--vault-id")
+            .arg(format!("prod@{}", prod.display()))
+            .args(["--encrypt-vault-id", "dev", "--output"])
+            .arg(&before_root)
+            .output()?,
+    );
+    assert!(fs::read(&before_root)?.starts_with(b"$ANSIBLE_VAULT;1.2;AES256;dev\n"));
     let inode = fs::metadata(&output)?.ino();
     std::os::unix::fs::symlink(&output, root.join("link"))?;
     let failed = command()
