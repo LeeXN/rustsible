@@ -63,6 +63,13 @@ impl Invocation {
                 return super::debug::execute_without_connection(&self.args);
             }
             let config = config.context("Target module needs a connection configuration")?;
+            if self.module == Builtin::Meta {
+                runtime.reset(&config.name)?;
+                return Ok(ModuleResult {
+                    msg: "Connection reset".into(),
+                    ..ModuleResult::default()
+                });
+            }
             if matches!(self.module, Builtin::Copy | Builtin::Template) {
                 let mut args = self.args.clone();
                 let mut source = if self.module == Builtin::Template {

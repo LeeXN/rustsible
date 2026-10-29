@@ -494,8 +494,8 @@ impl Play {
     }
 
     /// Execute one task concurrently across hosts, while keeping the task
-    /// sequence itself ordered. Work is batched to avoid creating an
-    /// unbounded number of operating-system threads for a large inventory.
+    /// sequence itself ordered. Each bounded worker takes the next available
+    /// host immediately, so a slow host cannot stall an otherwise free slot.
     fn execute_task_on_hosts<'a>(
         play: &Play,
         task: &Task,
@@ -506,60 +506,43 @@ impl Play {
         forks: usize,
     ) -> Vec<(&'a Host, Task, Result<TaskResult>)> {
         let runtime = &state.workers;
-        let mut results = Vec::with_capacity(hosts.len());
-        for batch in hosts.chunks(forks) {
-            let completed = std::thread::scope(|scope| {
-                let mut workers = Vec::with_capacity(batch.len());
-                for host in batch.iter().copied() {
-                    let host_vars = state.contexts.get(&host.name);
-                    let host_definitions = definitions.get(&host.name);
-                    let effective_task = play.apply_play_settings(task, host);
-                    let worker_task = effective_task.clone();
-                    let worker = scope.spawn(move || match (host_vars, host_definitions) {
-                        (Some(vars), Some(definitions)) => worker_task.execute_with_definitions(
-                            host,
-                            vars,
-                            definitions,
-                            &play.vars,
-                            check_mode,
-                            runtime,
-                        ),
-                        _ => Err(anyhow::anyhow!(
-                            "Internal error: no variable context for host '{}'",
-                            host.name
-                        )),
-                    });
-                    workers.push((host, effective_task, worker));
+        crate::scheduler::map(&hosts, forks, |&host| {
+            let effective_task = play.apply_play_settings(task, host);
+            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                match (state.contexts.get(&host.name), definitions.get(&host.name)) {
+                    (Some(vars), Some(definitions)) => effective_task.execute_with_definitions(
+                        host,
+                        vars,
+                        definitions,
+                        &play.vars,
+                        check_mode,
+                        runtime,
+                    ),
+                    _ => Err(anyhow::anyhow!(
+                        "Internal error: no variable context for host '{}'",
+                        host.name
+                    )),
                 }
-
-                workers
-                    .into_iter()
-                    .map(|(host, effective_task, worker)| {
-                        let result = match worker.join() {
-                            Ok(result) => result,
-                            Err(_) => Err(anyhow::anyhow!(
-                                "Task worker panicked while processing host '{}'",
-                                host.name
-                            )),
-                        };
-                        let result = result.map_err(|error| {
-                            if let Some(source) = &effective_task.source_file {
-                                anyhow::anyhow!(
-                                    "{}: task '{}': {error:#}",
-                                    source.display(),
-                                    effective_task.name
-                                )
-                            } else {
-                                error
-                            }
-                        });
-                        (host, effective_task, result)
-                    })
-                    .collect::<Vec<_>>()
+            }))
+            .unwrap_or_else(|_| {
+                Err(anyhow::anyhow!(
+                    "Task worker panicked while processing host '{}'",
+                    host.name
+                ))
             });
-            results.extend(completed);
-        }
-        results
+            let result = result.map_err(|error| {
+                if let Some(source) = &effective_task.source_file {
+                    anyhow::anyhow!(
+                        "{}: task '{}': {error:#}",
+                        source.display(),
+                        effective_task.name
+                    )
+                } else {
+                    error
+                }
+            });
+            (host, effective_task, result)
+        })
     }
 
     fn apply_play_settings(&self, task: &Task, host: &Host) -> Task {
@@ -716,6 +699,59 @@ mod tests {
         let error = play.execute_with_options(&[], false, 0).unwrap_err();
         assert!(error.to_string().contains("forks"));
         assert!(error.to_string().contains("greater than zero"));
+    }
+
+    #[test]
+    fn idle_slots_take_later_hosts_before_slow_host_finishes_and_keep_task_barrier() {
+        let temp = tempdir().unwrap();
+        let root = temp.path().to_str().unwrap();
+        let script = temp.path().join("work.sh");
+        fs::create_dir(temp.path().join("active")).unwrap();
+        fs::write(
+            &script,
+            format!(
+                r#"#!/bin/sh
+set -eu
+root='{root}'
+mkdir "$root/active/$1"
+trap 'rmdir "$root/active/$1"' EXIT
+set -- "$1" "$root"/active/*
+[ "$#" -le 3 ] || {{ touch "$root/overflow"; exit 43; }}
+case "$1" in
+slow)
+    for attempt in $(seq 1 200); do
+        [ ! -f "$root/release" ] || exit 0
+        sleep 0.05
+    done
+    exit 42;;
+last) touch "$root/release";;
+esac
+"#
+            ),
+        )
+        .unwrap();
+        let hosts = ["slow", "fast", "last"]
+            .map(|name| create_test_host(name, "localhost", 22, None, None));
+        let mut play = create_test_play();
+        let mut work = create_command_task(
+            "work",
+            &format!("/bin/sh {} {{{{ inventory_hostname }}}}", script.display()),
+        );
+        work.register = Some("work_result".into());
+        play.tasks.push(work);
+        play.tasks.push(create_command_task(
+            "barrier",
+            &format!("/bin/sh -c 'test -z \"$(ls -A {root}/active)\"'"),
+        ));
+        let mut state = RunState::default();
+        play.execute_in_run(&hosts, false, 2, &mut state).unwrap();
+        assert!(temp.path().join("release").exists());
+        assert!(!temp.path().join("overflow").exists());
+        for host in &hosts {
+            let result = &state.contexts[&host.name].registered["work_result"];
+            assert_eq!(result["rc"].as_i64(), Some(0));
+            assert_eq!(state.stats[&host.name].ok, 2);
+        }
     }
 
     #[test]

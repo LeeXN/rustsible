@@ -86,48 +86,18 @@ pub fn run_adhoc_with_options(
     println!("\n{}", "TASK [Execute ad-hoc command]".bold());
     println!("{}\n", "------------------------------".dimmed());
 
-    // Keep the amount of simultaneous SSH/local work bounded. Chunks are
-    // joined in their original order so user-visible output and recap remain
-    // deterministic even though execution within each chunk is concurrent.
     let runtime = crate::worker::Runtime::new(options.worker_dir.clone());
-    let mut executions = Vec::with_capacity(hosts.len());
-    for chunk in hosts.chunks(options.forks) {
-        let chunk_executions = std::thread::scope(|scope| {
-            let module_args = &module_args;
-            let runtime = &runtime;
-            let handles = chunk
-                .iter()
-                .map(|host| {
-                    scope.spawn(move || {
-                        info!("Running module {} on host {}", module_name, host.name);
-                        let start_time = Instant::now();
-                        let result = execute_adhoc_with_runtime(
-                            host,
-                            module_name,
-                            module_args,
-                            options,
-                            runtime,
-                        );
-                        HostExecution {
-                            result,
-                            duration: start_time.elapsed(),
-                        }
-                    })
-                })
-                .collect::<Vec<_>>();
-
-            handles
-                .into_iter()
-                .map(|handle| {
-                    handle.join().unwrap_or_else(|_| HostExecution {
-                        result: Err(anyhow::anyhow!("Ad-hoc host worker panicked")),
-                        duration: std::time::Duration::ZERO,
-                    })
-                })
-                .collect::<Vec<_>>()
-        });
-        executions.extend(chunk_executions);
-    }
+    let executions = crate::scheduler::map(hosts, options.forks, |host| {
+        let start_time = Instant::now();
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            execute_adhoc_with_runtime(host, module_name, &module_args, options, &runtime)
+        }))
+        .unwrap_or_else(|_| Err(anyhow::anyhow!("Ad-hoc host worker panicked")));
+        HostExecution {
+            result,
+            duration: start_time.elapsed(),
+        }
+    });
 
     let mut success_count = 0;
     let mut failed_details = Vec::new();

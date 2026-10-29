@@ -14,6 +14,7 @@ pub enum Builtin {
     Command,
     Shell,
     Debug,
+    Meta,
     Copy,
     File,
     Template,
@@ -28,10 +29,11 @@ pub enum Builtin {
 }
 
 impl Builtin {
-    pub const ALL: [Self; 14] = [
+    pub const ALL: [Self; 15] = [
         Self::Command,
         Self::Shell,
         Self::Debug,
+        Self::Meta,
         Self::Copy,
         Self::File,
         Self::Template,
@@ -62,6 +64,7 @@ impl Builtin {
             Self::Command => "command",
             Self::Shell => "shell",
             Self::Debug => "debug",
+            Self::Meta => "meta",
             Self::Copy => "copy",
             Self::File => "file",
             Self::Template => "template",
@@ -77,7 +80,7 @@ impl Builtin {
     }
     pub fn check_support(self) -> CheckSupport {
         match self {
-            Self::Debug | Self::Setup | Self::Stat => CheckSupport::ReadOnly,
+            Self::Debug | Self::Meta | Self::Setup | Self::Stat => CheckSupport::ReadOnly,
             Self::Command | Self::Shell => CheckSupport::Skip,
             _ => CheckSupport::Predict,
         }
@@ -95,6 +98,7 @@ impl Builtin {
         match self {
             Self::Command | Self::Shell => &["cmd"],
             Self::Debug => &["msg", "var", "_var_value"],
+            Self::Meta => &["action"],
             Self::Copy => &["src", "content", "dest", "mode", "owner", "group", "force"],
             Self::File => &["path", "dest", "state", "src", "mode", "owner", "group"],
             Self::Template => &["src", "content", "dest", "mode", "owner", "group", "vars"],
@@ -198,6 +202,11 @@ impl Builtin {
             Ok(())
         };
         match self {
+            Self::Meta => {
+                if string("action") != Some("reset_connection") {
+                    bail!("Only meta action reset_connection is currently supported");
+                }
+            }
             Self::Copy | Self::Template => {
                 required("dest")?;
                 if args.get("src").is_some() == args.get("content").is_some() {
