@@ -23,6 +23,7 @@ extern "C" fn interrupt(_: libc::c_int) {
 pub struct Supervised {
     pub result: ModuleResult,
     pub cancelled: bool,
+    pub timed_out: bool,
 }
 
 pub fn interrupted() -> bool {
@@ -30,11 +31,20 @@ pub fn interrupted() -> bool {
 }
 
 pub fn prepare() -> Result<()> {
+    prepare_signals(true)
+}
+pub fn prepare_detached() -> Result<()> {
+    prepare_signals(false)
+}
+fn prepare_signals(follow_parent: bool) -> Result<()> {
     // SAFETY: called only by the standalone, single-threaded worker before
     // fork. All pointers are valid stack objects and handlers only store an
     // atomic flag. No allocator/IO/locking is used by a signal handler.
     unsafe {
         libc::signal(libc::SIGCHLD, libc::SIG_DFL);
+        if !follow_parent {
+            libc::signal(libc::SIGPIPE, libc::SIG_IGN);
+        }
         let mut action: libc::sigaction = std::mem::zeroed();
         action.sa_sigaction = interrupt as *const () as usize;
         libc::sigemptyset(&mut action.sa_mask);
@@ -44,7 +54,13 @@ pub fn prepare() -> Result<()> {
                     .context("Cannot install worker cancellation handler");
             }
         }
-        libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGTERM, 0, 0, 0);
+        libc::prctl(
+            libc::PR_SET_PDEATHSIG,
+            if follow_parent { libc::SIGTERM } else { 0 },
+            0,
+            0,
+            0,
+        );
     }
     Ok(())
 }
@@ -57,6 +73,24 @@ pub fn run(
     managed: bool,
     may_modify: bool,
     keep_services: bool,
+    execute: impl FnOnce(&std::path::Path) -> ModuleResult,
+) -> Result<Supervised> {
+    run_with_control(timeout, managed, may_modify, keep_services, true, execute)
+}
+pub fn run_detached(
+    timeout: Duration,
+    may_modify: bool,
+    keep_services: bool,
+    execute: impl FnOnce(&std::path::Path) -> ModuleResult,
+) -> Result<Supervised> {
+    run_with_control(timeout, false, may_modify, keep_services, false, execute)
+}
+fn run_with_control(
+    timeout: Duration,
+    managed: bool,
+    may_modify: bool,
+    keep_services: bool,
+    watch_control: bool,
     execute: impl FnOnce(&std::path::Path) -> ModuleResult,
 ) -> Result<Supervised> {
     let main_pid = unsafe { libc::getpid() };
@@ -80,13 +114,20 @@ pub fn run(
                 libc::_exit(125);
             }
         }
-        let execution = run_core(timeout, managed, may_modify, keep_services, execute)
-            .unwrap_or_else(|error| {
-                cancelled(
-                    may_modify,
-                    &format!("Request supervision failed: {error:#}"),
-                )
-            });
+        let execution = run_core(
+            timeout,
+            managed,
+            may_modify,
+            keep_services,
+            watch_control,
+            execute,
+        )
+        .unwrap_or_else(|error| {
+            cancelled(
+                may_modify,
+                &format!("Request supervision failed: {error:#}"),
+            )
+        });
         let mut output = unsafe { File::from_raw_fd(descriptors[1]) };
         let status = if write_frame(&mut output, &execution, MAX_RESPONSE_BYTES).is_ok() {
             0
@@ -161,6 +202,7 @@ fn run_core(
     managed: bool,
     may_modify: bool,
     keep_services: bool,
+    watch_control: bool,
     execute: impl FnOnce(&std::path::Path) -> ModuleResult,
 ) -> Result<Supervised> {
     if unsafe { libc::prctl(libc::PR_SET_CHILD_SUBREAPER, 1, 0, 0, 0) } != 0 {
@@ -265,7 +307,10 @@ fn run_core(
                 ));
             }
             if Instant::now() >= deadline {
-                return Ok(cancelled(may_modify, "Worker execution timed out"));
+                return Ok(Supervised {
+                    timed_out: true,
+                    ..cancelled(may_modify, "Worker execution timed out")
+                });
             }
             let mut poll = [
                 libc::pollfd {
@@ -279,7 +324,7 @@ fn run_core(
                     revents: 0,
                 },
                 libc::pollfd {
-                    fd: 0,
+                    fd: if watch_control { 0 } else { -1 },
                     events: libc::POLLIN,
                     revents: 0,
                 },
@@ -304,6 +349,7 @@ fn run_core(
                             return Ok(Supervised {
                                 result: response.validate()?,
                                 cancelled: false,
+                                timed_out: false,
                             });
                         }
                         Ok(length) => {
@@ -350,6 +396,7 @@ fn run_core(
 fn cancelled(may_modify: bool, message: &str) -> Supervised {
     Supervised {
         cancelled: true,
+        timed_out: false,
         result: ModuleResult {
             failed: true,
             uncertain: may_modify,

@@ -1,0 +1,32 @@
+- hosts: localhost
+  gather_facts: false
+  vars:
+    demo_root: /tmp/rustsible-async-demo
+    ansible_async_dir: '{{ demo_root }}/jobs'
+  tasks:
+    - file:
+        path: '{{ demo_root }}'
+        state: directory
+        mode: '0700'
+    - shell: 'while [ ! -f {{ demo_root }}/gate ]; do sleep 0.05; done; printf complete > {{ demo_root }}/business; printf done'
+      async: 30
+      poll: 0
+      register: background
+    - copy:
+        content: ready
+        dest: '{{ demo_root }}/gate'
+      when: background is not skipped
+    - async_status:
+        jid: '{{ background.ansible_job_id }}'
+      register: result
+      until: result is finished
+      retries: 100
+      delay: 0.05
+      when: background is not skipped
+    - debug:
+        msg: '{{ result.stdout }}'
+      when: background is not skipped
+    - async_status:
+        jid: '{{ background.ansible_job_id }}'
+        mode: cleanup
+      when: background is not skipped

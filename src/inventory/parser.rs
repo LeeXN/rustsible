@@ -562,6 +562,9 @@ pub(crate) fn validate_resolved_connection_variable(
     {
         bail!("rustsible_remote_tmp must be an absolute path without control characters");
     }
+    if key == "ansible_async_dir" {
+        rustsible_protocol::validate_async_directory(value)?;
+    }
     if matches!(key, "ansible_connection" | "ansible_connection_type")
         && !matches!(
             value.trim().to_ascii_lowercase().as_str(),
@@ -583,6 +586,7 @@ pub(crate) fn validate_yaml_connection_variable(key: &str, value: &Value) -> Res
 pub(crate) fn validate_resolved_yaml_connection_variable(key: &str, value: &Value) -> Result<()> {
     let string_variables = [
         "rustsible_remote_tmp",
+        "ansible_async_dir",
         "ansible_host",
         "ansible_ssh_host",
         "ansible_user",

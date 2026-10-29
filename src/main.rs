@@ -109,6 +109,8 @@ fn main() -> Result<()> {
                     .map(|values| values.cloned().collect())
                     .unwrap_or_default(),
                 become_user: sub_matches.get_one::<String>("become-user").cloned(),
+                background: *sub_matches.get_one::<u64>("background").unwrap_or(&0),
+                poll: *sub_matches.get_one::<u64>("poll").unwrap_or(&15),
                 check_mode: sub_matches.get_flag("check"),
                 forks,
                 worker_dir: sub_matches

@@ -39,6 +39,9 @@ impl Outcome {
 #[derive(Debug, Default, Clone, serde::Serialize, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ModuleResult {
+    /// A private async result keeps its display policy when queried later.
+    #[serde(default)]
+    pub no_log: bool,
     pub stdout: String,
     pub stderr: String,
     pub rc: Option<i32>,
@@ -53,6 +56,22 @@ pub struct ModuleResult {
 }
 
 impl ModuleResult {
+    pub fn displayed(&self) -> Self {
+        if !self.no_log {
+            return self.clone();
+        }
+        Self {
+            no_log: true,
+            changed: self.changed,
+            failed: self.failed,
+            skipped: self.skipped,
+            unreachable: self.unreachable,
+            uncertain: self.uncertain,
+            rc: self.rc,
+            msg: "output censored because no_log is enabled".into(),
+            ..Default::default()
+        }
+    }
     pub fn outcome(&self) -> Outcome {
         Outcome::from_flags(
             self.failed || self.rc.is_some_and(|rc| rc != 0),

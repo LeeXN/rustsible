@@ -3,6 +3,7 @@ mod facts;
 mod files;
 mod filesystem;
 mod http;
+mod jobs;
 mod lines;
 mod modules;
 mod packages;
@@ -47,6 +48,19 @@ fn run() -> Result<()> {
     }
     let mut args = std::env::args().skip(1);
     let action = args.next();
+    if action.as_deref() == Some("--async-supervisor") {
+        let descriptor = args
+            .next()
+            .ok_or_else(|| anyhow::anyhow!("Missing async descriptor"))?
+            .parse()?;
+        let jid = args
+            .next()
+            .ok_or_else(|| anyhow::anyhow!("Missing async job ID"))?;
+        if args.next().is_some() {
+            bail!("Unexpected async supervisor arguments");
+        }
+        return jobs::supervise(descriptor, &jid);
+    }
     if args.next().is_some() || !matches!(action.as_deref(), Some("--handshake" | "--serve")) {
         bail!("Expected worker --handshake or --serve");
     }
@@ -173,9 +187,19 @@ fn run() -> Result<()> {
         let execution = supervisor::run(
             Duration::from_millis(timeout),
             request.managed,
-            !matches!(request.module.as_str(), "setup" | "stat") && !request.check,
-            !request.check && matches!(request.module.as_str(), "service" | "systemd" | "package"),
-            |scratch| modules::execute(&request, scratch, payload.as_ref().map(|file| file.path())),
+            request.asynchronous.is_some()
+                || rustsible_protocol::registry::Builtin::lookup(&request.module)?
+                    .may_modify(&request.args, request.check),
+            !request.check
+                && (request.asynchronous.is_some()
+                    || matches!(request.module.as_str(), "service" | "systemd" | "package")),
+            |scratch| {
+                if request.asynchronous.is_some() {
+                    jobs::start(&request)
+                } else {
+                    modules::execute(&request, scratch, payload.as_ref().map(|file| file.path()))
+                }
+            },
         )?;
         rustsible_protocol::write_frame(
             &mut output,

@@ -129,7 +129,15 @@ fn apply_settings(args: &Mapping) -> Result<Option<Task>> {
         if !SUPPORTED_TASK_KEYWORDS.contains(&key)
             || matches!(
                 key,
-                "loop" | "with_items" | "loop_control" | "register" | "until" | "retries" | "delay"
+                "async"
+                    | "poll"
+                    | "loop"
+                    | "with_items"
+                    | "loop_control"
+                    | "register"
+                    | "until"
+                    | "retries"
+                    | "delay"
             )
         {
             bail!("Unsupported include apply keyword: {key}");
@@ -543,37 +551,7 @@ pub(crate) fn expand_tasks(
         .into_iter()
         .map(|entry| entry.task)
         .collect::<Vec<_>>();
-    let apply = request.args.get(Value::String("apply".into()));
-    let settings = if let Some(apply) = apply {
-        let mapping = apply
-            .as_mapping()
-            .context("include apply must be a mapping")?
-            .clone();
-        for key in mapping.keys().filter_map(Value::as_str) {
-            if !SUPPORTED_TASK_KEYWORDS.contains(&key)
-                || matches!(
-                    key,
-                    "loop"
-                        | "with_items"
-                        | "loop_control"
-                        | "register"
-                        | "until"
-                        | "retries"
-                        | "delay"
-                )
-            {
-                bail!("Unsupported include apply keyword: {key}");
-            }
-        }
-        Some(parse_task_parts(
-            mapping,
-            TaskKind::Task,
-            "include apply".into(),
-            Mapping::new(),
-        )?)
-    } else {
-        None
-    };
+    let settings = apply_settings(&request.args)?;
     for task in &mut tasks {
         if let Some(settings) = &settings {
             task.inherit(settings);
@@ -884,6 +862,8 @@ const UNSUPPORTED_PLAY_KEYWORDS: &[&str] = &[
 ];
 
 const SUPPORTED_TASK_KEYWORDS: &[&str] = &[
+    "async",
+    "poll",
     "delegate_to",
     "delegate_facts",
     "throttle",
@@ -917,7 +897,6 @@ const SUPPORTED_TASK_KEYWORDS: &[&str] = &[
 const UNSUPPORTED_TASK_KEYWORDS: &[&str] = &[
     "action",
     "always",
-    "async",
     "become_exe",
     "become_flags",
     "become_method",
@@ -927,7 +906,6 @@ const UNSUPPORTED_TASK_KEYWORDS: &[&str] = &[
     "diff",
     "listen",
     "module_defaults",
-    "poll",
     "port",
     "remote_user",
     "rescue",
@@ -1189,7 +1167,9 @@ impl Loader<'_> {
                     if !SUPPORTED_TASK_KEYWORDS.contains(&key)
                         || matches!(
                             key,
-                            "loop"
+                            "async"
+                                | "poll"
+                                | "loop"
                                 | "with_items"
                                 | "loop_control"
                                 | "register"
@@ -1389,7 +1369,7 @@ fn parse_task_parts(
             validate_condition(value, keyword)?;
         }
     }
-    for keyword in ["retries", "delay", "timeout"] {
+    for keyword in ["retries", "delay", "timeout", "async", "poll"] {
         if let Some(value) = task_map.get(Value::String(keyword.into())) {
             if !matches!(value, Value::Number(_) | Value::String(_)) {
                 bail!("Task {keyword} must be a number or template expression");
@@ -1475,6 +1455,8 @@ fn parse_task_parts(
         retries: task_map.get(Value::String("retries".into())).cloned(),
         delay: task_map.get(Value::String("delay".into())).cloned(),
         timeout: task_map.get(Value::String("timeout".into())).cloned(),
+        asynchronous: task_map.get(Value::String("async".into())).cloned(),
+        poll: task_map.get(Value::String("poll".into())).cloned(),
         environment: parse_environment(&task_map)?,
         notify,
         ignore_errors,
@@ -2124,7 +2106,7 @@ mod tests {
 
     #[test]
     fn recognized_but_unsupported_task_keywords_are_not_modules() {
-        for keyword in ["async", "poll"] {
+        for keyword in ["collections", "diff"] {
             let content = format!(
                 "---\n- hosts: all\n  tasks:\n    - command: echo\n      {keyword}: true\n"
             );

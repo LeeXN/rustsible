@@ -170,7 +170,7 @@ impl TaskResult {
             msg: module_result.msg,
             host: host.to_string(),
             values,
-            no_log: false,
+            no_log: module_result.no_log,
         }
     }
 }
@@ -210,6 +210,8 @@ pub struct Task {
     pub retries: Option<Value>,
     pub delay: Option<Value>,
     pub timeout: Option<Value>,
+    pub asynchronous: Option<Value>,
+    pub poll: Option<Value>,
     pub environment: Mapping,
     pub notify: Vec<String>,
     pub ignore_errors: Option<bool>,
@@ -329,6 +331,12 @@ impl Task {
         self.no_log = self.no_log.or(parent.no_log);
         if self.timeout.is_none() {
             self.timeout = parent.timeout.clone();
+        }
+        if self.asynchronous.is_none() {
+            self.asynchronous = parent.asynchronous.clone();
+        }
+        if self.poll.is_none() {
+            self.poll = parent.poll.clone();
         }
         let mut conditions = Vec::new();
         for condition in [&parent.when, &self.when].into_iter().flatten() {
@@ -471,7 +479,7 @@ impl Task {
                         let mut result = TaskResult::new(&host.name);
                         result.skipped = true;
                         result.msg = "No items in loop".to_string();
-                        result.no_log = self.no_log.unwrap_or(false);
+                        result.no_log |= self.no_log.unwrap_or(false);
                         print_task_result(
                             &host.name,
                             &self.name,
@@ -516,7 +524,7 @@ impl Task {
                         let mut result = TaskResult::new(&host.name);
                         result.skipped = true;
                         result.msg = "Skipped loop item due to condition".to_string();
-                        result.no_log = self.no_log.unwrap_or(false);
+                        result.no_log |= self.no_log.unwrap_or(false);
                         let elapsed = start_time.elapsed();
                         print_loop_iteration_result(
                             &host.name,
@@ -564,7 +572,7 @@ impl Task {
                         result
                     }
                 };
-                result.no_log = self.no_log.unwrap_or(false);
+                result.no_log |= self.no_log.unwrap_or(false);
                 self.resolve_notifications(&mut result, &iter_vars, &mut engine);
                 for include in &mut result.includes {
                     include.iteration = idx;
@@ -640,7 +648,7 @@ impl Task {
                     let mut result = TaskResult::new(&host.name);
                     result.skipped = true;
                     result.msg = "Skipped due to condition".to_string();
-                    result.no_log = self.no_log.unwrap_or(false);
+                    result.no_log |= self.no_log.unwrap_or(false);
                     print_task_result(
                         &host.name,
                         &self.name,
@@ -659,7 +667,7 @@ impl Task {
                 execution,
                 &definitions,
             )?;
-            result.no_log = self.no_log.unwrap_or(false);
+            result.no_log |= self.no_log.unwrap_or(false);
             self.resolve_notifications(&mut result, &vars, &mut engine);
             results.push(result);
         }
@@ -686,7 +694,8 @@ impl Task {
         final_result.unreachable = results.iter().any(|result| result.unreachable);
         final_result.uncertain = results.iter().any(|result| result.uncertain);
         final_result.skipped = skipped;
-        final_result.no_log = self.no_log.unwrap_or(false);
+        final_result.no_log =
+            self.no_log.unwrap_or(false) || results.iter().any(|result| result.no_log);
 
         if self.loop_items.is_some() {
             final_result.values.insert(
@@ -1025,9 +1034,22 @@ impl Task {
             };
             environment.insert(name.to_owned(), text);
         }
+        let asynchronous =
+            self.integer_keyword(&self.asynchronous, 0, "async", engine, &context)?;
+        let poll = self.integer_keyword(&self.poll, 15, "poll", engine, &context)?;
+        if !(0..=604800).contains(&asynchronous) || !(0..=604800).contains(&poll) {
+            return Err(anyhow!(
+                "Async duration and poll must be nonnegative seconds up to seven days"
+            ));
+        }
         let invocation =
             Invocation::prepare(module_name, &Value::Mapping(resolved_args), check_mode)?
-                .with_execution(environment, (timeout > 0).then_some(timeout as u64 * 1000));
+                .with_execution(environment, (timeout > 0).then_some(timeout as u64 * 1000))
+                .with_async(
+                    asynchronous as u64,
+                    poll as u64,
+                    self.no_log.unwrap_or(false),
+                )?;
         let delegate = self.delegate_to.as_ref().map(|source| -> Result<String> {
             let value = crate::playbook::templar::render_value(source, engine, &context, true)?;
             let name = value.as_str().filter(|name| !name.trim().is_empty() && !name.chars().any(|ch| ch.is_control() || ch.is_whitespace()))
@@ -1696,6 +1718,8 @@ mod tests {
             retries: None,
             delay: None,
             timeout: None,
+            asynchronous: None,
+            poll: None,
             environment: Mapping::new(),
             notify: Vec::new(),
             ignore_errors: None,

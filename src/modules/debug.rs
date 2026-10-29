@@ -18,6 +18,7 @@ pub fn execute_without_connection(args: &Value) -> Result<ModuleResult> {
                 if let Value::String(msg) = value {
                     debug!("Debug module message is {} bytes", msg.len());
                     return Ok(ModuleResult {
+                        no_log: false,
                         stdout: msg.clone(),
                         stderr: String::new(),
                         rc: None,
@@ -32,6 +33,7 @@ pub fn execute_without_connection(args: &Value) -> Result<ModuleResult> {
                 } else {
                     let msg_str = format_value(value);
                     return Ok(ModuleResult {
+                        no_log: false,
                         stdout: msg_str.clone(),
                         stderr: String::new(),
                         rc: None,
@@ -60,6 +62,7 @@ pub fn execute_without_connection(args: &Value) -> Result<ModuleResult> {
                         _ => "<unknown>".to_string(), // Should ideally be string
                     };
                     Ok(ModuleResult {
+                        no_log: false,
                         stdout: value_str.clone(),
                         stderr: String::new(),
                         rc: None,
@@ -75,6 +78,7 @@ pub fn execute_without_connection(args: &Value) -> Result<ModuleResult> {
                 } else if let Value::String(rendered_string) = var_param_value {
                     debug!("DEBUG MODULE EXECUTE: 'var' key holds a string.");
                     Ok(ModuleResult {
+                        no_log: false,
                         stdout: rendered_string.clone(),
                         stderr: String::new(),
                         rc: None,
@@ -91,6 +95,7 @@ pub fn execute_without_connection(args: &Value) -> Result<ModuleResult> {
                     debug!("DEBUG MODULE EXECUTE: 'var' key holds non-string value.");
                     let var_content_str = format!("{:?}", var_param_value);
                     Ok(ModuleResult {
+                        no_log: false,
                         stdout: var_content_str.clone(),
                         stderr: String::new(),
                         rc: None,

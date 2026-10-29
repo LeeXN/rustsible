@@ -47,10 +47,11 @@ pub enum Builtin {
     Stat,
     GetUrl,
     Package,
+    AsyncStatus,
 }
 
 impl Builtin {
-    pub const ALL: [Self; 17] = [
+    pub const ALL: [Self; 18] = [
         Self::Command,
         Self::Shell,
         Self::Debug,
@@ -68,6 +69,7 @@ impl Builtin {
         Self::Stat,
         Self::GetUrl,
         Self::Package,
+        Self::AsyncStatus,
     ];
 
     pub fn lookup(name: &str) -> Result<Self> {
@@ -101,6 +103,7 @@ impl Builtin {
             Self::Stat => "stat",
             Self::GetUrl => "get_url",
             Self::Package => "package",
+            Self::AsyncStatus => "async_status",
         }
     }
     pub fn check_support(self) -> CheckSupport {
@@ -118,10 +121,32 @@ impl Builtin {
         if diff {
             bail!("Module '{}' does not support diff", self.name());
         }
-        if asynchronous {
+        if asynchronous && !self.supports_async() {
             bail!("Module '{}' does not support async", self.name());
         }
         Ok(())
+    }
+    pub fn supports_async(self) -> bool {
+        matches!(
+            self,
+            Self::Command
+                | Self::Shell
+                | Self::User
+                | Self::Service
+                | Self::Systemd
+                | Self::Package
+                | Self::File
+                | Self::Lineinfile
+                | Self::GetUrl
+        )
+    }
+    pub fn may_modify(self, args: &Value, check: bool) -> bool {
+        !check
+            && if self == Self::AsyncStatus {
+                args.get("mode").and_then(Value::as_str) == Some("cleanup")
+            } else {
+                self.check_support() != CheckSupport::ReadOnly
+            }
     }
     pub fn parameters(self) -> &'static [&'static str] {
         match self {
@@ -178,6 +203,7 @@ impl Builtin {
             Self::Stat => &["path", "checksum_algorithm"],
             Self::GetUrl => &["url", "dest", "owner", "group", "mode", "force", "checksum"],
             Self::Package => &["name", "state", "update_cache"],
+            Self::AsyncStatus => &["jid", "mode", "_async_dir"],
         }
     }
 
@@ -275,6 +301,16 @@ impl Builtin {
                     crate::param::validate_variable_name(name, "include_vars name")?;
                 }
             }
+            Self::AsyncStatus => {
+                required("jid")?;
+                crate::validate_job_id(string("jid").expect("Required job ID"))?;
+                if let Some(directory) = string("_async_dir") {
+                    crate::validate_async_directory(directory)?;
+                }
+                if !matches!(string("mode"), None | Some("status" | "cleanup")) {
+                    bail!("Async status mode must be status or cleanup");
+                }
+            }
             Self::Meta => {
                 if !matches!(
                     string("action"),
@@ -352,7 +388,7 @@ impl Builtin {
             }
         }
         if self != Self::User {
-            if let Some(mode) = string("mode") {
+            if let Some(mode) = string("mode").filter(|_| self != Self::AsyncStatus) {
                 crate::param::parse_mode(mode)?;
             }
             for key in ["owner", "group"] {

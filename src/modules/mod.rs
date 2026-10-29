@@ -24,6 +24,8 @@ pub struct AdHocOptions {
     pub become_override: Option<bool>,
     pub become_user: Option<String>,
     pub check_mode: bool,
+    pub background: u64,
+    pub poll: u64,
     pub forks: usize,
     pub worker_dir: Option<std::path::PathBuf>,
     pub extra_vars: Vec<String>,
@@ -37,6 +39,8 @@ impl Default for AdHocOptions {
             become_override: None,
             become_user: None,
             check_mode: false,
+            background: 0,
+            poll: 15,
             forks: 5,
             worker_dir: None,
             extra_vars: Vec::new(),
@@ -149,7 +153,8 @@ pub fn run_adhoc_with_options(
     let mut failed_details = Vec::new();
 
     for (host, execution) in hosts.iter().zip(&executions) {
-        match &execution.result {
+        let displayed = execution.result.as_ref().map(ModuleResult::displayed);
+        match &displayed {
             Ok(module_result) if !module_result_failed(module_result) => {
                 success_count += 1;
                 if let Some(payload) = structured_module_output(module_result)? {
@@ -391,7 +396,8 @@ fn execute_adhoc_with_runtime(
         variables,
     )?;
     let invocation =
-        registry::Invocation::prepare(module_name, &Value::Mapping(arguments), options.check_mode)?;
+        registry::Invocation::prepare(module_name, &Value::Mapping(arguments), options.check_mode)?
+            .with_async(options.background, options.poll, false)?;
     let config = invocation
         .needs_connection()
         .then(|| adhoc_config(host, options))
@@ -635,6 +641,7 @@ mod tests {
     #[test]
     fn structured_ad_hoc_output_contains_common_and_module_fields() {
         let result = ModuleResult {
+            no_log: false,
             stdout: "payload".to_string(),
             stderr: "warning".to_string(),
             rc: Some(7),

@@ -165,6 +165,7 @@ fn is_connection_variable(name: &str) -> bool {
     matches!(
         name,
         "rustsible_remote_tmp"
+            | "ansible_async_dir"
             | "ansible_host"
             | "ansible_ssh_host"
             | "ansible_port"
