@@ -1,0 +1,15 @@
+- hosts: localhost
+  gather_facts: false
+  tasks:
+    - setup:
+        gather_subset: ['!all', '!min', architecture, distribution, network]
+        filter:
+          - ansible_architecture
+          - ansible_distribution*
+          - ansible_os_family
+          - ansible_interfaces
+          - ansible_all_ipv4_addresses
+      register: selected
+    - copy:
+        content: '{{ selected.ansible_facts.ansible_architecture }}|{{ ansible_facts.architecture }}|{{ ansible_distribution }}|{{ ansible_distribution_version }}|{{ ansible_distribution_major_version }}|{{ ansible_distribution_release }}|{{ ansible_os_family }}|{{ ansible_interfaces | sort | join(",") }}|{{ ansible_all_ipv4_addresses | sort | join(",") }}'
+        dest: '@OUTPUT@/facts'

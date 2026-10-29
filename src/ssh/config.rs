@@ -31,12 +31,16 @@ impl ConnectionConfig {
         host: &Host,
         overrides: &HashMap<String, Value>,
     ) -> Result<Self> {
-        let definitions = host.all_variables();
-        let mut data = HashMap::from([(
+        let definitions = host.inventory_variables();
+        let mut data = (*host.defaults).clone();
+        for name in definitions.keys() {
+            data.remove(name);
+        }
+        data.extend(HashMap::from([(
             "inventory_hostname".into(),
             Value::String(host.name.clone()),
-        )]);
-        data.extend(overrides.clone());
+        )]));
+        crate::inventory::host::merge_variable_layer(&mut data, overrides);
         let resolved = crate::playbook::templar::resolve_definitions(&definitions, &data)?;
         Self::require_resolved(&definitions, &resolved)?;
         Self::from_context(&host.name, resolved)
@@ -69,6 +73,7 @@ impl ConnectionConfig {
             }
         }
         let host = Host {
+            defaults: Default::default(),
             name: name.to_owned(),
             variables,
             inherited_variables: HashMap::new(),

@@ -159,17 +159,52 @@ fn handshake_and_linux_facts_are_native_and_match_the_target() {
     let result = finish(child, input);
     assert_eq!(result.outcome(), Outcome::Ok);
     assert_eq!(
-        result.values["ansible_facts"]["architecture"].as_str(),
+        result.values["ansible_facts"]["ansible_architecture"].as_str(),
         Some(std::env::consts::ARCH)
     );
     assert!(
-        result.values["ansible_facts"]["date_time"]["epoch"]
+        result.values["ansible_facts"]["ansible_date_time"]["epoch"]
             .as_str()
             .unwrap()
             .parse::<u64>()
             .unwrap()
             > 0
     );
+}
+
+#[test]
+fn fact_subsets_filters_and_normalized_names_match_the_declared_surface() {
+    let args = serde_json::json!({"gather_subset":["!all","!min","architecture","distribution","network"],"filter":["ansible_architecture","ansible_os_family","ansible_interfaces","ansible_all_ipv[46]_addresses"]});
+    let (child, input) = start(request("setup", args));
+    let result = finish(child, input);
+    assert!(!result.failed, "{}", result.msg);
+    let facts = result.values["ansible_facts"].as_mapping().unwrap();
+    assert_eq!(
+        facts["ansible_architecture"].as_str(),
+        Some(std::env::consts::ARCH)
+    );
+    assert!(facts["ansible_os_family"].is_string());
+    assert!(facts["ansible_interfaces"]
+        .as_sequence()
+        .unwrap()
+        .iter()
+        .any(|value| value.as_str() == Some("lo")));
+    assert!(facts["ansible_all_ipv4_addresses"].is_sequence());
+    assert!(facts["ansible_all_ipv6_addresses"].is_sequence());
+    assert!(!facts.contains_key(serde_yaml::Value::String("ansible_date_time".into())));
+    let (child, input) = start(request(
+        "setup",
+        serde_json::json!({"gather_subset":["!all","!min"]}),
+    ));
+    assert!(finish(child, input).values["ansible_facts"]
+        .as_mapping()
+        .unwrap()
+        .is_empty());
+    let (child, input) = start(request(
+        "setup",
+        serde_json::json!({"gather_subset":["python"]}),
+    ));
+    assert!(finish(child, input).failed);
 }
 #[test]
 fn stat_checksums_and_link_handling_use_rust() {

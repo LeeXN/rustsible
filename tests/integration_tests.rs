@@ -35,6 +35,453 @@ fn local_inventory() -> NamedTempFile {
 }
 
 #[test]
+fn inventory_playbook_variable_files_and_extra_vars_keep_layers_and_source_paths() -> Result<()> {
+    let directory = TempDir::new()?;
+    let inventory_dir = directory.path().join("inventory");
+    let play_dir = directory.path().join("playbook");
+    let elsewhere = directory.path().join("elsewhere");
+    for base in [&inventory_dir, &play_dir] {
+        std::fs::create_dir_all(base.join("group_vars"))?;
+        std::fs::create_dir_all(base.join("host_vars"))?;
+    }
+    std::fs::create_dir(&elsewhere)?;
+    std::fs::write(
+        inventory_dir.join("hosts"),
+        "[web]\nnode ansible_host=unreachable.invalid ansible_connection=ssh priority=inventory\n",
+    )?;
+    std::fs::write(
+        inventory_dir.join("group_vars/all.yml"),
+        "group_value: inventory\npriority: inventorygroup",
+    )?;
+    std::fs::write(
+        inventory_dir.join("host_vars/node.yml"),
+        "priority: inventoryhost",
+    )?;
+    std::fs::write(play_dir.join("group_vars/all.yml"), "group_value: playbook")?;
+    std::fs::write(play_dir.join("host_vars/node.yml"), "host_value: playbook")?;
+    std::fs::write(
+        play_dir.join("choice.yml"),
+        "priority: varsfile\ntyped: false\nfrom_file: [one, two]\nansible_connection: local\nansible_ssh_host: localhost",
+    )?;
+    std::fs::write(
+        directory.path().join("extra.yml"),
+        "selector: choice\npriority: extrafile\nnumber: 7",
+    )?;
+    std::fs::write(
+        play_dir.join("site.yml"),
+        format!(
+            r#"
+- hosts: all
+  gather_facts: true
+  vars:
+    priority: play
+    ansible_host: unreachable.invalid
+  vars_files:
+    - [missing.yml, '{{{{ selector }}}}.yml']
+  tasks:
+    - command: /bin/true
+      register: priority
+      retries: 1
+      delay: 0
+      until: priority.rc == 0
+    - copy:
+        content: '{{{{ priority }}}}|{{{{ group_value }}}}|{{{{ host_value }}}}|{{{{ typed }}}}|{{{{ number }}}}|{{{{ from_file | join(",") }}}}'
+        dest: {}/result
+      vars:
+        priority: task
+        typed: true
+"#,
+            directory.path().display()
+        ),
+    )?;
+    let output = controller()
+        .current_dir(&elsewhere)
+        .args([
+            "playbook",
+            play_dir.join("site.yml").to_str().unwrap(),
+            "-i",
+            inventory_dir.join("hosts").to_str().unwrap(),
+            "-e",
+            &format!("@{}", directory.path().join("extra.yml").display()),
+            "-e",
+            "priority=extra",
+        ])
+        .output()?;
+    assert!(
+        output.status.success(),
+        "{}\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        std::fs::read_to_string(directory.path().join("result"))?,
+        "extra|playbook|playbook|True|7|one,two"
+    );
+    Ok(())
+}
+
+#[test]
+fn include_vars_and_set_fact_keep_lifetimes_types_and_loop_accumulation() -> Result<()> {
+    let directory = TempDir::new()?;
+    let root = directory.path().display();
+    std::fs::write(
+        directory.path().join("included.yml"),
+        "priority: included\ndelayed: '{{ later }}'\n",
+    )?;
+    std::fs::create_dir(directory.path().join("variables"))?;
+    std::fs::write(directory.path().join("variables/a.yml"), "value: first")?;
+    std::fs::write(
+        directory.path().join("variables/z.json"),
+        r#"{"value":"last","typed":true}"#,
+    )?;
+    let book = directory.path().join("site.yml");
+    std::fs::write(
+        &book,
+        format!(
+            r#"
+- hosts: localhost
+  gather_facts: false
+  vars:
+    priority: play
+  tasks:
+    - include_vars: included.yml
+      vars:
+        priority: task
+    - set_fact:
+        later: target
+        items: []
+    - copy:
+        content: '{{{{ priority }}}}|{{{{ delayed }}}}'
+        dest: {root}/included
+      vars:
+        priority: task
+    - set_fact:
+        items: '{{{{ items + [item] }}}}'
+      loop: [1, 2]
+    - set_fact:
+        priority: fact
+    - include_vars:
+        dir: variables
+        name: namespaced
+    - set_fact:
+        qualified: []
+    - set_fact:
+        qualified: '{{{{ hostvars[inventory_hostname].qualified + [item] }}}}'
+      loop: [1, 2]
+- hosts: localhost
+  gather_facts: false
+  vars:
+    priority: secondplay
+  tasks:
+    - copy:
+        content: '{{{{ priority }}}}|{{{{ delayed }}}}|{{{{ items | join(",") }}}}|{{{{ namespaced.value }}}}|{{{{ namespaced.typed }}}}|{{{{ qualified | join(",") }}}}'
+        dest: {root}/result
+"#
+        ),
+    )?;
+    let inventory = local_inventory();
+    let output = controller()
+        .args([
+            "playbook",
+            book.to_str().unwrap(),
+            "-i",
+            inventory.path().to_str().unwrap(),
+        ])
+        .output()?;
+    assert!(
+        output.status.success(),
+        "{}\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        std::fs::read_to_string(directory.path().join("included"))?,
+        "included|target"
+    );
+    assert_eq!(
+        std::fs::read_to_string(directory.path().join("result"))?,
+        "fact|target|1,2|last|True|2"
+    );
+    Ok(())
+}
+
+#[test]
+fn extra_vars_render_ad_hoc_arguments_and_debug_using_the_shared_template_path() -> Result<()> {
+    let inventory = local_inventory();
+    let output = controller()
+        .args([
+            "ad-hoc",
+            "all",
+            "-i",
+            inventory.path().to_str().unwrap(),
+            "-m",
+            "command",
+            "-a",
+            r#"{"argv":["/usr/bin/printf","%s|%s","{{ text }}","{{ items | join(',') }}"]}"#,
+            "-e",
+            r#"{"text":"two words; literal","items":[1,2]}"#,
+        ])
+        .output()?;
+    assert!(
+        output.status.success(),
+        "{}\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(String::from_utf8_lossy(&output.stdout).contains("two words; literal|1,2"));
+    let output = controller()
+        .args([
+            "ad-hoc",
+            "all",
+            "-i",
+            inventory.path().to_str().unwrap(),
+            "-m",
+            "debug",
+            "-a",
+            "var=structured",
+            "-e",
+            r#"{"structured":{"enabled":true,"items":[1,2]}}"#,
+        ])
+        .output()?;
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let text = String::from_utf8_lossy(&output.stdout);
+    assert!(text.contains("enabled") && text.contains("items"), "{text}");
+    Ok(())
+}
+
+#[test]
+fn hostvars_groups_and_source_paths_follow_host_scope_between_tasks() -> Result<()> {
+    let directory = TempDir::new()?;
+    let inventory = directory.path().join("inventory.yml");
+    std::fs::write(
+        &inventory,
+        r#"
+all:
+  vars:
+    ansible_connection: local
+    ansible_host: localhost
+  hosts:
+    outside:
+      token: untouched
+  children:
+    parent:
+      children:
+        web:
+          hosts:
+            one:
+              linked: '{{ hostvars.two.token }}'
+            two:
+              token: inventory
+"#,
+    )?;
+    let book = directory.path().join("site.yml");
+    std::fs::write(
+        &book,
+        format!(
+            r#"
+- hosts: web
+  gather_facts: false
+  vars:
+    play_only: invisible
+  tasks:
+    - set_fact:
+        token: '{{{{ inventory_hostname }}}}-fact'
+    - copy:
+        content: '{{{{ hostvars.two.token }}}}|{{{{ hostvars.one.linked }}}}|{{{{ hostvars.outside.token }}}}|{{{{ groups.web | join(",") }}}}|{{{{ group_names | join(",") }}}}|{{{{ hostvars.one.play_only | default("absent") }}}}|{{{{ inventory_dir }}}}|{{{{ playbook_dir }}}}'
+        dest: {}/{{{{ inventory_hostname }}}}
+"#,
+            directory.path().display()
+        ),
+    )?;
+    let output = controller()
+        .args([
+            "playbook",
+            book.to_str().unwrap(),
+            "-i",
+            inventory.to_str().unwrap(),
+            "-e",
+            "inventory_hostname=spoof",
+        ])
+        .output()?;
+    assert!(
+        output.status.success(),
+        "{}\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    for name in ["one", "two"] {
+        assert_eq!(
+            std::fs::read_to_string(directory.path().join(name))?,
+            format!(
+                "two-fact|two-fact|untouched|one,two|parent,web|absent|{}|{}",
+                directory.path().display(),
+                directory.path().display()
+            )
+        );
+    }
+    assert!(!directory.path().join("spoof").exists());
+    let output = controller().args(["ad-hoc", "one", "-i", inventory.to_str().unwrap(), "-m", "debug", "-a", r#"{"msg":"{{ hostvars.two.token }}|{{ groups.web | join(',') }}|{{ group_names | join(',') }}"}"#]).output()?;
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(String::from_utf8_lossy(&output.stdout).contains("inventory|one,two|parent,web"));
+    Ok(())
+}
+
+#[test]
+fn configuration_selection_and_cli_overrides_are_visible_in_real_runs() -> Result<()> {
+    let directory = TempDir::new()?;
+    let project = directory.path().join("project");
+    let environment = directory.path().join("environment");
+    let explicit = directory.path().join("explicit");
+    let home = directory.path().join("home");
+    for (base, identity) in [
+        (&project, "project"),
+        (&environment, "environment"),
+        (&explicit, "explicit"),
+        (&home, "home"),
+    ] {
+        std::fs::create_dir(base)?;
+        std::fs::write(
+            base.join("hosts"),
+            format!("node ansible_connection=local ansible_host=localhost identity={identity}\n"),
+        )?;
+        std::fs::write(
+            base.join(if identity == "home" {
+                ".ansible.cfg"
+            } else {
+                "ansible.cfg"
+            }),
+            "[defaults]\ninventory=hosts\nforks=2\nworker_dir=missing-workers\n",
+        )?;
+    }
+    let book = project.join("site.yml");
+    std::fs::write(&book, "- hosts: all\n  gather_facts: false\n  tasks:\n    - copy:\n        content: '{{ identity }}|{{ ansible_config_file }}'\n        dest: '{{ output }}'\n")?;
+    for (index, choice) in [
+        "project",
+        "environment",
+        "explicit",
+        "cli-inventory",
+        "home",
+    ]
+    .iter()
+    .enumerate()
+    {
+        if *choice == "home" {
+            std::fs::remove_file(project.join("ansible.cfg"))?;
+        }
+        let output_file = directory.path().join(format!("result-{index}"));
+        let mut command = controller();
+        command
+            .current_dir(&project)
+            .env("HOME", &home)
+            .env_remove("ANSIBLE_CONFIG")
+            .env_remove("ANSIBLE_INVENTORY")
+            .env_remove("ANSIBLE_FORKS");
+        if matches!(*choice, "environment" | "explicit" | "cli-inventory") {
+            command.env("ANSIBLE_CONFIG", environment.join("ansible.cfg"));
+        }
+        if matches!(*choice, "explicit" | "cli-inventory") {
+            command.arg("--config").arg(explicit.join("ansible.cfg"));
+        }
+        command
+            .arg("playbook")
+            .arg(&book)
+            .arg("-e")
+            .arg(format!("output={}", output_file.display()))
+            .args(["--forks", "1"]);
+        if *choice == "cli-inventory" {
+            command.arg("-i").arg(project.join("hosts"));
+        }
+        let output = command.output()?;
+        assert!(
+            output.status.success(),
+            "{choice}: {}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let identity = if *choice == "cli-inventory" {
+            "project"
+        } else {
+            choice
+        };
+        let source = match *choice {
+            "project" => project.join("ansible.cfg"),
+            "environment" => environment.join("ansible.cfg"),
+            "home" => home.join(".ansible.cfg"),
+            _ => explicit.join("ansible.cfg"),
+        };
+        assert_eq!(
+            std::fs::read_to_string(output_file)?,
+            format!("{identity}|{}", source.display())
+        );
+    }
+    Ok(())
+}
+
+#[test]
+fn configuration_become_defaults_stay_below_play_task_and_variable_settings() -> Result<()> {
+    let directory = TempDir::new()?;
+    std::fs::write(
+        directory.path().join("hosts"),
+        "node ansible_connection=local ansible_host=localhost\n",
+    )?;
+    std::fs::write(
+        directory.path().join("ansible.cfg"),
+        "[defaults]\ninventory=hosts\n[privilege_escalation]\nbecome=false\nbecome_user=root\n",
+    )?;
+    let book = directory.path().join("site.yml");
+    std::fs::write(
+        &book,
+        r#"
+- hosts: all
+  gather_facts: false
+  become: true
+  become_user: app
+  tasks:
+    - debug:
+        msg: 'play={{ ansible_become }}|{{ ansible_become_user }}'
+    - debug:
+        msg: 'task={{ ansible_become }}|{{ ansible_become_user }}'
+      become: false
+      become_user: nobody
+    - debug:
+        msg: 'variable={{ ansible_become }}|{{ ansible_become_user }}'
+      vars:
+        ansible_become: false
+        ansible_become_user: variable-user
+"#,
+    )?;
+    let output = controller()
+        .arg("--config")
+        .arg(directory.path().join("ansible.cfg"))
+        .arg("playbook")
+        .arg(&book)
+        .output()?;
+    assert!(
+        output.status.success(),
+        "{}\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let text = String::from_utf8_lossy(&output.stdout);
+    for expected in [
+        "play=True|app",
+        "task=False|nobody",
+        "variable=False|variable-user",
+    ] {
+        assert!(text.contains(expected), "{text}");
+    }
+    Ok(())
+}
+
+#[test]
 fn task_attempts_conditions_environment_and_loop_results_follow_real_execution() -> Result<()> {
     let directory = TempDir::new()?;
     let root = directory.path().display();
@@ -828,7 +1275,7 @@ fn ad_hoc_setup_and_stat_support_native_argument_forms_and_json_results() -> Res
     );
     let setup_stdout = String::from_utf8(setup.stdout)?;
     assert!(setup_stdout.contains("\"ansible_facts\""));
-    assert!(setup_stdout.contains("\"architecture\""));
+    assert!(setup_stdout.contains("\"ansible_architecture\""));
 
     let directory = TempDir::new()?;
     let inspected = directory.path().join("missing file");
@@ -949,7 +1396,10 @@ fn native_copy_inline_content_keeps_nul_and_literal_template_bytes() -> Result<(
     let inventory = local_inventory();
     let path = temporary.path().join("binary");
     let content = "literal {{ do_not_evaluate }}\0data";
-    let args = serde_json::json!({"dest":path,"content":content,"mode":"0600"}).to_string();
+    // CLI arguments now use the same initial template evaluation as Ansible.
+    // Its rendered string must reach the worker verbatim, including NUL/braces.
+    let expression = format!("{{{{ {} }}}}", serde_json::to_string(content)?);
+    let args = serde_json::json!({"dest":path,"content":expression,"mode":"0600"}).to_string();
     let output = controller()
         .args([
             "ad-hoc",

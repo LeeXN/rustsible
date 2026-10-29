@@ -1,0 +1,4 @@
+configuration: varsfile
+sequence: [first, second]
+number: '0012'
+delayed: '{{ later }}'

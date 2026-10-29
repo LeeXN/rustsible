@@ -54,6 +54,7 @@ fn run(
     }
 
     match request.module.as_str() {
+        "setup" => return crate::facts::execute(&request.args),
         "service" | "systemd" => {
             return crate::services::execute(
                 &request.args,
@@ -76,7 +77,6 @@ fn run(
         _ => {}
     }
     let allowed = match request.module.as_str() {
-        "setup" => &[][..],
         "stat" => &["path", "checksum_algorithm"][..],
         _ => bail!("Unsupported native module"),
     };
@@ -87,18 +87,6 @@ fn run(
     }
     let mut result = ModuleResult::default();
     match request.module.as_str() {
-        "setup" => {
-            let now = chrono::Local::now();
-            result.values.insert("ansible_facts".into(), serde_yaml::to_value(json!({
-                "architecture": std::env::consts::ARCH, "system": "Linux",
-                "date_time": { "date": now.format("%Y-%m-%d").to_string(), "time": now.format("%H:%M:%S").to_string(),
-                    "year": now.format("%Y").to_string(), "month": now.format("%m").to_string(), "day": now.format("%d").to_string(),
-                    "hour": now.format("%H").to_string(), "minute": now.format("%M").to_string(), "second": now.format("%S").to_string(),
-                    "weekday": now.format("%A").to_string(), "weekday_number": now.format("%w").to_string(),
-                    "epoch": now.timestamp().to_string(), "iso8601": now.with_timezone(&chrono::Utc).format("%Y-%m-%dT%H:%M:%SZ").to_string() }
-            }))?);
-            result.msg = "Facts gathered".into();
-        }
         "stat" => {
             let path = request
                 .args

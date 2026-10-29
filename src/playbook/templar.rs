@@ -9,7 +9,65 @@ use std::collections::HashMap;
 #[derive(Debug, Clone, Default)]
 pub(crate) struct RuntimeVariables {
     pub facts: HashMap<String, Value>,
+    pub defaults: std::sync::Arc<HashMap<String, Value>>,
     pub registered: HashMap<String, Value>,
+    pub included: HashMap<String, Value>,
+    pub extra: std::sync::Arc<HashMap<String, Value>>,
+    pub globals: std::sync::Arc<HashMap<String, Value>>,
+    pub magic: HashMap<String, Value>,
+}
+
+impl RuntimeVariables {
+    /// Keep precedence in one place for task arguments, vars_files and
+    /// hostvars. Only definitions are rendered; facts/register values are data.
+    pub(crate) fn layers(
+        &self,
+        definitions: &HashMap<String, Value>,
+        overlays: &[&serde_yaml::Mapping],
+        keywords: Option<&HashMap<String, Value>>,
+    ) -> Result<(HashMap<String, Value>, HashMap<String, Value>)> {
+        let mut baseline = HashMap::new();
+        if let Some(keywords) = keywords {
+            crate::inventory::host::merge_variable_layer(&mut baseline, keywords);
+        }
+        crate::inventory::host::merge_variable_layer(&mut baseline, definitions);
+        let mut definitions = baseline;
+        let mut higher = HashMap::new();
+        for overlay in overlays {
+            let layer = overlay
+                .iter()
+                .map(|(name, value)| {
+                    Ok((
+                        name.as_str()
+                            .context("Variable names must be strings")?
+                            .to_owned(),
+                        value.clone(),
+                    ))
+                })
+                .collect::<Result<HashMap<_, _>>>()?;
+            crate::inventory::host::merge_variable_layer(&mut higher, &layer);
+        }
+        crate::inventory::host::merge_variable_layer(&mut higher, &self.included);
+        // Configuration strings are literal data. Only inventory/play/task
+        // declarations are template definitions, even when a path has braces.
+        let mut data = (*self.defaults).clone();
+        for name in definitions.keys() {
+            data.remove(name);
+        }
+        data.extend(self.facts.clone());
+        for name in higher.keys() {
+            data.remove(name);
+        }
+        data.extend(self.registered.clone());
+        definitions.extend(higher);
+        crate::inventory::host::merge_variable_layer(&mut definitions, &self.extra);
+        for name in self.extra.keys() {
+            data.remove(name);
+        }
+        data.extend((*self.globals).clone());
+        data.extend(self.magic.clone());
+        Ok((definitions, data))
+    }
 }
 
 pub(crate) type TemplateContext = HashMap<String, serde_json::Value>;

@@ -7,6 +7,14 @@ pub fn build_cli() -> Command {
         .subcommand_required(true)
         .arg_required_else_help(true)
         .arg(
+            Arg::new("config")
+                .long("config")
+                .global(true)
+                .value_name("FILE")
+                .value_parser(clap::value_parser!(std::path::PathBuf))
+                .help("Explicit ansible.cfg file"),
+        )
+        .arg(
             Arg::new("worker-dir")
                 .long("worker-dir")
                 .global(true)
@@ -16,6 +24,7 @@ pub fn build_cli() -> Command {
         )
         .subcommand(
             Command::new("playbook")
+                .arg(extra_vars_arg())
                 .about("Run a Rustsible playbook")
                 .arg(
                     Arg::new("playbook")
@@ -61,6 +70,7 @@ pub fn build_cli() -> Command {
         )
         .subcommand(
             Command::new("ad-hoc")
+                .arg(extra_vars_arg())
                 .about("Run an ad-hoc command on managed nodes")
                 .arg(
                     Arg::new("pattern")
@@ -143,6 +153,15 @@ pub fn build_cli() -> Command {
                         .help("Increase verbosity (up to -vvvv)"),
                 ),
         )
+}
+
+fn extra_vars_arg() -> Arg {
+    Arg::new("extra-vars")
+        .short('e')
+        .long("extra-vars")
+        .action(ArgAction::Append)
+        .value_name("VARS")
+        .help("Extra variables as name=value, a YAML/JSON mapping, or @file")
 }
 
 #[cfg(test)]

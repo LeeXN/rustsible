@@ -84,6 +84,10 @@ jobs:
         run: bash tests/ssh/run.sh target/${{ matrix.target }}/release/rustsible target/workers sessions
       - name: Task controls over SSH and three execution identities
         run: bash tests/ssh/run.sh target/${{ matrix.target }}/release/rustsible target/workers controls
+      - name: Variable sources, facts and configuration precedence over SSH
+        run: bash tests/ssh/run.sh target/${{ matrix.target }}/release/rustsible target/workers variables
+      - name: Variable sources and facts without Python on musl
+        run: bash tests/ssh/run.sh target/${{ matrix.target }}/release/rustsible target/workers variables musl
       - name: Native execution without Python or curl (glibc)
         run: bash tests/ssh/run.sh target/${{ matrix.target }}/release/rustsible target/workers native glibc target/${{ matrix.target }}/release/examples/http_fixture
       - name: Native execution without Python or curl (musl)

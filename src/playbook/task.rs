@@ -167,11 +167,14 @@ impl Task {
         vars: &HashMap<String, Value>,
         check_mode: bool,
     ) -> Result<TaskResult> {
-        let mut definitions = host.all_variables();
+        let mut definitions = host.inventory_variables();
         crate::inventory::host::merge_variable_layer(&mut definitions, vars);
         self.execute_with_definitions(
             host,
-            &RuntimeVariables::default(),
+            &RuntimeVariables {
+                defaults: host.defaults.clone(),
+                ..Default::default()
+            },
             &definitions,
             &Mapping::new(),
             check_mode,
@@ -188,26 +191,23 @@ impl Task {
         check_mode: bool,
         workers: &crate::worker::Runtime,
     ) -> Result<TaskResult> {
-        let mut definitions = definitions.clone();
-        let mut higher_definitions = HashMap::new();
-        for layer in [play_vars, &self.vars] {
-            let mut variables = HashMap::new();
-            for (name, value) in layer {
-                let name = name.as_str().context("Variable names must be strings")?;
-                variables.insert(name.to_owned(), value.clone());
-            }
-            crate::inventory::host::merge_variable_layer(&mut higher_definitions, &variables);
+        let mut keywords = HashMap::new();
+        if let Some(value) = self.become_override.or(self.is_become.then_some(true)) {
+            keywords.insert("ansible_become".into(), Value::Bool(value));
         }
-        let mut data = runtime.facts.clone();
-        for name in higher_definitions.keys() {
-            data.remove(name);
+        if let Some(value) = self
+            .become_user_override
+            .as_ref()
+            .or((self.become_user != "root").then_some(&self.become_user))
+        {
+            keywords.insert("ansible_become_user".into(), Value::String(value.clone()));
         }
-        data.extend(runtime.registered.clone());
+        let (mut definitions, mut data) =
+            runtime.layers(definitions, &[play_vars, &self.vars], Some(&keywords))?;
         data.insert(
             "inventory_hostname".into(),
             Value::String(host.name.clone()),
         );
-        definitions.extend(higher_definitions);
         let vars = crate::playbook::templar::resolve_definitions(&definitions, &data)?;
         let start_time = Instant::now();
         info!("TASK [{}] on host {}", self.name, host.name);
@@ -248,13 +248,21 @@ impl Task {
                 debug!("Loop iteration {} of {}", idx + 1, items_list.len());
 
                 let mut iter_vars = data.clone();
-
+                for key in runtime.extra.keys() {
+                    iter_vars.remove(key);
+                }
+                iter_vars.extend((*runtime.globals).clone());
+                iter_vars.extend(runtime.magic.clone());
+                iter_vars.insert(
+                    "inventory_hostname".into(),
+                    Value::String(host.name.clone()),
+                );
+                // Loop bindings are transient execution values, above ordinary
+                // definitions (including extra vars), just like local register.
                 iter_vars.insert(loop_var.to_string(), item.clone());
-
                 if let Some(index_var) = &self.index_var_name {
                     iter_vars.insert(index_var.clone(), Value::Number(idx.into()));
                 }
-
                 let iter_vars =
                     crate::playbook::templar::resolve_definitions(&definitions, &iter_vars)?;
                 let iter_context = crate::playbook::templar::create_context(&iter_vars)?;
@@ -297,7 +305,6 @@ impl Task {
                 let mut result = match iter_task.execute_attempts(
                     host,
                     &mut engine,
-                    &iter_context,
                     &iter_vars,
                     check_mode,
                     workers,
@@ -311,6 +318,43 @@ impl Task {
                     }
                 };
                 result.no_log = self.no_log;
+
+                if !result.failed && !result.skipped {
+                    if let Some(Value::Mapping(facts)) = result.values.get("ansible_facts") {
+                        let variables = facts
+                            .iter()
+                            .map(|(name, value)| {
+                                Ok((
+                                    name.as_str()
+                                        .context("Variable names must be strings")?
+                                        .to_owned(),
+                                    value.clone(),
+                                ))
+                            })
+                            .collect::<Result<HashMap<_, _>>>()?;
+                        match Builtin::lookup(&self.module)? {
+                            Builtin::SetFact => {
+                                crate::inventory::host::merge_variable_layer(&mut data, &variables)
+                            }
+                            Builtin::IncludeVars => {
+                                for key in variables.keys() {
+                                    if !runtime.registered.contains_key(key) {
+                                        data.remove(key);
+                                    }
+                                }
+                                crate::inventory::host::merge_variable_layer(
+                                    &mut definitions,
+                                    &variables,
+                                );
+                                crate::inventory::host::merge_variable_layer(
+                                    &mut definitions,
+                                    &runtime.extra,
+                                );
+                            }
+                            _ => {}
+                        }
+                    }
+                }
 
                 let elapsed = start_time.elapsed();
                 let execution_time = format!("{:.2}s", elapsed.as_secs_f64());
@@ -360,7 +404,7 @@ impl Task {
                 ConnectionConfig::require_resolved(&definitions, &vars)?;
             }
             let mut result =
-                self.execute_attempts(host, &mut engine, &context, &vars, check_mode, workers)?;
+                self.execute_attempts(host, &mut engine, &vars, check_mode, workers)?;
             result.no_log = self.no_log;
             results.push(result);
         }
@@ -447,11 +491,11 @@ impl Task {
         &self,
         host: &Host,
         engine: &mut Environment<'_>,
-        context: &TemplateContext,
         vars: &HashMap<String, Value>,
         check: bool,
         workers: &crate::worker::Runtime,
     ) -> Result<TaskResult> {
+        let context = crate::playbook::templar::create_context(vars)?;
         let has_until = self
             .until
             .as_ref()
@@ -462,13 +506,13 @@ impl Task {
                 if has_until { 3 } else { 0 },
                 "retries",
                 engine,
-                context,
+                &context,
             )?
             .max(0);
         let total = u32::try_from(retries)?
             .checked_add(1)
             .context("Task retries is too large")?;
-        let delay = self.number_keyword(&self.delay, 5.0, "delay", engine, context)?;
+        let delay = self.number_keyword(&self.delay, 5.0, "delay", engine, &context)?;
         let delay = if delay < 0.0 { 1.0 } else { delay };
         if delay > 604800.0 {
             return Err(anyhow!("Task delay exceeds seven days"));
@@ -489,7 +533,7 @@ impl Task {
             let condition_result = (|| -> Result<bool> {
                 for (condition, failure) in [(&self.changed_when, false), (&self.failed_when, true)]
                 {
-                    if let Some(register) = &self.register {
+                    if let Some(register) = self.register.as_ref() {
                         attempt_vars.insert(register.clone(), result.registered_value());
                     }
                     if let Some(condition) = condition {
@@ -505,7 +549,7 @@ impl Task {
                         }
                     }
                 }
-                if let Some(register) = &self.register {
+                if let Some(register) = self.register.as_ref() {
                     attempt_vars.insert(register.clone(), result.registered_value());
                 }
                 if total == 1 {
@@ -632,6 +676,23 @@ impl Task {
                 }
             }
         }
+        if module_name == "include_vars" {
+            for key in ["file", "dir"] {
+                if let (Some(source), Some(Value::String(path))) = (
+                    &self.source_file,
+                    resolved_args.get_mut(Value::String(key.into())),
+                ) {
+                    if std::path::Path::new(path).is_relative() {
+                        *path = source
+                            .parent()
+                            .context("Task source has no parent")?
+                            .join(&*path)
+                            .to_string_lossy()
+                            .into_owned();
+                    }
+                }
+            }
+        }
         let timeout = self.integer_keyword(&self.timeout, 0, "timeout", engine, &context)?;
         if !(0..=604800).contains(&timeout) {
             return Err(anyhow!("Task timeout must be between zero and seven days"));
@@ -723,8 +784,16 @@ impl Task {
     ) -> Result<Option<Vec<Value>>> {
         match items {
             Value::Sequence(_) => {
-                let Value::Sequence(items) =
-                    self.render_argument_value(items, engine, context, false, false, 0, &mut 0)?
+                let Value::Sequence(items) = render_argument_value(
+                    &self.module,
+                    items,
+                    engine,
+                    context,
+                    false,
+                    false,
+                    0,
+                    &mut 0,
+                )?
                 else {
                     unreachable!("Rendering a sequence preserves its type");
                 };
@@ -768,164 +837,156 @@ impl Task {
         context: &TemplateContext,
         vars: &HashMap<String, Value>,
     ) -> Result<Mapping> {
-        let mut resolved = Mapping::new();
-        debug!(
-            "Resolving {} arguments for task '{}'",
-            self.args.len(),
-            self.name
-        );
+        render_module_arguments(&self.module, &self.args, engine, context, vars)
+    }
+}
 
-        let module_name = self.normalized_module_name();
-        let mut rendered_nodes = 0;
-        for (key, value) in &self.args {
-            let Value::String(key) = key else {
-                return Err(anyhow!("Module argument names must be strings"));
-            };
+pub(crate) fn render_module_arguments(
+    module: &str,
+    args: &Mapping,
+    engine: &mut Environment<'_>,
+    context: &TemplateContext,
+    vars: &HashMap<String, Value>,
+) -> Result<Mapping> {
+    let mut resolved = Mapping::new();
+    debug!("Resolving {} arguments for module '{}'", args.len(), module);
 
-            // These compatibility rules intentionally depend only on the
-            // top-level module argument. Mapping keys below it are data: they
-            // are validated and preserved verbatim, never treated as templates.
-            let force_string = (module_name == "template" && key == "content")
-                || (module_name == "debug" && matches!(key.as_str(), "msg" | "var"));
-            let is_mode_param =
-                matches!(module_name, "file" | "copy" | "template") && key == "mode";
+    let module_name = Builtin::lookup(module).map(Builtin::name).unwrap_or(module);
+    let mut rendered_nodes = 0;
+    for (key, value) in args {
+        let Value::String(key) = key else {
+            return Err(anyhow!("Module argument names must be strings"));
+        };
 
-            if module_name == "template" && matches!(key.as_str(), "content" | "vars") {
-                resolved.insert(Value::String(key.clone()), value.clone());
-                continue;
+        // These compatibility rules intentionally depend only on the
+        // top-level module argument. Mapping keys below it are data: they
+        // are validated and preserved verbatim, never treated as templates.
+        let force_string = (module_name == "template" && key == "content")
+            || (module_name == "debug" && matches!(key.as_str(), "msg" | "var"));
+        let is_mode_param = matches!(module_name, "file" | "copy" | "template") && key == "mode";
+
+        if module_name == "template" && matches!(key.as_str(), "content" | "vars") {
+            resolved.insert(Value::String(key.clone()), value.clone());
+            continue;
+        }
+
+        let rendered_value = render_argument_value(
+            module,
+            value,
+            engine,
+            context,
+            force_string,
+            is_mode_param,
+            0,
+            &mut rendered_nodes,
+        )
+        .map_err(|error| {
+            anyhow!(
+                "Failed to render an argument for module '{}': {}",
+                module,
+                error
+            )
+        })?;
+
+        if matches!(
+            &rendered_value,
+            Value::String(value) if value == crate::playbook::templar::OMIT_SENTINEL
+        ) {
+            continue;
+        }
+
+        resolved.insert(Value::String(key.clone()), rendered_value.clone());
+
+        // Preserve debug.var's controller-side lookup behavior without
+        // logging either the variable name or its potentially secret value.
+        if module_name == "debug" && key == "var" {
+            if let Value::String(var_name_to_lookup) = &rendered_value {
+                if let Some(found_value) = get_nested_value(var_name_to_lookup, vars) {
+                    resolved.insert(Value::String("_var_value".to_string()), found_value.clone());
+                } else {
+                    resolved.remove(Value::String("_var_value".to_string()));
+                }
+            } else {
+                resolved.remove(Value::String("_var_value".to_string()));
+            }
+        }
+    }
+
+    debug!("Finished resolving arguments for module '{}'", module);
+    Ok(resolved)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn render_argument_value(
+    module: &str,
+    value: &Value,
+    engine: &mut Environment<'_>,
+    context: &TemplateContext,
+    force_string: bool,
+    is_mode_param: bool,
+    depth: usize,
+    rendered_nodes: &mut usize,
+) -> Result<Value> {
+    if depth > MAX_ARGUMENT_TEMPLATE_DEPTH {
+        return Err(anyhow!(
+            "Module arguments exceed the maximum nesting depth of {}",
+            MAX_ARGUMENT_TEMPLATE_DEPTH
+        ));
+    }
+
+    *rendered_nodes = rendered_nodes
+        .checked_add(1)
+        .ok_or_else(|| anyhow!("Module argument node count overflowed"))?;
+    if *rendered_nodes > MAX_ARGUMENT_TEMPLATE_NODES {
+        return Err(anyhow!(
+            "Module arguments exceed the maximum node count of {}",
+            MAX_ARGUMENT_TEMPLATE_NODES
+        ));
+    }
+
+    match value {
+        Value::String(value) => {
+            let rendered_value =
+                crate::playbook::templar::render_value(value, engine, context, force_string)?;
+
+            if is_mode_param {
+                if let Value::String(mode) = &rendered_value {
+                    if mode.contains("{{") || mode.contains("{%") {
+                        return Err(anyhow!(
+                            "Mode parameter for module '{}' contains unresolved template syntax",
+                            module
+                        ));
+                    }
+                }
             }
 
-            let rendered_value = self
-                .render_argument_value(
+            Ok(rendered_value)
+        }
+        Value::Sequence(values) => values
+            .iter()
+            .map(|value| {
+                render_argument_value(
+                    module,
                     value,
                     engine,
                     context,
                     force_string,
                     is_mode_param,
-                    0,
-                    &mut rendered_nodes,
+                    depth + 1,
+                    rendered_nodes,
                 )
-                .map_err(|error| {
-                    anyhow!(
-                        "Failed to render an argument for module '{}': {}",
-                        self.module,
-                        error
-                    )
-                })?;
-
-            if matches!(
-                &rendered_value,
-                Value::String(value) if value == crate::playbook::templar::OMIT_SENTINEL
-            ) {
-                continue;
-            }
-
-            resolved.insert(Value::String(key.clone()), rendered_value.clone());
-
-            // Preserve debug.var's controller-side lookup behavior without
-            // logging either the variable name or its potentially secret value.
-            if module_name == "debug" && key == "var" {
-                if let Value::String(var_name_to_lookup) = &rendered_value {
-                    if let Some(found_value) = get_nested_value(var_name_to_lookup, vars) {
-                        resolved
-                            .insert(Value::String("_var_value".to_string()), found_value.clone());
-                    } else {
-                        resolved.remove(Value::String("_var_value".to_string()));
-                    }
-                } else {
-                    resolved.remove(Value::String("_var_value".to_string()));
-                }
-            }
-        }
-
-        debug!("Finished resolving arguments for task '{}'", self.name);
-        Ok(resolved)
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    fn render_argument_value(
-        &self,
-        value: &Value,
-        engine: &mut Environment<'_>,
-        context: &TemplateContext,
-        force_string: bool,
-        is_mode_param: bool,
-        depth: usize,
-        rendered_nodes: &mut usize,
-    ) -> Result<Value> {
-        if depth > MAX_ARGUMENT_TEMPLATE_DEPTH {
-            return Err(anyhow!(
-                "Module arguments exceed the maximum nesting depth of {}",
-                MAX_ARGUMENT_TEMPLATE_DEPTH
-            ));
-        }
-
-        *rendered_nodes = rendered_nodes
-            .checked_add(1)
-            .ok_or_else(|| anyhow!("Module argument node count overflowed"))?;
-        if *rendered_nodes > MAX_ARGUMENT_TEMPLATE_NODES {
-            return Err(anyhow!(
-                "Module arguments exceed the maximum node count of {}",
-                MAX_ARGUMENT_TEMPLATE_NODES
-            ));
-        }
-
-        match value {
-            Value::String(value) => {
-                let rendered_value =
-                    crate::playbook::templar::render_value(value, engine, context, force_string)?;
-
-                if is_mode_param {
-                    if let Value::String(mode) = &rendered_value {
-                        if mode.contains("{{") || mode.contains("{%") {
-                            return Err(anyhow!(
-                                "Mode parameter for module '{}' contains unresolved template syntax",
-                                self.module
-                            ));
-                        }
-                    }
-                }
-
-                Ok(rendered_value)
-            }
-            Value::Sequence(values) => values
-                .iter()
-                .map(|value| {
-                    self.render_argument_value(
-                        value,
-                        engine,
-                        context,
-                        force_string,
-                        is_mode_param,
-                        depth + 1,
-                        rendered_nodes,
-                    )
-                })
-                .collect::<Result<Vec<_>>>()
-                .map(Value::Sequence),
-            Value::Mapping(values) => {
-                let mut rendered = Mapping::new();
-                for (key, value) in values {
-                    let Value::String(key) = key else {
-                        return Err(anyhow!("Module argument mapping keys must be strings"));
-                    };
-                    let value = self.render_argument_value(
-                        value,
-                        engine,
-                        context,
-                        force_string,
-                        is_mode_param,
-                        depth + 1,
-                        rendered_nodes,
-                    )?;
-                    rendered.insert(Value::String(key.clone()), value);
-                }
-                Ok(Value::Mapping(rendered))
-            }
-            Value::Tagged(tagged) => {
-                let mut rendered = (**tagged).clone();
-                rendered.value = self.render_argument_value(
-                    &tagged.value,
+            })
+            .collect::<Result<Vec<_>>>()
+            .map(Value::Sequence),
+        Value::Mapping(values) => {
+            let mut rendered = Mapping::new();
+            for (key, value) in values {
+                let Value::String(key) = key else {
+                    return Err(anyhow!("Module argument mapping keys must be strings"));
+                };
+                let value = render_argument_value(
+                    module,
+                    value,
                     engine,
                     context,
                     force_string,
@@ -933,10 +994,25 @@ impl Task {
                     depth + 1,
                     rendered_nodes,
                 )?;
-                Ok(Value::Tagged(Box::new(rendered)))
+                rendered.insert(Value::String(key.clone()), value);
             }
-            Value::Null | Value::Bool(_) | Value::Number(_) => Ok(value.clone()),
+            Ok(Value::Mapping(rendered))
         }
+        Value::Tagged(tagged) => {
+            let mut rendered = (**tagged).clone();
+            rendered.value = render_argument_value(
+                module,
+                &tagged.value,
+                engine,
+                context,
+                force_string,
+                is_mode_param,
+                depth + 1,
+                rendered_nodes,
+            )?;
+            Ok(Value::Tagged(Box::new(rendered)))
+        }
+        Value::Null | Value::Bool(_) | Value::Number(_) => Ok(value.clone()),
     }
 }
 

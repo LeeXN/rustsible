@@ -1,6 +1,6 @@
 # 分阶段计划的实现状态
 
-当前已实现并验证计划 **01–09**，以及文件安全补充修复。**M1 已达成；完整的 22 项计划尚未完成。**
+当前已实现并验证计划 **01–10**，以及文件安全补充修复。**M1 已达成；完整的 22 项计划尚未完成。**
 
 | 计划项 | 交付 | 证据 |
 | --- | --- | --- |
@@ -13,8 +13,9 @@
 | 07 文件与下载原生迁移 | 已实现并验证 | [#10](https://github.com/LeeXN/rustsible/pull/10)， 删除 Python、GNU cp/远端文件 Shell 路径；流式内容协议；父进程持有目标端暂存目录；本地 glibc/musl SSH 的无 Python/curl、私有 CA、代理、20 MiB、capabilities、磁盘/输入字节/inode 不足与清理已通过；最小环境控制端完整执行已通过，[双架构 CI 40823389637](https://github.com/LeeXN/rustsible/actions/runs/40823389637) 七作业通过，覆盖率 84.05% |
 | 08 其余系统模块原生迁移 | 已实现并验证 | [#11](https://github.com/LeeXN/rustsible/pull/11)，user/service/systemd/package 全部进 worker；共享 schema；独立任务监督进程；真实 systemd/APT、OpenRC/APK、SysV、本地/SSH/三身份、密码/组/home/缓存更新及版本升级通过；[双架构 CI 40830347366](https://github.com/LeeXN/rustsible/actions/runs/40830347366) 八作业通过，包含 x86_64 Rocky DNF、CentOS Yum、Arch Pacman、openSUSE Zypper 离线本地仓库及真实 Upstart PID 1；DNF 显式刷新缓存 |
 | 09 连接与调度 | 已实现并验证 | [#12](https://github.com/LeeXN/rustsible/pull/12)，Playbook/ad-hoc 共用固定线程领取主机；任务屏障、结果顺序和 forks 上限；有效配置变化关闭旧连接；meta reset_connection。真实 SSH 12 次目标调用仅 4 次认证，包含 reset 与两次配置变化；[双架构 CI 40831259231](https://github.com/LeeXN/rustsible/actions/runs/40831259231) 八作业通过 |
-| 10 任务执行语义 | 实现并验收中 | changed_when/failed_when、until/retries/delay、任务 timeout、play/task environment；command argv/cmd/chdir/creates/removes/stdin，目标端环境展开与尾部空行处理；本地完整场景、固定 Ansible 2.21 逐字节结果对照、84.09% 覆盖率通过；真实 x86_64 SSH 三身份验证逐项重试/注册/环境隔离，超时终止 setsid 后代且只执行一次；协议 v3，双架构 CI 待收口 |
-| 11–15 变量、复用与部署流程 | 未实现 | 第二阶段 |
+| 10 任务执行语义 | 已实现并验证 | [#13](https://github.com/LeeXN/rustsible/pull/13)，changed_when/failed_when、until/retries/delay、timeout、environment、command 参数与安全预测；固定 Ansible 2.21 文件对照、84.09% 覆盖率；[双架构 CI 40833587972](https://github.com/LeeXN/rustsible/actions/runs/40833587972) 八作业通过，真实 SSH 三身份、超时终止 setsid 后代且只执行一次；协议 v3 |
+| 11 变量、配置与常用 facts | 实现并验收中 | group_vars/host_vars、vars_files、include_vars、set_fact、-e；hostvars/groups/路径上下文；配置选择、环境与 CLI 优先级，独立最低配置层；目标端发行版/主机/网络/时间 facts 与 subset/filter；Ansible 2.21 字段和生命周期对照，本地 85.17% 覆盖率；真实 x86_64 glibc/musl SSH 三身份、check、配置/play/task 执行用户与文件属主、hosts 完整域名别名已验证；最终提交双架构 CI 待运行 |
+| 12–15 复用、失败处置与部署流程 | 未实现 | 第二阶段 |
 | 16–19 常用模块与 CLI | 未实现 | 第三阶段 |
 | 20–22 Vault、扩展与发布验收 | 未实现 | 第四阶段 |
 

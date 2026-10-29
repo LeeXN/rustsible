@@ -26,6 +26,9 @@ pub struct AdHocOptions {
     pub check_mode: bool,
     pub forks: usize,
     pub worker_dir: Option<std::path::PathBuf>,
+    pub extra_vars: Vec<String>,
+    pub inventory: Option<std::sync::Arc<crate::inventory::Inventory>>,
+    pub config_file: Option<std::path::PathBuf>,
 }
 
 impl Default for AdHocOptions {
@@ -36,6 +39,9 @@ impl Default for AdHocOptions {
             check_mode: false,
             forks: 5,
             worker_dir: None,
+            extra_vars: Vec::new(),
+            inventory: None,
+            config_file: None,
         }
     }
 }
@@ -60,6 +66,12 @@ pub fn run_adhoc_with_options(
     if options.forks == 0 {
         return Err(anyhow::anyhow!("--forks must be greater than zero"));
     }
+    let extra = crate::vars::extra(&options.extra_vars)?;
+    let mut hosts = hosts.to_vec();
+    for host in &mut hosts {
+        crate::inventory::host::merge_variable_layer(&mut host.variables, &extra);
+    }
+    let hosts = hosts.as_slice();
     if options
         .become_user
         .as_deref()
@@ -71,11 +83,9 @@ pub fn run_adhoc_with_options(
     }
 
     let module_name = registry::Builtin::lookup(module_name)?.name();
-    // Validate the module and parse mapped arguments before starting any
-    // connections. Besides failing fast, this deliberately parses the command
-    // line only once rather than once per host.
+    // Parse CLI syntax once. Render and validate per host before opening its
+    // connection, because extra/inventory variables can change argument types.
     let module_args = prepare_adhoc_args(module_name, args)?;
-    registry::Invocation::prepare(module_name, &module_args, options.check_mode)?;
 
     info!(
         "Running ad-hoc module '{}' on {} hosts",
@@ -86,11 +96,47 @@ pub fn run_adhoc_with_options(
     println!("\n{}", "TASK [Execute ad-hoc command]".bold());
     println!("{}\n", "------------------------------".dimmed());
 
-    let runtime = crate::worker::Runtime::new(options.worker_dir.clone());
+    let fallback;
+    let inventory = if let Some(inventory) = &options.inventory {
+        inventory.as_ref()
+    } else {
+        fallback = {
+            let mut inventory = crate::inventory::Inventory::new();
+            for host in hosts {
+                inventory.add_host(host.clone());
+            }
+            inventory
+        };
+        &fallback
+    };
+    let mut state = crate::playbook::RunState::default();
+    state.extra = std::sync::Arc::new(extra);
+    state.workers = crate::worker::Runtime::new(options.worker_dir.clone());
+    state.prepare(
+        inventory,
+        &std::env::current_dir()?,
+        options.config_file.as_deref(),
+    )?;
+    let globals = state.variable_globals()?;
+    let runtime = &state.workers;
     let executions = crate::scheduler::map(hosts, options.forks, |host| {
         let start_time = Instant::now();
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            execute_adhoc_with_runtime(host, module_name, &module_args, options, &runtime)
+            let mut variables = state.variables_for(&host.name, &globals)?;
+            if let Some(value) = options.become_override {
+                variables.insert("ansible_become".into(), Value::Bool(value));
+            }
+            if let Some(value) = &options.become_user {
+                variables.insert("ansible_become_user".into(), Value::String(value.clone()));
+            }
+            execute_adhoc_with_runtime(
+                host,
+                module_name,
+                &module_args,
+                options,
+                runtime,
+                &variables,
+            )
         }))
         .unwrap_or_else(|_| Err(anyhow::anyhow!("Ad-hoc host worker panicked")));
         HostExecution {
@@ -295,12 +341,25 @@ fn execute_adhoc_module(
     args: &Value,
     options: &AdHocOptions,
 ) -> Result<ModuleResult> {
+    let mut definitions = host.all_variables();
+    crate::inventory::host::merge_variable_layer(
+        &mut definitions,
+        &crate::vars::extra(&options.extra_vars)?,
+    );
+    let variables = crate::playbook::templar::resolve_definitions(
+        &definitions,
+        &HashMap::from([(
+            "inventory_hostname".into(),
+            Value::String(host.name.clone()),
+        )]),
+    )?;
     execute_adhoc_with_runtime(
         host,
         module_name,
         args,
         options,
         &crate::worker::Runtime::new(options.worker_dir.clone()),
+        &variables,
     )
 }
 
@@ -310,13 +369,34 @@ fn execute_adhoc_with_runtime(
     args: &Value,
     options: &AdHocOptions,
     runtime: &crate::worker::Runtime,
+    variables: &HashMap<String, Value>,
 ) -> Result<ModuleResult> {
-    let invocation = registry::Invocation::prepare(module_name, args, options.check_mode)?;
+    let context = crate::playbook::templar::create_context(variables)?;
+    let mut engine = crate::playbook::templar::environment();
+    let mapping = match args {
+        Value::String(text) if matches!(module_name, "command" | "shell") => {
+            serde_yaml::Mapping::from_iter([(
+                Value::String("cmd".into()),
+                Value::String(text.clone()),
+            )])
+        }
+        Value::Mapping(mapping) => mapping.clone(),
+        _ => anyhow::bail!("Module arguments must be a mapping or command string"),
+    };
+    let arguments = crate::playbook::render_module_arguments(
+        module_name,
+        &mapping,
+        &mut engine,
+        &context,
+        variables,
+    )?;
+    let invocation =
+        registry::Invocation::prepare(module_name, &Value::Mapping(arguments), options.check_mode)?;
     let config = invocation
         .needs_connection()
         .then(|| adhoc_config(host, options))
         .transpose()?;
-    Ok(invocation.execute(config.as_ref(), &HashMap::new(), runtime))
+    Ok(invocation.execute(config.as_ref(), variables, runtime))
 }
 
 /// Parse command line arguments in format "key1=value1 key2=value2"

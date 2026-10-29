@@ -11,6 +11,9 @@ pub struct Host {
     pub name: String,
     pub variables: HashMap<String, Value>,
     pub inherited_variables: HashMap<String, Value>,
+    /// One shared configuration baseline stays below play/task keywords and
+    /// explicit inventory variables; it is never another mutable host copy.
+    pub(crate) defaults: std::sync::Arc<HashMap<String, Value>>,
 }
 
 const VARIABLE_ALIASES: &[(&str, &str)] = &[
@@ -64,6 +67,7 @@ impl Host {
             name: name.split(' ').next().unwrap_or(name).to_owned(),
             variables: HashMap::new(),
             inherited_variables: HashMap::new(),
+            defaults: Default::default(),
         }
     }
     pub fn with_port(mut self, port: u16) -> Self {
@@ -75,6 +79,7 @@ impl Host {
         self.variables
             .get(key)
             .or_else(|| self.inherited_variables.get(key))
+            .or_else(|| self.defaults.get(key))
     }
     pub fn set_variable(&mut self, key: &str, value: &str) {
         self.set_typed_variable(key, Value::String(value.to_owned()));
@@ -99,6 +104,11 @@ impl Host {
         self.inherited_variables.clear();
     }
     pub fn all_variables(&self) -> HashMap<String, Value> {
+        let mut result = (*self.defaults).clone();
+        merge_variable_layer(&mut result, &self.inventory_variables());
+        result
+    }
+    pub(crate) fn inventory_variables(&self) -> HashMap<String, Value> {
         let mut result = HashMap::new();
         merge_variable_layer(&mut result, &self.inherited_variables);
         merge_variable_layer(&mut result, &self.variables);
@@ -110,6 +120,8 @@ impl Host {
             .or_else(|| self.variables.get(alias))
             .or_else(|| self.inherited_variables.get(canonical))
             .or_else(|| self.inherited_variables.get(alias))
+            .or_else(|| self.defaults.get(canonical))
+            .or_else(|| self.defaults.get(alias))
     }
     pub fn hostname(&self) -> Result<&str> {
         match self.connection_variable("ansible_host", "ansible_ssh_host") {

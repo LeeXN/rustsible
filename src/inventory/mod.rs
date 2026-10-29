@@ -1,13 +1,15 @@
 pub mod host;
 pub(crate) mod parser;
 
-use anyhow::{bail, Result};
+use anyhow::{bail, Context, Result};
 pub use host::{Host, HostGroup};
 use log::{debug, info, warn};
 use std::collections::{HashMap, HashSet};
 
 #[derive(Debug, Clone)]
 pub struct Inventory {
+    pub source: Option<std::path::PathBuf>,
+    pub(crate) defaults: Option<std::sync::Arc<HashMap<String, serde_yaml::Value>>>,
     pub hosts: HashMap<String, Host>,
     pub groups: HashMap<String, HostGroup>,
 }
@@ -25,6 +27,8 @@ impl Inventory {
         groups.insert("ungrouped".to_string(), HostGroup::new("ungrouped"));
 
         Self {
+            source: None,
+            defaults: None,
             hosts: HashMap::new(),
             groups,
         }
@@ -40,6 +44,68 @@ impl Inventory {
 
     pub fn get_group(&self, name: &str) -> Option<&HostGroup> {
         self.groups.get(name)
+    }
+    pub(crate) fn group_members(&self) -> std::collections::BTreeMap<String, Vec<String>> {
+        self.groups
+            .keys()
+            .map(|name| {
+                let mut members = HashSet::new();
+                if name == "all" {
+                    members.extend(self.hosts.keys().cloned());
+                } else {
+                    self.collect_group_hosts(name, &mut members, &mut HashSet::new());
+                }
+                let mut members = members
+                    .into_iter()
+                    .filter(|name| self.hosts.contains_key(name))
+                    .collect::<Vec<_>>();
+                members.sort();
+                (name.clone(), members)
+            })
+            .collect()
+    }
+
+    /// Load inventory and playbook variable files into their original layer;
+    /// host overrides therefore still win over every inherited group value.
+    pub(crate) fn load_variable_files(&mut self, base: &std::path::Path) -> Result<()> {
+        for (kind, names) in [
+            (
+                "group_vars",
+                self.groups.keys().cloned().collect::<Vec<_>>(),
+            ),
+            ("host_vars", self.hosts.keys().cloned().collect::<Vec<_>>()),
+        ] {
+            for name in names {
+                // Inventory names are labels, never paths supplied to a file
+                // loader. In particular, aliases containing '/' cannot escape.
+                if name.contains('/') || name == "." || name == ".." {
+                    bail!("Inventory variable-file label cannot be a path: {name}");
+                }
+                for path in crate::vars::named_files(&base.join(kind), &name)? {
+                    let layer = crate::vars::load(&path)?
+                        .into_iter()
+                        .map(|(key, value)| {
+                            (
+                                key.as_str().expect("Validated variable name").to_owned(),
+                                value,
+                            )
+                        })
+                        .collect();
+                    let target = if kind == "group_vars" {
+                        &mut self
+                            .groups
+                            .get_mut(&name)
+                            .expect("Existing group")
+                            .variables
+                    } else {
+                        &mut self.hosts.get_mut(&name).expect("Existing host").variables
+                    };
+                    host::merge_variable_layer(target, &layer);
+                }
+            }
+        }
+        self.apply_group_vars();
+        Ok(())
     }
 
     /// Filter hosts using the commonly used Ansible pattern operators.
@@ -239,6 +305,9 @@ impl Inventory {
     pub(crate) fn apply_group_vars(&mut self) {
         for host in self.hosts.values_mut() {
             host.clear_inherited_variables();
+            if let Some(defaults) = &self.defaults {
+                host.defaults = defaults.clone();
+            }
         }
 
         if let Some(all_group) = self.groups.get("all") {
@@ -357,12 +426,62 @@ fn glob_matches(pattern: &str, value: &str) -> bool {
 }
 
 pub fn parse(inventory_path: &str) -> Result<Inventory> {
-    parser::parse_inventory(inventory_path)
+    let mut inventory = parser::parse_inventory(inventory_path)?;
+    let source = std::path::Path::new(inventory_path).canonicalize()?;
+    inventory.load_variable_files(
+        source
+            .parent()
+            .context("Inventory has no parent directory")?,
+    )?;
+    inventory.source = Some(source);
+    Ok(inventory)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn variable_files_override_their_inventory_layer_and_follow_directory_priority() {
+        let inventory_dir = tempfile::tempdir().unwrap();
+        let playbook_dir = tempfile::tempdir().unwrap();
+        std::fs::write(inventory_dir.path().join("inventory"), "[web]\nnode ansible_connection=local priority=inline\n[all:vars]\ngroup_value=inline\n").unwrap();
+        for base in [inventory_dir.path(), playbook_dir.path()] {
+            std::fs::create_dir(base.join("group_vars")).unwrap();
+            std::fs::create_dir(base.join("host_vars")).unwrap();
+        }
+        std::fs::write(
+            inventory_dir.path().join("group_vars/all.yml"),
+            "group_value: inventory\npriority: group\nlist: [one, two]",
+        )
+        .unwrap();
+        std::fs::write(
+            inventory_dir.path().join("host_vars/node.yml"),
+            "priority: hostfile",
+        )
+        .unwrap();
+        std::fs::write(
+            playbook_dir.path().join("group_vars/all.yml"),
+            "group_value: playbook\npriority: latergroup",
+        )
+        .unwrap();
+        std::fs::write(
+            playbook_dir.path().join("host_vars/node.yml"),
+            "priority: playbookhost\nansible_host: localhost",
+        )
+        .unwrap();
+        let mut inventory =
+            parse(inventory_dir.path().join("inventory").to_str().unwrap()).unwrap();
+        let variables = inventory.filter_hosts("node")[0].all_variables();
+        assert_eq!(variables["priority"].as_str(), Some("hostfile"));
+        assert_eq!(variables["group_value"].as_str(), Some("inventory"));
+        assert!(variables["list"].is_sequence());
+        inventory.load_variable_files(playbook_dir.path()).unwrap();
+        let variables = inventory.filter_hosts("node")[0].all_variables();
+        assert_eq!(variables["priority"].as_str(), Some("playbookhost"));
+        assert_eq!(variables["group_value"].as_str(), Some("playbook"));
+        assert_eq!(variables["ansible_host"].as_str(), Some("localhost"));
+    }
 
     fn inventory_for_patterns() -> Inventory {
         let mut inventory = Inventory::new();

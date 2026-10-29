@@ -9,10 +9,19 @@ fn main() -> Result<()> {
     // Delay logger initialization until after parsing arguments
     let app = cli::build_cli();
     let matches = app.get_matches();
+    let config = rustsible::config::Config::load(
+        matches
+            .get_one::<std::path::PathBuf>("config")
+            .map(std::path::PathBuf::as_path),
+    )?;
 
     // Set log level based on the number of verbose flags
     let log_level = match matches.subcommand() {
-        Some((_, sub_matches)) => match sub_matches.get_count("verbose") {
+        Some((_, sub_matches)) => match if sub_matches.get_count("verbose") > 0 {
+            sub_matches.get_count("verbose")
+        } else {
+            config.verbosity.unwrap_or(0)
+        } {
             0 => LevelFilter::Off,
             1 => LevelFilter::Info,
             2 => LevelFilter::Debug,
@@ -44,23 +53,23 @@ fn main() -> Result<()> {
         Some(("playbook", sub_matches)) => {
             let playbook_file =
                 required_cli_string(sub_matches.get_one::<String>("playbook"), "playbook file")?;
-            let inventory_file = sub_matches
-                .get_one::<String>("inventory")
-                .map_or("inventory", String::as_str);
 
             info!("Running playbook: {}", playbook_file);
-            let inventory = inventory::parse(inventory_file)?;
-            let forks = required_cli_usize(sub_matches.get_one::<usize>("forks"), "--forks")?;
-            if forks == 0 {
-                return Err(anyhow::anyhow!("--forks must be greater than zero"));
-            }
+            let inventory = load_inventory(sub_matches, &config)?;
+            let forks = config.host_limit(sub_matches)?;
             let options = playbook::ExecutionOptions {
                 limit: sub_matches.get_one::<String>("limit").cloned(),
+                config_file: config.file.clone(),
+                extra_vars: sub_matches
+                    .get_many::<String>("extra-vars")
+                    .map(|values| values.cloned().collect())
+                    .unwrap_or_default(),
                 check_mode: sub_matches.get_flag("check"),
                 forks,
                 worker_dir: sub_matches
                     .get_one::<std::path::PathBuf>("worker-dir")
-                    .cloned(),
+                    .cloned()
+                    .or_else(|| config.worker_dir.clone()),
             };
             let result = playbook::execute_with_options(playbook_file, &inventory, &options);
 
@@ -76,12 +85,9 @@ fn main() -> Result<()> {
                 required_cli_string(sub_matches.get_one::<String>("args"), "module arguments")?;
             let host_pattern =
                 required_cli_string(sub_matches.get_one::<String>("pattern"), "host pattern")?;
-            let inventory_file = sub_matches
-                .get_one::<String>("inventory")
-                .map_or("inventory", String::as_str);
 
             info!("Running ad-hoc command with module: {}", module);
-            let inventory = inventory::parse(inventory_file)?;
+            let inventory = load_inventory(sub_matches, &config)?;
             let hosts = inventory.filter_hosts(host_pattern);
 
             if hosts.is_empty() {
@@ -89,21 +95,25 @@ fn main() -> Result<()> {
                 std::process::exit(1);
             }
 
-            let forks = required_cli_usize(sub_matches.get_one::<usize>("forks"), "--forks")?;
-            if forks == 0 {
-                return Err(anyhow::anyhow!("--forks must be greater than zero"));
-            }
+            let forks = config.host_limit(sub_matches)?;
             let options = modules::AdHocOptions {
+                inventory: Some(std::sync::Arc::new(inventory.clone())),
+                config_file: config.file.clone(),
                 // Omitting --become deliberately leaves the decision to each
                 // host's inventory. --become-user selects the target account
                 // but, like Ansible, does not itself enable escalation.
                 become_override: sub_matches.get_flag("become").then_some(true),
+                extra_vars: sub_matches
+                    .get_many::<String>("extra-vars")
+                    .map(|values| values.cloned().collect())
+                    .unwrap_or_default(),
                 become_user: sub_matches.get_one::<String>("become-user").cloned(),
                 check_mode: sub_matches.get_flag("check"),
                 forks,
                 worker_dir: sub_matches
                     .get_one::<std::path::PathBuf>("worker-dir")
-                    .cloned(),
+                    .cloned()
+                    .or_else(|| config.worker_dir.clone()),
             };
             let result = modules::run_adhoc_with_options(&hosts, module, args, &options);
             if let Err(e) = result {
@@ -112,12 +122,7 @@ fn main() -> Result<()> {
             }
         }
         Some(("inventory-debug", sub_matches)) => {
-            let inventory_file = sub_matches
-                .get_one::<String>("inventory")
-                .map_or("inventory", String::as_str);
-
-            info!("Debugging inventory file: {}", inventory_file);
-            let inventory = inventory::parse(inventory_file)?;
+            let inventory = load_inventory(sub_matches, &config)?;
 
             println!("\n=== Inventory Debug Information ===");
             println!("Total hosts: {}", inventory.hosts.len());
@@ -182,6 +187,23 @@ fn main() -> Result<()> {
     Ok(())
 }
 
+fn load_inventory(
+    matches: &clap::ArgMatches,
+    config: &rustsible::config::Config,
+) -> Result<inventory::Inventory> {
+    let path = matches
+        .get_one::<String>("inventory")
+        .map(std::path::PathBuf::from)
+        .or_else(|| config.inventory.clone())
+        .unwrap_or_else(|| "inventory".into());
+    let mut inventory = inventory::parse(
+        path.to_str()
+            .ok_or_else(|| anyhow::anyhow!("Inventory path must be UTF-8"))?,
+    )?;
+    config.apply_inventory(&mut inventory);
+    Ok(inventory)
+}
+
 fn required_cli_string<'a>(value: Option<&'a String>, description: &str) -> Result<&'a str> {
     value.map(String::as_str).ok_or_else(|| {
         anyhow::anyhow!(
@@ -191,6 +213,7 @@ fn required_cli_string<'a>(value: Option<&'a String>, description: &str) -> Resu
     })
 }
 
+#[cfg(test)]
 fn required_cli_usize(value: Option<&usize>, description: &str) -> Result<usize> {
     value.copied().ok_or_else(|| {
         anyhow::anyhow!(

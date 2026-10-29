@@ -46,14 +46,72 @@ rejected. Use Jinja positional defaults such as `default([])` rather than the
 former Tera spelling `default(value=[])`. Relative `copy.src` and `template.src`
 paths are anchored to the task's source file, independent of the launch directory.
 
-Inventory host/group variables each use a single typed table. The effective
-order is inventory groups → host → facts → play vars → task vars → registered
-results → loop variables. Connection variables are resolved from that same
-context and override play/task keyword defaults; aliases are normalized within
-each layer. Invalid connection types or port values, unresolved references,
-and variable cycles fail before connecting or modifying a target. Only sudo is
-implemented for become; custom become executables and flags are rejected.
+Inventory host/group variables each use a single typed table. Variable order
+is inventory groups → host → facts → play vars → vars_files → task vars →
+include_vars → set_fact/register → extra vars. Transient loop bindings and the
+current attempt's register are available within that execution; subsequent
+tasks again see extra vars at their normal highest precedence. Connection
+variables use that same context and override play/task keyword defaults.
+Configuration is a shared, literal baseline below keywords and variables.
+Aliases normalize within each layer. Invalid connection types/ports,
+unresolved references, and variable cycles fail before target operations.
+Only sudo is implemented for become; custom executables/flags are rejected.
 Ad-hoc CLI become overrides retain their documented Rustsible precedence.
+
+| Variable source | Supported form |
+| --- | --- |
+| `group_vars` / `host_vars` | Inventory directory, then playbook directory; extensionless/YAML/JSON files or sorted directories; host values outrank groups |
+| `vars_files` | Source-relative paths, including ordered fallback lists; fact-dependent paths resolve after gathering |
+| `include_vars` | Exactly one of `file`/`dir`, optional namespace `name`; directories recursively load supported files in lexical order |
+| `set_fact` | Typed in-memory values, including loop accumulation, retained across plays; persistent `cacheable: true` is rejected |
+| `-e` / `--extra-vars` | Repeated `name=value` strings, YAML/JSON objects, or `@file`; structured inputs retain their types |
+
+`hostvars`, `groups`, `group_names`, `inventory_hostname`, `inventory_file`,
+`inventory_dir`, `playbook_dir`, and the selected `ansible_config_file` are
+available to templates. Hostvars includes inventory and persistent host values,
+including hosts outside the current play. Its view advances at task boundaries;
+qualified hostvars inside a loop therefore observes the preceding task, as in
+Ansible 2.21. Ad-hoc arguments now share the playbook renderer. To embed literal
+template delimiters, return them from a quoted expression or variable; rendered
+output is never evaluated again. See [the variable example](examples/variables/playbook.yml).
+
+`--config FILE` selects a required configuration file. Otherwise Rustsible
+uses `ANSIBLE_CONFIG`, project `ansible.cfg`, `~/.ansible.cfg`, then
+`/etc/ansible/ansible.cfg`. Explicit inventory/forks/worker-dir options override
+configuration; supported environment options override file values. Paths in a
+configuration file resolve relative to that file. Unsupported keys fail with
+their file/section/key instead of silently changing execution expectations.
+
+| Section | Implemented keys |
+| --- | --- |
+| `[defaults]` | `inventory` (one file), `forks`, `verbosity`, `remote_user`, `private_key_file`, `timeout`, `host_key_checking`, Rustsible's `worker_dir` |
+| `[privilege_escalation]` | `become`, `become_user`, `become_method` (`sudo`) |
+
+The corresponding `ANSIBLE_INVENTORY`, `ANSIBLE_FORKS`, `ANSIBLE_VERBOSITY`,
+`ANSIBLE_REMOTE_USER`, `ANSIBLE_PRIVATE_KEY_FILE`, `ANSIBLE_TIMEOUT`,
+`ANSIBLE_HOST_KEY_CHECKING`, `ANSIBLE_BECOME`, `ANSIBLE_BECOME_USER`, and
+`ANSIBLE_BECOME_METHOD` environment settings are recognized.
+
+Facts run on the target. Setup supports `gather_subset`, `filter` (a string or
+list of shell patterns), and `gather_timeout` (1–604800 seconds, default 10).
+Plays also accept `gather_subset`/`gather_timeout`. Setup results use prefixed
+keys such as `ansible_architecture`; the host's `ansible_facts.architecture`
+namespace removes that prefix. `set_fact` and `include_vars` retain their own
+host-variable names.
+
+| Native subset | Returned fields (with `ansible_` in setup results) |
+| --- | --- |
+| `platform` | architecture, system, kernel, kernel_version, machine, hostname, nodename, fqdn, domain |
+| `distribution` | distribution, distribution_version, distribution_major_version, distribution_release, os_family |
+| `date_time` | date/time components, weekday, weekday_number, epoch, iso8601 |
+| `network` | interfaces, all_ipv4_addresses, all_ipv6_addresses, default_ipv4 (main routing table) |
+| `min` / `all` | platform/distribution/date_time; `all` additionally includes network |
+
+Individual documented architecture/system/kernel/machine, distribution-version,
+OS-family, and network selectors are accepted. `!all` keeps minimum facts;
+`!all,!min` collects none unless explicit subsets are added. Unsupported subsets
+are rejected; filter only returns matching top-level fact names. Python facts,
+executable local facts and the rest of Ansible's collectors are not declared.
 The compatibility surface currently includes Linux architecture facts,
 `stat.path/checksum_algorithm`, `get_url.url/dest/owner/group/mode/force/checksum`
 (inline `<algorithm>:<digest>` checksums),
@@ -375,6 +433,9 @@ The following built-in modules are registered for playbooks:
 | `command` | Run a command |
 | `shell` | Run a command through a shell |
 | `debug` | Display a message or variable |
+| `set_fact` | Retain typed host values during a playbook run |
+| `include_vars` | Load controller variable files or directories |
+| `meta` | Reset a host's worker connection (`reset_connection`) |
 | `copy` | Copy a controller file or literal content |
 | `file` | Manage files, directories, links, and permissions |
 | `template` | Render a MiniJinja/Jinja template |
