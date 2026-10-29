@@ -259,8 +259,8 @@ Playbooks support `meta: flush_handlers`, `clear_host_errors`, `reset_connection
 `end_host`, and `end_play`. Clear errors allows excluded hosts into later plays;
 it preserves the failure recap and exit status. End host/play stops that play
 without excluding the host from later plays. Ad-hoc meta supports only reset.
-Blocks cannot loop or register as a unit; static imports cannot loop. Tags and
-async are still outside the implemented scope.
+Blocks cannot loop or register as a unit; static imports cannot loop. Tags are
+still outside the implemented scope.
 See [the reusable deployment example](examples/reuse/main.yml) and the pinned
 reference scenarios under [tests/reference/reuse](tests/reference/reuse).
 
@@ -299,6 +299,41 @@ existing successful recovery behavior.
 See [the rolling example](examples/rolling/playbook.yml). The SSH strategy
 fixture uses three distinct servers and checks physical identities, batch
 barriers, cross-host facts, parallel delegation, idempotency, check and cleanup.
+
+## Native background tasks
+
+Tasks accept `async: SECONDS` and `poll: SECONDS`; ad-hoc accepts `-B/--background`
+and `-P/--poll`. A zero async duration runs synchronously. Poll defaults to 15;
+poll zero returns `ansible_job_id`, `started` and `finished` immediately. Positive
+poll waits for a terminal result and cleans its state, retaining output/rc in
+the registered result. Async and poll values are nonnegative whole seconds,
+bounded to seven days. An explicit task timeout can further limit execution.
+
+Command/shell, target file/lineinfile/get_url, user, service/systemd and package
+support async. Copy/template transfers and controller actions do not. Global
+check skips a supported async task without starting a process or creating job
+state; guard dependent queries with `when: background is not skipped`.
+
+`async_status` accepts `jid` and optional `mode: status` (default) or `cleanup`.
+Status returns boolean `started`/`finished`; `result is finished` works with
+until/retries/delay. Poll-zero jobs retain their results until explicit cleanup.
+Cleanup is idempotent for absent state and rejects running/unconfirmed jobs.
+Its check mode predicts deletion. Invalid IDs, corrupt results, unsafe modes,
+symlinks and another execution identity's cache are rejected.
+
+State defaults to the execution identity's `~/.rustsible_async`; inventory
+`ansible_async_dir` can select an absolute path or target-relative `~/` path.
+Directories are `0700`, results are atomically replaced `0600` files, and the
+native program retained for a running job is `0700`. The configured directory
+must permit execution. Startup checks `noexec` explicitly. A detached native
+supervisor enforces the deadline and reaps even setsid descendants; it installs
+no service. SSH/controller exit after startup leaves the job running. Credentials
+and requests use stdin. Later status queries retain the original job's no_log
+display policy, while registered data remains usable in memory.
+
+Protocol v4 adds native job and display metadata; mismatched workers are rejected.
+See [the async example](examples/async/playbook.yml) and the
+[fixed Ansible 2.21 comparison](tests/reference/async.yml).
 
 ## Build
 
@@ -406,8 +441,8 @@ Playbook and ad-hoc execution share one module registry, argument schema,
 capability policy, dispatcher, and common result conversion. Unsupported keys
 and wrong types fail before dispatch, including during check mode. The check
 policy is read-only for `debug/setup/stat`, predictive for state modules, and
-skip for commands without a safe prediction. Diff and async remain unsupported
-and are rejected; later implementation stages will enable them explicitly.
+skip for commands without a safe prediction. Async support follows the module
+capability declarations above. Diff remains unsupported and is rejected.
 
 Results distinguish `ok`, `failed`, `skipped`, `unreachable`, and `uncertain`
 through `outcome` and the `failed/skipped/unreachable/uncertain` flags. `rc`, output, and confirmed
@@ -519,6 +554,7 @@ The following built-in modules are registered for playbooks:
 | `debug` | Display a message or variable |
 | `set_fact` | Retain typed host values during a playbook run |
 | `include_vars` | Load controller variable files or directories |
+| `async_status` | Query or clean a native background job for the execution identity |
 | `meta` | Flush handlers, clear host errors, reset connections, or end host/play execution |
 | `copy` | Copy a controller file or literal content |
 | `file` | Manage files, directories, links, and permissions |
@@ -591,6 +627,9 @@ checks that deployment through real SSH with three execution identities,
 including check-mode business-state equality and worker cleanup.
 `bash tests/ssh/run.sh CONTROLLER WORKER_DIRECTORY strategy [glibc|musl]`
 runs the three-server deployment/delegation scenarios.
+`bash tests/ssh/run.sh CONTROLLER WORKER_DIRECTORY async [glibc|musl]`
+checks disconnect survival, state permissions/identity isolation, background
+native files, poll/cleanup, no_log, detached descendants and noexec.
 
 Dependency advisories are checked in CI against `Cargo.lock`. CI also enforces
 an 80% line-coverage floor. This is a regression baseline, not a claim that every remote SSH path is exercised end to

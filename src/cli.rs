@@ -121,6 +121,16 @@ pub fn build_cli() -> Command {
                         .value_name("USER"),
                 )
                 .arg(
+                    Arg::new("background").short('B').long("background")
+                        .value_name("SECONDS").value_parser(clap::value_parser!(u64)).default_value("0")
+                        .help("Maximum runtime for a native background task; zero runs synchronously"),
+                )
+                .arg(
+                    Arg::new("poll").short('P').long("poll")
+                        .value_name("SECONDS").value_parser(clap::value_parser!(u64)).default_value("15")
+                        .help("Poll interval for a background task; zero returns its job ID immediately"),
+                )
+                .arg(
                     Arg::new("check")
                         .long("check")
                         .help("Predict changes without applying them")

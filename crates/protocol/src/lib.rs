@@ -12,7 +12,7 @@ use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::io::{Read, Write};
 
-pub const VERSION: u32 = 3;
+pub const VERSION: u32 = 4;
 pub const BUILD_ID: &str = env!("RUSTSIBLE_BUILD_ID");
 pub const MAX_REQUEST_BYTES: usize = 16 * 1024 * 1024;
 // JSON escaping can expand a bounded 16 MiB command response sixfold.
@@ -31,6 +31,7 @@ pub const NATIVE_MODULES: &[&str] = &[
     "service",
     "systemd",
     "package",
+    "async_status",
 ];
 
 #[derive(Serialize, Deserialize)]
@@ -45,6 +46,48 @@ pub struct Request {
     pub environment: std::collections::BTreeMap<String, String>,
     pub managed: bool,
     pub payload: Option<Payload>,
+    pub asynchronous: Option<AsyncSpec>,
+}
+#[derive(Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AsyncSpec {
+    pub jid: String,
+    pub timeout_ms: u64,
+    pub directory: Option<String>,
+    pub no_log: bool,
+}
+impl AsyncSpec {
+    pub fn validate(&self) -> Result<()> {
+        validate_job_id(&self.jid)?;
+        if self.timeout_ms == 0 || self.timeout_ms > 7 * 24 * 60 * 60 * 1000 {
+            bail!("Async timeout must be between one millisecond and seven days");
+        }
+        if let Some(directory) = &self.directory {
+            validate_async_directory(directory)?;
+        }
+        Ok(())
+    }
+}
+pub fn validate_job_id(jid: &str) -> Result<()> {
+    if jid.len() != 65
+        || !jid.starts_with('j')
+        || !jid[1..]
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    {
+        bail!("Invalid native async job ID");
+    }
+    Ok(())
+}
+pub fn validate_async_directory(path: &str) -> Result<()> {
+    if (!std::path::Path::new(path).is_absolute() && !path.starts_with("~/"))
+        || path.chars().any(char::is_control)
+    {
+        bail!(
+            "Async directory must be absolute or begin with ~/ and contain no control characters"
+        );
+    }
+    Ok(())
 }
 impl Request {
     pub fn new(module: &str, args: serde_yaml::Value, check: bool, timeout_ms: u64) -> Self {
@@ -58,6 +101,7 @@ impl Request {
             environment: Default::default(),
             managed: true,
             payload: None,
+            asynchronous: None,
         }
     }
     pub fn validate(&self) -> Result<()> {
@@ -84,6 +128,16 @@ impl Request {
         }
         if !NATIVE_MODULES.contains(&self.module.as_str()) {
             bail!("Unsupported native module: {}", self.module);
+        }
+        if let Some(asynchronous) = &self.asynchronous {
+            asynchronous.validate()?;
+            if self.check {
+                bail!("Async tasks cannot start in check mode");
+            }
+            registry::Builtin::lookup(&self.module)?.validate_capabilities(false, false, true)?;
+            if self.payload.is_some() {
+                bail!("Async tasks cannot receive controller file payloads");
+            }
         }
         if matches!(self.module.as_str(), "copy" | "template") != self.payload.is_some() {
             bail!("Only copy/template requests require a streamed payload");
@@ -308,6 +362,35 @@ pub fn digest_hex_length(algorithm: &str) -> Result<usize> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn async_requests_validate_identity_capability_directory_and_check_before_execution() {
+        let specification = super::AsyncSpec {
+            jid: format!("j{:064x}", 1),
+            timeout_ms: 1000,
+            directory: Some("~/private-jobs".into()),
+            no_log: false,
+        };
+        assert!(specification.validate().is_ok());
+        for jid in ["../state", "", "jbad", "j000/../../state"] {
+            assert!(super::validate_job_id(jid).is_err());
+        }
+        for directory in ["relative", "", "/tmp/invalid\0path"] {
+            assert!(super::validate_async_directory(directory).is_err());
+        }
+        let mut request = super::Request::new(
+            "command",
+            serde_yaml::from_str("cmd: /bin/true").unwrap(),
+            false,
+            1000,
+        );
+        request.asynchronous = Some(specification);
+        assert!(request.validate().is_ok());
+        request.check = true;
+        assert!(request.validate().is_err());
+        request.check = false;
+        request.module = "copy".into();
+        assert!(request.validate().is_err());
+    }
     use super::*;
     #[test]
     fn framing_rejects_truncation_oversize_trailing_and_unknown_fields() {

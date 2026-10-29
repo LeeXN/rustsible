@@ -54,6 +54,7 @@ fn run(
     }
 
     match request.module.as_str() {
+        "async_status" => return crate::jobs::status(&request.args, request.check),
         "setup" => return crate::facts::execute(&request.args),
         "service" | "systemd" => {
             return crate::services::execute(

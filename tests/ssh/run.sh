@@ -124,6 +124,10 @@ if [[ $mode == strategy ]]; then
     source "$repo_dir/tests/ssh/strategy.sh"
     exit 0
 fi
+if [[ $mode == async ]]; then
+    source "$repo_dir/tests/ssh/async.sh"
+    exit 0
+fi
 cat > "$fixture_dir/playbook.yml" <<'EOF'
 - hosts: all
   become: false

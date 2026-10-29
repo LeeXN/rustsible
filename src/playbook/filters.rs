@@ -77,6 +77,7 @@ pub fn register_ansible_filters(environment: &mut Environment<'_>) {
     });
     environment.add_test("changed", |value: Value| result_flag(value, "changed"));
     environment.add_test("skipped", |value: Value| result_flag(value, "skipped"));
+    environment.add_test("finished", |value: Value| result_flag(value, "finished"));
 }
 
 #[cfg(test)]

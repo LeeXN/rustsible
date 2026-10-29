@@ -105,6 +105,9 @@ impl Runtime {
     ) -> Result<ModuleResult> {
         let module = request.module.clone();
         let check = request.check;
+        let may_modify = request.asynchronous.is_some()
+            || rustsible_protocol::registry::Builtin::lookup(&module)?
+                .may_modify(&request.args, check);
         if let Some(source) = source.as_mut() {
             let size = source.seek(SeekFrom::End(0))?;
             source.rewind()?;
@@ -250,7 +253,7 @@ impl Runtime {
                 slot.take();
                 Ok(crate::modules::result::from_error(
                     error.context("Native worker exchange failed; invocation was not replayed"),
-                    !check && !matches!(module.as_str(), "setup" | "stat"),
+                    may_modify,
                 ))
             }
         }

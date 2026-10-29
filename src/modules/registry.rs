@@ -13,6 +13,7 @@ pub struct Invocation {
     check: bool,
     environment: std::collections::BTreeMap<String, String>,
     timeout_ms: Option<u64>,
+    asynchronous: Option<(rustsible_protocol::AsyncSpec, u64)>,
 }
 
 impl Invocation {
@@ -44,6 +45,7 @@ impl Invocation {
             check,
             environment: Default::default(),
             timeout_ms: None,
+            asynchronous: None,
         })
     }
     pub(crate) fn with_execution(
@@ -55,11 +57,37 @@ impl Invocation {
         self.timeout_ms = timeout_ms;
         self
     }
+    pub(crate) fn with_async(mut self, seconds: u64, poll: u64, no_log: bool) -> Result<Self> {
+        if seconds > 604800 || poll > 604800 {
+            bail!("Async duration and poll interval must not exceed seven days");
+        }
+        if seconds != 0 {
+            self.module.validate_capabilities(self.check, false, true)?;
+            static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+            let counter = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            let timestamp = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)?
+                .as_nanos();
+            let bytes = format!("{timestamp}-{}-{counter}", std::process::id()).into_bytes();
+            let jid = format!("j{}", rustsible_protocol::sha256(&mut bytes.as_slice())?);
+            self.asynchronous = Some((
+                rustsible_protocol::AsyncSpec {
+                    jid,
+                    timeout_ms: seconds * 1000,
+                    directory: None,
+                    no_log,
+                },
+                poll,
+            ));
+        }
+        Ok(self)
+    }
     fn skip_check(&self) -> bool {
         self.check
-            && matches!(self.module, Builtin::Command | Builtin::Shell)
-            && self.args.get("creates").is_none()
-            && self.args.get("removes").is_none()
+            && (self.asynchronous.is_some()
+                || (matches!(self.module, Builtin::Command | Builtin::Shell)
+                    && self.args.get("creates").is_none()
+                    && self.args.get("removes").is_none()))
     }
     pub fn needs_connection(&self) -> bool {
         !matches!(
@@ -78,10 +106,17 @@ impl Invocation {
         if self.skip_check() {
             return ModuleResult {
                 skipped: true,
-                msg: format!(
-                    "Check mode: {} was not executed because it has no safe change prediction",
-                    self.module.name()
-                ),
+                msg: if self.asynchronous.is_some() {
+                    format!(
+                        "Check mode: async {} task was not started",
+                        self.module.name()
+                    )
+                } else {
+                    format!(
+                        "Check mode: {} was not executed because it has no safe change prediction",
+                        self.module.name()
+                    )
+                },
                 ..ModuleResult::default()
             };
         }
@@ -119,11 +154,33 @@ impl Invocation {
                 });
             }
             let config = config.context("Target module needs a connection configuration")?;
-            let timeout_ms = self.timeout_ms.unwrap_or(
-                crate::ssh::connection::command_timeout(config)?
-                    .as_millis()
-                    .try_into()?,
-            );
+            let connection_timeout: u64 = crate::ssh::connection::command_timeout(config)?
+                .as_millis()
+                .try_into()?;
+            let timeout_ms = if self.asynchronous.is_some() {
+                connection_timeout
+            } else {
+                self.timeout_ms.unwrap_or(connection_timeout)
+            };
+            if let Some((specification, _)) = self.asynchronous.as_mut() {
+                specification.directory = config
+                    .get_variable("ansible_async_dir")
+                    .map(|path| path.into_owned());
+                if let Some(limit) = self.timeout_ms {
+                    specification.timeout_ms = specification.timeout_ms.min(limit);
+                }
+            }
+            if self.module == Builtin::AsyncStatus && self.args.get("_async_dir").is_none() {
+                if let Some(directory) = config.get_variable("ansible_async_dir") {
+                    self.args
+                        .as_mapping_mut()
+                        .context("Async status requires a mapping")?
+                        .insert(
+                            Value::String("_async_dir".into()),
+                            Value::String(directory.into_owned()),
+                        );
+                }
+            }
             let mut request = rustsible_protocol::Request::new(
                 self.module.name(),
                 self.args.clone(),
@@ -131,6 +188,10 @@ impl Invocation {
                 timeout_ms,
             );
             request.environment = self.environment.clone();
+            request.asynchronous = self
+                .asynchronous
+                .as_ref()
+                .map(|(specification, _)| specification.clone());
             if matches!(self.module, Builtin::Copy | Builtin::Template) {
                 let mut args = self.args.clone();
                 let mut source = if self.module == Builtin::Template {
@@ -154,7 +215,25 @@ impl Invocation {
                 request.args = args;
                 return runtime.execute_request(config, request, Some(&mut source));
             }
-            runtime.execute_request(config, request, None)
+            let mut launched = runtime.execute_request(config, request, None)?;
+            if let Some((specification, poll)) = &self.asynchronous {
+                launched
+                    .values
+                    .entry("ansible_job_id".into())
+                    .or_insert_with(|| Value::String(specification.jid.clone()));
+                launched.no_log |= specification.no_log;
+                if *poll > 0 && launched.outcome() == crate::modules::Outcome::Ok {
+                    return self.poll(
+                        config,
+                        runtime,
+                        specification,
+                        *poll,
+                        connection_timeout,
+                        launched.changed,
+                    );
+                }
+            }
+            Ok(launched)
         })();
         match result {
             Ok(mut result) => {
@@ -162,10 +241,100 @@ impl Invocation {
                 result.changed |= super::result::known_changed();
                 result
             }
-            Err(error) => crate::modules::result::from_error(
-                error,
-                self.module.check_support() != CheckSupport::ReadOnly && !self.check,
-            ),
+            Err(error) => {
+                let mut result = crate::modules::result::from_error(
+                    error,
+                    self.asynchronous.is_some() || self.module.may_modify(&self.args, self.check),
+                );
+                if let Some((specification, _)) = &self.asynchronous {
+                    result.values.insert(
+                        "ansible_job_id".into(),
+                        Value::String(specification.jid.clone()),
+                    );
+                    result.no_log |= specification.no_log;
+                }
+                result
+            }
+        }
+    }
+    fn poll(
+        &self,
+        config: &ConnectionConfig,
+        runtime: &crate::worker::Runtime,
+        specification: &rustsible_protocol::AsyncSpec,
+        interval: u64,
+        timeout: u64,
+        changed: bool,
+    ) -> Result<ModuleResult> {
+        let deadline = std::time::Instant::now()
+            + std::time::Duration::from_millis(specification.timeout_ms)
+            + std::time::Duration::from_secs(15);
+        loop {
+            let mut args = serde_yaml::Mapping::from_iter([(
+                Value::String("jid".into()),
+                Value::String(specification.jid.clone()),
+            )]);
+            if let Some(directory) = &specification.directory {
+                args.insert(
+                    Value::String("_async_dir".into()),
+                    Value::String(directory.clone()),
+                );
+            }
+            let mut result = runtime.execute_request(
+                config,
+                rustsible_protocol::Request::new(
+                    "async_status",
+                    Value::Mapping(args.clone()),
+                    false,
+                    timeout,
+                ),
+                None,
+            )?;
+            result
+                .values
+                .entry("ansible_job_id".into())
+                .or_insert_with(|| Value::String(specification.jid.clone()));
+            result.no_log |= specification.no_log;
+            result.changed |= changed;
+            if result.values.get("finished").and_then(Value::as_bool) == Some(true) {
+                args.insert(
+                    Value::String("mode".into()),
+                    Value::String("cleanup".into()),
+                );
+                let cleaned = runtime.execute_request(
+                    config,
+                    rustsible_protocol::Request::new(
+                        "async_status",
+                        Value::Mapping(args),
+                        false,
+                        timeout,
+                    ),
+                    None,
+                )?;
+                if cleaned.failed {
+                    result.failed = true;
+                    result.msg = format!(
+                        "{}; async result cleanup failed: {}",
+                        result.msg, cleaned.msg
+                    );
+                }
+                return Ok(result);
+            }
+            if result.failed || result.unreachable || result.uncertain {
+                return Ok(result);
+            }
+            if std::time::Instant::now() >= deadline {
+                result.failed = true;
+                result.uncertain = true;
+                result.msg =
+                    "Async supervisor did not confirm a final result; query the retained job ID"
+                        .into();
+                return Ok(result);
+            }
+            std::thread::sleep(
+                std::time::Duration::from_secs(interval)
+                    .min(deadline.saturating_duration_since(std::time::Instant::now())),
+            );
         }
     }
 }
@@ -185,8 +354,13 @@ mod tests {
             }
             assert!(module.validate_capabilities(true, false, false).is_ok());
             assert!(module.validate_capabilities(false, true, false).is_err());
-            assert!(module.validate_capabilities(false, false, true).is_err());
         }
+        assert!(Builtin::Command
+            .validate_capabilities(false, false, true)
+            .is_ok());
+        assert!(Builtin::Copy
+            .validate_capabilities(false, false, true)
+            .is_err());
         assert_eq!(
             Builtin::lookup("ansible.builtin.systemd_service").unwrap(),
             Builtin::Systemd

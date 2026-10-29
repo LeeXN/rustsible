@@ -1,0 +1,32 @@
+- hosts: localhost
+  gather_facts: false
+  vars:
+    ansible_async_dir: '@OUTPUT@/jobs'
+  tasks:
+    - shell: 'while [ ! -f @OUTPUT@/gate ]; do sleep 0.01; done; printf complete > @OUTPUT@/business; printf done'
+      async: 30
+      poll: 0
+      register: launched
+    - copy:
+        content: ready
+        dest: '@OUTPUT@/gate'
+    - async_status:
+        jid: '{{ launched.ansible_job_id }}'
+      register: observed
+      until: observed is finished
+      retries: 80
+      delay: 0.05
+    - copy:
+        content: '{{ observed.stdout }}|{{ observed.rc }}|{{ "finished" if observed.finished else "running" }}'
+        dest: '@OUTPUT@/queried'
+    - async_status:
+        jid: '{{ launched.ansible_job_id }}'
+        mode: cleanup
+    - command:
+        argv: [/bin/echo, polled]
+      async: 30
+      poll: 1
+      register: polled
+    - copy:
+        content: '{{ polled.stdout }}|{{ polled.rc }}|{{ "finished" if polled.finished else "running" }}'
+        dest: '@OUTPUT@/polled'

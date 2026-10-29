@@ -123,6 +123,13 @@ mv "$fixture_dir/free-output" "$fixture_dir/reference-free"
 mkdir "$fixture_dir/free-output"
 "$binary" playbook -i "$fixture_dir/strategy-inventory" "$fixture_dir/free.yml" > "$fixture_dir/native-free.log" 2>&1
 diff -r "$fixture_dir/reference-free" "$fixture_dir/free-output"
+mkdir "$fixture_dir/async-output"
+sed "s|@OUTPUT@|$fixture_dir/async-output|g" "$repo_dir/tests/reference/async.yml" > "$fixture_dir/async.yml"
+uv tool run --from ansible-core==2.21.0 ansible-playbook -i "$fixture_dir/inventory" "$fixture_dir/async.yml" > "$fixture_dir/reference-async.log" 2>&1
+mv "$fixture_dir/async-output" "$fixture_dir/reference-async"
+mkdir "$fixture_dir/async-output"
+"$binary" playbook -i "$fixture_dir/inventory" "$fixture_dir/async.yml" > "$fixture_dir/native-async.log" 2>&1
+diff -r "$fixture_dir/reference-async" "$fixture_dir/async-output"
 if uv tool run --from ansible-core==2.21.0 ansible-playbook \
     -i "$fixture_dir/inventory" "$fixture_dir/non_boolean.yml" > "$fixture_dir/reference-condition.log" 2>&1; then
     echo 'Reference unexpectedly accepted a string condition' >&2; exit 1
@@ -131,4 +138,4 @@ if "$binary" playbook -i "$fixture_dir/inventory" "$fixture_dir/non_boolean.yml"
     echo 'Rustsible unexpectedly accepted a string condition' >&2; exit 1
 fi
 [[ ! -e $fixture_dir/result/unsafe-condition ]]
-printf 'Ansible 2.21.0 comparison passed: templates/types, native files, retries/conditions, environment, command prediction, facts, variables, imports/roles, handlers/rescue, serial/run_once, failure thresholds, delegation and free strategy\n'
+printf 'Ansible 2.21.0 comparison passed: templates/types, native files, retries/conditions, environment, command prediction, facts, variables, imports/roles, handlers/rescue, serial/run_once, failure thresholds, delegation, free strategy and native async/poll/status\n'

@@ -42,6 +42,15 @@ rustsible playbook examples/rolling/playbook.yml -i examples/rolling/inventory -
 rustsible playbook examples/rolling/playbook.yml -i examples/rolling/inventory
 ```
 
+`async/playbook.yml` 与 `async/inventory` 展示后台启动、下一任务解锁执行、
+until 查询和显式清理。默认文件位于 `/tmp/rustsible-async-demo`，可用
+`-e demo_root=/其他测试目录` 改路径；全局 `--check` 不启动任务。
+
+```bash
+rustsible playbook examples/async/playbook.yml -i examples/async/inventory --check
+rustsible playbook examples/async/playbook.yml -i examples/async/inventory
+```
+
 ## 运行
 
 ```bash
