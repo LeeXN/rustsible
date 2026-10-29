@@ -36,6 +36,7 @@ pub struct Play {
 #[derive(Debug, Default)]
 struct HostStats {
     unreachable: usize,
+    uncertain: usize,
     ok: usize,
     changed: usize,
     failed: usize,
@@ -60,7 +61,7 @@ impl RunState {
         for name in names {
             let stats = &self.stats[name];
             println!(
-                "{:<30} : ok={} changed={} unreachable={} failed={} skipped={} ignored={}",
+                "{:<30} : ok={} changed={} unreachable={} failed={} skipped={} ignored={} uncertain={}",
                 name,
                 stats.ok,
                 stats.changed,
@@ -68,6 +69,7 @@ impl RunState {
                 stats.failed,
                 stats.skipped,
                 stats.ignored,
+                stats.uncertain,
             );
         }
     }
@@ -220,7 +222,9 @@ impl Play {
                     .get_mut(&host.name)
                     .context("Internal play state lost fact-gathering statistics")?;
                 if result.failed {
-                    if result.unreachable {
+                    if result.uncertain {
+                        host_stats.uncertain += 1;
+                    } else if result.unreachable {
                         host_stats.unreachable += 1;
                     } else {
                         host_stats.failed += 1;
@@ -324,10 +328,12 @@ impl Play {
                         )
                     })?;
                 if result.failed {
-                    if effective_task.ignore_errors && !result.unreachable {
+                    if effective_task.ignore_errors && !result.unreachable && !result.uncertain {
                         host_stats.ignored += 1;
                     } else {
-                        if result.unreachable {
+                        if result.uncertain {
+                            host_stats.uncertain += 1;
+                        } else if result.unreachable {
                             host_stats.unreachable += 1;
                         } else {
                             host_stats.failed += 1;
@@ -402,16 +408,15 @@ impl Play {
 
                     let failed_message = match handler_result {
                         Ok(result) if result.failed => {
-                            if result.unreachable {
-                                stats
-                                    .get_mut(&host.name)
-                                    .context("Missing handler statistics")?
-                                    .unreachable += 1;
+                            let counters = stats
+                                .get_mut(&host.name)
+                                .context("Missing handler statistics")?;
+                            if result.uncertain {
+                                counters.uncertain += 1;
+                            } else if result.unreachable {
+                                counters.unreachable += 1;
                             } else {
-                                stats
-                                    .get_mut(&host.name)
-                                    .context("Missing handler statistics")?
-                                    .failed += 1;
+                                counters.failed += 1;
                             }
                             Some(result.msg)
                         }
@@ -596,31 +601,7 @@ impl Play {
     }
 
     fn registered_value(result: &TaskResult) -> Value {
-        let mut value = Mapping::new();
-        value.insert(
-            Value::String("changed".to_string()),
-            Value::Bool(result.changed),
-        );
-        value.insert(
-            Value::String("failed".to_string()),
-            Value::Bool(result.failed),
-        );
-        value.insert(
-            Value::String("unreachable".to_string()),
-            Value::Bool(result.unreachable),
-        );
-        value.insert(
-            Value::String("skipped".to_string()),
-            Value::Bool(result.skipped),
-        );
-        value.insert(
-            Value::String("msg".to_string()),
-            Value::String(result.msg.clone()),
-        );
-        for (key, item) in &result.values {
-            value.insert(Value::String(key.clone()), item.clone());
-        }
-        Value::Mapping(value)
+        result.registered_value()
     }
 }
 

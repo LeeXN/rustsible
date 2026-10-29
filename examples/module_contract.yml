@@ -1,0 +1,18 @@
+- name: Inspect common module results
+  hosts: localhost
+  gather_facts: false
+  vars:
+    ansible_connection: local
+  tasks:
+    - name: Keep an expected failure for inspection
+      ansible.builtin.shell: printf 'available output'; printf 'expected failure' >&2; exit 7
+      register: diagnostic
+      ignore_errors: true
+    - ansible.builtin.debug:
+        var: diagnostic
+    - name: Explicit preview never starts the command
+      command: printf must-not-run
+      check_mode: true
+      register: preview
+    - debug:
+        msg: 'Preview outcome: {{ preview.outcome }}'

@@ -25,11 +25,18 @@ impl ConnectionConfig {
         self.port
     }
     pub fn from_host(host: &Host) -> Result<Self> {
+        Self::from_host_with_overrides(host, &HashMap::new())
+    }
+    pub(crate) fn from_host_with_overrides(
+        host: &Host,
+        overrides: &HashMap<String, Value>,
+    ) -> Result<Self> {
         let definitions = host.all_variables();
-        let data = HashMap::from([(
+        let mut data = HashMap::from([(
             "inventory_hostname".into(),
             Value::String(host.name.clone()),
         )]);
+        data.extend(overrides.clone());
         let resolved = crate::playbook::templar::resolve_definitions(&definitions, &data)?;
         Self::require_resolved(&definitions, &resolved)?;
         Self::from_context(&host.name, resolved)

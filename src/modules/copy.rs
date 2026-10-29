@@ -5,7 +5,7 @@ use std::path::Path;
 
 use crate::inventory::Host;
 use crate::modules::file::{inspect_path, plan_metadata_changes, PathKind};
-use crate::modules::param::{get_optional_param, get_param, validate_params};
+use crate::modules::param::{get_optional_param, get_param};
 use crate::modules::ModuleExecutor;
 use crate::modules::ModuleResult;
 use crate::ssh::atomic::{install, FileMetadata};
@@ -21,10 +21,7 @@ impl ModuleExecutor for CopyModule {
         become_user: &str,
         check_mode: bool,
     ) -> Result<ModuleResult> {
-        validate_params(
-            copy_args,
-            &["src", "content", "dest", "mode", "owner", "group", "force"],
-        )?;
+        crate::modules::registry::Builtin::Copy.validate_parameters(copy_args)?;
         let dest = get_param::<String>(copy_args, "dest")?;
         if dest.is_empty() {
             return Err(anyhow::anyhow!("Copy destination cannot be empty"));
@@ -137,6 +134,9 @@ impl ModuleExecutor for CopyModule {
             rc: None,
             changed,
             failed: false,
+            skipped: false,
+            unreachable: false,
+            uncertain: false,
             msg: if changed {
                 format!("Content copied from {} to {}", source_info, dest)
             } else {

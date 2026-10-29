@@ -5,7 +5,7 @@ use serde_yaml::Value;
 
 use crate::inventory::Host;
 use crate::modules::file::{inspect_path, plan_metadata_changes, quote_posix_shell_arg, PathKind};
-use crate::modules::param::{get_optional_param, get_param, validate_params};
+use crate::modules::param::{get_optional_param, get_param};
 use crate::modules::ModuleResult;
 use crate::ssh::atomic::{install, FileMetadata};
 use crate::ssh::connection::{Connection, SshConnection};
@@ -33,7 +33,12 @@ fn read_content(
         let command = format!("cat -- {}", quote_posix_shell_arg(path)?);
         let (code, stdout, stderr) = connection.execute_sudo_command(&command, become_user)?;
         if code != 0 {
-            bail!("Failed to read file {}: {}", path, stderr.trim());
+            return Err(crate::modules::result::command_error(
+                anyhow::anyhow!("Failed to read file {}: {}", path, stderr.trim()),
+                code,
+                stdout,
+                stderr,
+            ));
         }
         stdout.into_bytes()
     } else {
@@ -42,28 +47,6 @@ fn read_content(
             .with_context(|| format!("File {} disappeared while it was being inspected", path))?
     };
     String::from_utf8(bytes).with_context(|| format!("File {} is not valid UTF-8", path))
-}
-
-fn validate_new_metadata(
-    mode: Option<&str>,
-    owner: Option<&str>,
-    group: Option<&str>,
-) -> Result<()> {
-    if let Some(mode) = mode {
-        if mode.is_empty() || !mode.chars().all(|character| matches!(character, '0'..='7')) {
-            bail!("File mode must be a non-empty octal string");
-        }
-        let parsed = u32::from_str_radix(mode, 8).context("Invalid file mode")?;
-        if parsed > 0o7777 {
-            bail!("File mode is outside the supported range");
-        }
-    }
-    for (kind, value) in [("owner", owner), ("group", group)] {
-        if value.is_some_and(str::is_empty) {
-            bail!("File {kind} cannot be empty");
-        }
-    }
-    Ok(())
 }
 
 fn validate_line(line: Option<&str>) -> Result<()> {
@@ -80,22 +63,7 @@ pub fn execute(
     become_user: &str,
     check_mode: bool,
 ) -> Result<ModuleResult> {
-    validate_params(
-        args,
-        &[
-            "path",
-            "line",
-            "regexp",
-            "state",
-            "backup",
-            "create",
-            "insertafter",
-            "insertbefore",
-            "owner",
-            "group",
-            "mode",
-        ],
-    )?;
+    crate::modules::registry::Builtin::Lineinfile.validate_parameters(args)?;
     let path = get_param::<String>(args, "path")?;
     let line = get_optional_param::<String>(args, "line")?;
     let regexp = get_optional_param::<String>(args, "regexp")?;
@@ -109,6 +77,13 @@ pub fn execute(
     let group = get_optional_param::<String>(args, "group")?;
     let mode = get_optional_param::<String>(args, "mode")?;
 
+    crate::modules::file::validate_identities(
+        connection,
+        owner.as_deref(),
+        group.as_deref(),
+        use_become,
+        become_user,
+    )?;
     validate_line(line.as_deref())?;
     if insertafter.is_some() && insertbefore.is_some() {
         bail!("'insertafter' and 'insertbefore' are mutually exclusive");
@@ -142,7 +117,6 @@ pub fn execute(
     )?;
     let creates_file = !file_exists && state == "present";
 
-    validate_new_metadata(mode.as_deref(), owner.as_deref(), group.as_deref())?;
     let existing_metadata_changes = if file_exists {
         Some(plan_metadata_changes(
             &current,
@@ -174,10 +148,21 @@ pub fn execute(
                     quote_posix_shell_arg(&path)?,
                     quote_posix_shell_arg(&backup_path)?
                 );
-                let (code, _, stderr) = run(connection, &command, use_become, become_user)?;
+                crate::modules::result::ensure_mutation_allowed()?;
+                let (code, stdout, stderr) = run(connection, &command, use_become, become_user)?;
                 if code != 0 {
-                    bail!("Failed to create backup {}: {}", backup_path, stderr.trim());
+                    return Err(crate::modules::result::command_error(
+                        anyhow::anyhow!(
+                            "Failed to create backup {}: {}",
+                            backup_path,
+                            stderr.trim()
+                        ),
+                        code,
+                        stdout,
+                        stderr,
+                    ));
                 }
+                crate::modules::result::record_change();
             }
         }
 
@@ -202,6 +187,9 @@ pub fn execute(
         rc: None,
         changed,
         failed: false,
+        skipped: false,
+        unreachable: false,
+        uncertain: false,
         msg: if changed {
             format!(
                 "File {} {}",

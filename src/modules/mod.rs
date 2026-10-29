@@ -8,7 +8,10 @@ pub mod local;
 pub mod package;
 pub mod param;
 mod python;
+pub mod registry;
 pub mod remote;
+pub(crate) mod result;
+pub use result::{ExecutionFailure, Outcome};
 pub mod service;
 pub mod setup;
 pub mod shell;
@@ -34,6 +37,9 @@ pub struct ModuleResult {
     pub rc: Option<i32>,
     pub changed: bool,
     pub failed: bool,
+    pub skipped: bool,
+    pub unreachable: bool,
+    pub uncertain: bool,
     pub msg: String,
     /// Module-specific return values exposed to `register`.
     pub values: HashMap<String, Value>,
@@ -59,13 +65,6 @@ impl Default for AdHocOptions {
             forks: 5,
         }
     }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct EffectiveAdHocOptions {
-    use_become: bool,
-    become_user: String,
-    check_mode: bool,
 }
 
 /// Trait for common module execution patterns
@@ -105,6 +104,7 @@ pub trait ModuleExecutor {
         use_become: bool,
         become_user: &str,
     ) -> Result<(i32, String, String)> {
+        result::ensure_mutation_allowed()?;
         debug!("Executing module command ({} bytes)", cmd.len());
 
         if use_become {
@@ -128,6 +128,9 @@ pub trait ModuleExecutor {
             rc: Some(exit_code),
             changed: true,
             failed: exit_code != 0,
+            skipped: false,
+            unreachable: false,
+            uncertain: false,
             msg: if exit_code == 0 {
                 format!("{} (exit code: {})", success_msg, exit_code)
             } else if stderr.trim().is_empty() {
@@ -202,15 +205,12 @@ pub fn run_adhoc_with_options(
         ));
     }
 
-    let module_name = module_name
-        .strip_prefix("ansible.builtin.")
-        .or_else(|| module_name.strip_prefix("ansible.legacy."))
-        .unwrap_or(module_name);
-
+    let module_name = registry::Builtin::lookup(module_name)?.name();
     // Validate the module and parse mapped arguments before starting any
     // connections. Besides failing fast, this deliberately parses the command
     // line only once rather than once per host.
     let module_args = prepare_adhoc_args(module_name, args)?;
+    registry::Invocation::prepare(module_name, &module_args, options.check_mode)?;
 
     info!(
         "Running ad-hoc module '{}' on {} hosts",
@@ -231,13 +231,10 @@ pub fn run_adhoc_with_options(
             let handles = chunk
                 .iter()
                 .map(|host| {
-                    let effective_options = effective_adhoc_options(host, options);
                     scope.spawn(move || {
                         info!("Running module {} on host {}", module_name, host.name);
                         let start_time = Instant::now();
-                        let result = effective_options.and_then(|effective_options| {
-                            execute_adhoc_module(host, module_name, module_args, &effective_options)
-                        });
+                        let result = execute_adhoc_module(host, module_name, module_args, options);
                         HostExecution {
                             result,
                             duration: start_time.elapsed(),
@@ -270,14 +267,22 @@ pub fn run_adhoc_with_options(
                     println!(
                         "{} | {} => {}",
                         host.name.green(),
-                        "SUCCESS".green(),
+                        if module_result.skipped {
+                            "SKIPPED".yellow()
+                        } else {
+                            "SUCCESS".green()
+                        },
                         payload
                     );
                 } else {
                     println!(
                         "{} | {} | rc={} >>>\n{}",
                         host.name.green(),
-                        "SUCCESS".green(),
+                        if module_result.skipped {
+                            "SKIPPED".yellow()
+                        } else {
+                            "SUCCESS".green()
+                        },
                         module_result_rc(module_result),
                         if !module_result.stdout.trim().is_empty() {
                             module_result.stdout.trim()
@@ -297,12 +302,17 @@ pub fn run_adhoc_with_options(
                 };
                 failed_details.push(format!("{}: {}", host.name, detail));
                 if let Some(payload) = structured_module_output(module_result)? {
-                    println!("{} | {} => {}", host.name.red(), "FAILED".red(), payload);
+                    println!(
+                        "{} | {} => {}",
+                        host.name.red(),
+                        module_result.outcome().as_str().to_uppercase().red(),
+                        payload
+                    );
                 } else {
                     println!(
                         "{} | {} | rc={} >>>\n{}",
                         host.name.red(),
-                        "FAILED".red(),
+                        module_result.outcome().as_str().to_uppercase().red(),
                         module_result_rc(module_result),
                         detail
                     );
@@ -328,15 +338,20 @@ pub fn run_adhoc_with_options(
             Ok(result) if !module_result_failed(result) => Some(result),
             _ => None,
         };
+        let outcome = execution
+            .result
+            .as_ref()
+            .map(ModuleResult::outcome)
+            .unwrap_or(Outcome::Failed);
         println!(
-            "{}: {}={} {}={} {}={}",
+            "{}: ok={} changed={} failed={} unreachable={} uncertain={} skipped={}",
             host.name.bold(),
-            "ok".green(),
-            usize::from(successful_result.is_some()),
-            "changed".yellow(),
+            usize::from(outcome == Outcome::Ok),
             usize::from(successful_result.is_some_and(|result| result.changed)),
-            "failed".red(),
-            usize::from(successful_result.is_none())
+            usize::from(outcome == Outcome::Failed),
+            usize::from(outcome == Outcome::Unreachable),
+            usize::from(outcome == Outcome::Uncertain),
+            usize::from(outcome == Outcome::Skipped)
         );
     }
 
@@ -364,14 +379,10 @@ struct HostExecution {
 }
 
 fn prepare_adhoc_args(module_name: &str, args: &str) -> Result<Value> {
-    match module_name {
-        "command" | "shell" => parse_command_adhoc_args(args),
-        "setup" => parse_mapping_adhoc_args(args, true),
-        "copy" | "file" | "template" | "service" | "systemd" | "systemd_service" | "package"
-        | "debug" | "lineinfile" | "user" | "stat" | "get_url" => {
-            parse_mapping_adhoc_args(args, false)
-        }
-        _ => Err(anyhow::anyhow!("Unsupported module: {}", module_name)),
+    let module = registry::Builtin::lookup(module_name)?;
+    match module {
+        registry::Builtin::Command | registry::Builtin::Shell => parse_command_adhoc_args(args),
+        _ => parse_mapping_adhoc_args(args, module == registry::Builtin::Setup),
     }
 }
 
@@ -399,22 +410,18 @@ fn parse_mapping_adhoc_args(args: &str, allow_empty: bool) -> Result<Value> {
     Ok(Value::Mapping(parse_args(args)?))
 }
 
-fn effective_adhoc_options(host: &Host, options: &AdHocOptions) -> Result<EffectiveAdHocOptions> {
-    let config = crate::ssh::config::ConnectionConfig::from_host(host)?;
-    let use_become = options.become_override.unwrap_or(config.use_become);
-    let become_user = options
-        .become_user
-        .as_deref()
-        .or(Some(config.become_user.as_str()))
-        .filter(|user| !user.is_empty())
-        .unwrap_or("root")
-        .to_string();
-
-    Ok(EffectiveAdHocOptions {
-        use_become,
-        become_user,
-        check_mode: options.check_mode,
-    })
+fn adhoc_config(
+    host: &Host,
+    options: &AdHocOptions,
+) -> Result<crate::ssh::config::ConnectionConfig> {
+    let mut overrides = HashMap::new();
+    if let Some(value) = options.become_override {
+        overrides.insert("ansible_become".into(), Value::Bool(value));
+    }
+    if let Some(value) = &options.become_user {
+        overrides.insert("ansible_become_user".into(), Value::String(value.clone()));
+    }
+    crate::ssh::config::ConnectionConfig::from_host_with_overrides(host, &overrides)
 }
 
 fn module_result_rc(result: &ModuleResult) -> i32 {
@@ -422,38 +429,18 @@ fn module_result_rc(result: &ModuleResult) -> i32 {
 }
 
 fn module_result_failed(result: &ModuleResult) -> bool {
-    result.failed || result.rc.is_some_and(|rc| rc != 0)
+    matches!(
+        result.outcome(),
+        Outcome::Failed | Outcome::Unreachable | Outcome::Uncertain
+    )
 }
 
 fn structured_module_output(result: &ModuleResult) -> Result<Option<String>> {
-    if result.values.is_empty() {
+    if result.values.is_empty() && !result.skipped && !result.unreachable && !result.uncertain {
         return Ok(None);
     }
 
-    let mut payload = serde_json::Map::new();
-    for (key, value) in &result.values {
-        payload.insert(
-            key.clone(),
-            serde_json::to_value(value)
-                .with_context(|| format!("Failed to serialize module result field '{key}'"))?,
-        );
-    }
-    payload.insert("changed".to_string(), result.changed.into());
-    payload.insert("failed".to_string(), module_result_failed(result).into());
-    if let Some(rc) = result.rc {
-        payload.insert("rc".to_string(), rc.into());
-    }
-    if !result.stdout.is_empty() {
-        payload.insert("stdout".to_string(), result.stdout.clone().into());
-    }
-    if !result.stderr.is_empty() {
-        payload.insert("stderr".to_string(), result.stderr.clone().into());
-    }
-    if !result.msg.is_empty() {
-        payload.insert("msg".to_string(), result.msg.clone().into());
-    }
-
-    serde_json::to_string_pretty(&payload)
+    serde_json::to_string_pretty(&result.as_value())
         .context("Failed to encode structured module result")
         .map(Some)
 }
@@ -462,149 +449,14 @@ fn execute_adhoc_module(
     host: &Host,
     module_name: &str,
     args: &Value,
-    options: &EffectiveAdHocOptions,
+    options: &AdHocOptions,
 ) -> Result<ModuleResult> {
-    // Arbitrary commands have no generally safe change prediction. Return a
-    // check-mode result before opening a transport, while still validating the
-    // arguments exactly enough to reject an empty command.
-    if options.check_mode && matches!(module_name, "command" | "shell") {
-        let command = match module_name {
-            "command" => command::CommandModule::extract_command_arg(args)?,
-            "shell" => shell::ShellModule::extract_command_arg(args)?,
-            _ => unreachable!(),
-        };
-        let command_args = (module_name == "command")
-            .then(|| tokenize_args(&command))
-            .transpose()?;
-        if command.trim().is_empty() || command_args.as_ref().is_some_and(Vec::is_empty) {
-            return Err(anyhow::anyhow!(
-                "{} module requires a non-empty command",
-                module_name
-            ));
-        }
-        if module_name == "shell" && command.contains('\0') {
-            return Err(anyhow::anyhow!("Shell command cannot contain NUL bytes"));
-        }
-        if let Some(command_args) = command_args {
-            for argument in command_args {
-                file::quote_posix_shell_arg(&argument)?;
-            }
-        }
-        return Ok(ModuleResult {
-            stdout: String::new(),
-            stderr: String::new(),
-            rc: Some(0),
-            changed: false,
-            failed: false,
-            msg: format!(
-                "Check mode: {} was not executed because it has no safe change prediction",
-                module_name
-            ),
-            values: Default::default(),
-        });
-    }
-
-    match module_name {
-        "command" => command::execute_adhoc(
-            host,
-            args,
-            options.use_become,
-            &options.become_user,
-            options.check_mode,
-        ),
-        "shell" => shell::execute_adhoc(
-            host,
-            args,
-            options.use_become,
-            &options.become_user,
-            options.check_mode,
-        ),
-        "copy" => copy::execute_adhoc(
-            host,
-            args,
-            options.use_become,
-            &options.become_user,
-            options.check_mode,
-        ),
-        "file" => file::execute_adhoc(
-            host,
-            args,
-            options.use_become,
-            &options.become_user,
-            options.check_mode,
-        ),
-        "template" => template::execute_adhoc(
-            host,
-            args,
-            options.use_become,
-            &options.become_user,
-            options.check_mode,
-        ),
-        "service" => service::execute_adhoc(
-            host,
-            args,
-            options.use_become,
-            &options.become_user,
-            options.check_mode,
-        ),
-        "systemd" | "systemd_service" => service::execute_systemd_adhoc(
-            host,
-            args,
-            options.use_become,
-            &options.become_user,
-            options.check_mode,
-        ),
-        "package" => package::execute_adhoc(
-            host,
-            args,
-            options.use_become,
-            &options.become_user,
-            options.check_mode,
-        ),
-        "debug" => debug::execute_adhoc(
-            host,
-            args,
-            options.use_become,
-            &options.become_user,
-            options.check_mode,
-        ),
-        "lineinfile" => lineinfile::execute_adhoc(
-            host,
-            args,
-            options.use_become,
-            &options.become_user,
-            options.check_mode,
-        ),
-        "user" => user::execute_adhoc(
-            host,
-            args,
-            options.use_become,
-            &options.become_user,
-            options.check_mode,
-        ),
-        "setup" => setup::execute_adhoc(
-            host,
-            args,
-            options.use_become,
-            &options.become_user,
-            options.check_mode,
-        ),
-        "stat" => stat::execute_adhoc(
-            host,
-            args,
-            options.use_become,
-            &options.become_user,
-            options.check_mode,
-        ),
-        "get_url" => get_url::execute_adhoc(
-            host,
-            args,
-            options.use_become,
-            &options.become_user,
-            options.check_mode,
-        ),
-        _ => Err(anyhow::anyhow!("Unsupported module: {}", module_name)),
-    }
+    let invocation = registry::Invocation::prepare(module_name, args, options.check_mode)?;
+    let config = invocation
+        .needs_connection()
+        .then(|| adhoc_config(host, options))
+        .transpose()?;
+    Ok(invocation.execute(config.as_ref(), &HashMap::new()))
 }
 
 /// Parse command line arguments in format "key1=value1 key2=value2"
@@ -929,6 +781,9 @@ mod tests {
             rc: Some(7),
             changed: true,
             failed: false,
+            skipped: false,
+            unreachable: false,
+            uncertain: false,
             msg: "download failed".to_string(),
             values: HashMap::from([(
                 "stat".to_string(),
@@ -954,10 +809,11 @@ mod tests {
     fn setup_and_stat_execute_through_ad_hoc_dispatch() {
         let mut host = Host::new("localhost");
         host.set_variable("ansible_connection", "local");
-        let options = EffectiveAdHocOptions {
-            use_become: false,
-            become_user: "root".to_string(),
+        let options = AdHocOptions {
+            become_override: None,
+            become_user: None,
             check_mode: false,
+            forks: 5,
         };
 
         let facts = execute_adhoc_module(
@@ -986,10 +842,11 @@ mod tests {
     fn new_ad_hoc_dispatch_routes_validate_module_specific_arguments() {
         let mut host = Host::new("localhost");
         host.set_variable("ansible_connection", "local");
-        let options = EffectiveAdHocOptions {
-            use_become: false,
-            become_user: "root".to_string(),
+        let options = AdHocOptions {
+            become_override: None,
+            become_user: None,
             check_mode: true,
+            forks: 5,
         };
         let empty = Value::Mapping(Default::default());
 
@@ -1026,14 +883,9 @@ mod tests {
         host.set_variable("ansible_become", "true");
         host.set_variable("ansible_become_user", "inventory-user");
 
-        assert_eq!(
-            effective_adhoc_options(&host, &AdHocOptions::default()).unwrap(),
-            EffectiveAdHocOptions {
-                use_become: true,
-                become_user: "inventory-user".to_string(),
-                check_mode: false,
-            }
-        );
+        let inherited = adhoc_config(&host, &AdHocOptions::default()).unwrap();
+        assert!(inherited.use_become);
+        assert_eq!(inherited.become_user, "inventory-user");
 
         let explicit = AdHocOptions {
             become_override: Some(false),
@@ -1041,14 +893,9 @@ mod tests {
             check_mode: true,
             forks: 3,
         };
-        assert_eq!(
-            effective_adhoc_options(&host, &explicit).unwrap(),
-            EffectiveAdHocOptions {
-                use_become: false,
-                become_user: "cli-user".to_string(),
-                check_mode: true,
-            }
-        );
+        let config = adhoc_config(&host, &explicit).unwrap();
+        assert!(!config.use_become);
+        assert_eq!(config.become_user, "cli-user");
     }
 
     #[test]
@@ -1129,6 +976,9 @@ mod tests {
         assert_eq!(
             module_result_rc(&ModuleResult {
                 failed: true,
+                skipped: false,
+                unreachable: false,
+                uncertain: false,
                 ..ModuleResult::default()
             }),
             1

@@ -4,7 +4,6 @@ use serde_yaml::Value;
 
 use crate::inventory::Host;
 use crate::modules::file::quote_posix_shell_arg;
-use crate::modules::param::validate_params;
 use crate::modules::ModuleResult;
 use crate::ssh::connection::{Connection, SshConnection};
 
@@ -105,18 +104,25 @@ fn detect_package_manager(connection: &dyn SshConnection) -> Result<PackageManag
         PackageManager::Pacman,
     ] {
         let command = format!("command -v -- {} >/dev/null 2>&1", manager.executable());
-        let (code, _, stderr) = connection
+        let (code, stdout, stderr) = connection
             .execute_command(&command)
             .with_context(|| format!("Failed while detecting {}", manager.executable()))?;
         match code {
             0 => return Ok(manager),
             1 | 127 => {}
-            code => bail!(
-                "Failed while detecting {} (exit {}): {}",
-                manager.executable(),
-                code,
-                stderr.trim()
-            ),
+            code => {
+                return Err(crate::modules::result::command_error(
+                    anyhow::anyhow!(
+                        "Failed while detecting {} (exit {}): {}",
+                        manager.executable(),
+                        code,
+                        stderr.trim()
+                    ),
+                    code,
+                    stdout,
+                    stderr,
+                ))
+            }
         }
     }
     bail!("No supported package manager was detected")
@@ -141,16 +147,21 @@ fn is_installed(
     package: &str,
 ) -> Result<bool> {
     let command = installed_query(manager, package)?;
-    let (code, _, stderr) = connection.execute_command(&command)?;
+    let (code, stdout, stderr) = connection.execute_command(&command)?;
     match code {
         0 => Ok(true),
         1 => Ok(false),
-        code => bail!(
-            "Failed to query installed state for '{}' (exit {}): {}",
-            package,
+        code => Err(crate::modules::result::command_error(
+            anyhow::anyhow!(
+                "Failed to query installed state for '{}' (exit {}): {}",
+                package,
+                code,
+                stderr.trim()
+            ),
             code,
-            stderr.trim()
-        ),
+            stdout,
+            stderr,
+        )),
     }
 }
 
@@ -179,7 +190,7 @@ fn is_latest(
             )
         }
     };
-    let (code, _, stderr) = connection.execute_command(&command)?;
+    let (code, stdout, stderr) = connection.execute_command(&command)?;
     match manager {
         PackageManager::Apt => match code {
             0 => Ok(true),
@@ -192,32 +203,47 @@ fn is_latest(
                 "No candidate version was reported for package '{}'",
                 package
             ),
-            code => bail!(
-                "Failed to compare package versions for '{}' (exit {}): {}",
-                package,
+            code => Err(crate::modules::result::command_error(
+                anyhow::anyhow!(
+                    "Failed to compare package versions for '{}' (exit {}): {}",
+                    package,
+                    code,
+                    stderr.trim()
+                ),
                 code,
-                stderr.trim()
-            ),
+                stdout,
+                stderr,
+            )),
         },
         PackageManager::Dnf | PackageManager::Yum => match code {
             0 => Ok(true),
             100 => Ok(false),
-            code => bail!(
-                "Failed to query available updates for '{}' (exit {}): {}",
-                package,
+            code => Err(crate::modules::result::command_error(
+                anyhow::anyhow!(
+                    "Failed to query available updates for '{}' (exit {}): {}",
+                    package,
+                    code,
+                    stderr.trim()
+                ),
                 code,
-                stderr.trim()
-            ),
+                stdout,
+                stderr,
+            )),
         },
         PackageManager::Pacman => match code {
             0 => Ok(false),
             1 => Ok(true),
-            code => bail!(
-                "Failed to query available updates for '{}' (exit {}): {}",
-                package,
+            code => Err(crate::modules::result::command_error(
+                anyhow::anyhow!(
+                    "Failed to query available updates for '{}' (exit {}): {}",
+                    package,
+                    code,
+                    stderr.trim()
+                ),
                 code,
-                stderr.trim()
-            ),
+                stdout,
+                stderr,
+            )),
         },
         PackageManager::Zypper => bail!("state=latest is not supported for zypper"),
     }
@@ -293,7 +319,7 @@ pub fn execute(
     become_user: &str,
     check_mode: bool,
 ) -> Result<ModuleResult> {
-    validate_params(args, &["name", "state", "update_cache"])?;
+    crate::modules::registry::Builtin::Package.validate_parameters(args)?;
     let map = args
         .as_mapping()
         .context("Package module requires a mapping of arguments")?;
@@ -328,16 +354,24 @@ pub fn execute(
     let changed = update_cache || !pending.is_empty();
 
     if !check_mode {
+        crate::modules::result::ensure_mutation_allowed()?;
         if update_cache {
             let command = cache_update_command(manager);
-            let (code, _, stderr) = run_operation(connection, command, use_become, become_user)?;
+            let (code, stdout, stderr) =
+                run_operation(connection, command, use_become, become_user)?;
             if code != 0 {
-                bail!(
-                    "Failed to update the package cache (exit {}): {}",
+                return Err(crate::modules::result::command_error(
+                    anyhow::anyhow!(
+                        "Failed to update the package cache (exit {}): {}",
+                        code,
+                        stderr.trim()
+                    ),
                     code,
-                    stderr.trim()
-                );
+                    stdout,
+                    stderr,
+                ));
             }
+            crate::modules::result::record_change();
         }
 
         for package in &pending {
@@ -346,15 +380,22 @@ pub fn execute(
                 "Executing package-manager operation ({} bytes)",
                 command.len()
             );
-            let (code, _, stderr) = run_operation(connection, &command, use_become, become_user)?;
+            let (code, stdout, stderr) =
+                run_operation(connection, &command, use_become, become_user)?;
             if code != 0 {
-                bail!(
-                    "Package operation failed for '{}' (exit {}): {}",
-                    package,
+                return Err(crate::modules::result::command_error(
+                    anyhow::anyhow!(
+                        "Package operation failed for '{}' (exit {}): {}",
+                        package,
+                        code,
+                        stderr.trim()
+                    ),
                     code,
-                    stderr.trim()
-                );
+                    stdout,
+                    stderr,
+                ));
             }
+            crate::modules::result::record_change();
         }
     }
 
@@ -364,6 +405,9 @@ pub fn execute(
         rc: None,
         changed,
         failed: false,
+        skipped: false,
+        unreachable: false,
+        uncertain: false,
         msg: if changed {
             format!(
                 "{} package(s) {}{}",

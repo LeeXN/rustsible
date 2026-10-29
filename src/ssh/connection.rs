@@ -15,6 +15,34 @@ use std::time::{Duration, Instant};
 use super::config::ConnectionConfig;
 use crate::inventory::Host;
 
+/// Preserve error classification through anyhow contexts without retaining
+/// command text or stdin data. Once execution starts, a lost response cannot
+/// safely be interpreted as proof that no state change occurred.
+#[derive(Debug)]
+pub(crate) struct TransportFailure {
+    pub remote: bool,
+    pub started: bool,
+    message: String,
+}
+impl std::fmt::Display for TransportFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.message)
+    }
+}
+impl std::error::Error for TransportFailure {}
+pub(crate) fn result_unavailable(error: anyhow::Error) -> anyhow::Error {
+    transport_error(error, false, true)
+}
+
+fn transport_error(error: anyhow::Error, remote: bool, started: bool) -> anyhow::Error {
+    let message = error.to_string();
+    error.context(TransportFailure {
+        remote,
+        started,
+        message,
+    })
+}
+
 const DEFAULT_SSH_TIMEOUT_SECS: u64 = 10;
 const DEFAULT_COMMAND_TIMEOUT_SECS: u64 = 300;
 const MAX_COMMAND_OUTPUT_BYTES: usize = 16 * 1024 * 1024;
@@ -669,6 +697,17 @@ impl LocalConnection {
         command: &str,
         input: Option<&[u8]>,
     ) -> Result<(i32, Vec<u8>, Vec<u8>)> {
+        let mut started = false;
+        self.execute_bytes(command, input, &mut started)
+            .map_err(|error| transport_error(error, false, started))
+    }
+
+    fn execute_bytes(
+        &self,
+        command: &str,
+        input: Option<&[u8]>,
+        started: &mut bool,
+    ) -> Result<(i32, Vec<u8>, Vec<u8>)> {
         debug!(
             "Executing local command for {} ({} bytes)",
             self.host,
@@ -682,6 +721,7 @@ impl LocalConnection {
             .checked_add(self.command_timeout)
             .context("Local command timeout is too large")?;
         let mut child = spawn_local_shell(command).context("Failed to start local command")?;
+        *started = true;
 
         // Drain both output pipes while stdin is being written. Writing stdin
         // synchronously before starting the readers deadlocks when the child
@@ -1021,6 +1061,17 @@ impl SshClient {
         command: &str,
         input: Option<&[u8]>,
     ) -> Result<(i32, Vec<u8>, Vec<u8>)> {
+        let mut started = false;
+        self.execute_bytes(command, input, &mut started)
+            .map_err(|error| transport_error(error, true, started))
+    }
+
+    fn execute_bytes(
+        &self,
+        command: &str,
+        input: Option<&[u8]>,
+        started: &mut bool,
+    ) -> Result<(i32, Vec<u8>, Vec<u8>)> {
         let _operation = self
             .operation_lock
             .lock()
@@ -1055,6 +1106,7 @@ impl SshClient {
             std::thread::sleep(IO_POLL_INTERVAL);
         };
 
+        *started = true;
         // Starting the remote process is also part of the command deadline.
         // libssh2 operations in non-blocking mode must be retried when their
         // SSH window or socket would block.
@@ -1205,6 +1257,39 @@ impl SshClient {
                 group: group.as_deref(),
             },
         )
+    }
+
+    fn read_remote_bytes(&self, path: &str) -> Result<Option<Vec<u8>>> {
+        let _operation = self
+            .operation_lock
+            .lock()
+            .map_err(|_| anyhow!("SSH operation lock was poisoned"))?;
+        let sftp = self
+            .session
+            .sftp()
+            .context("Failed to initialize SFTP subsystem")?;
+        let mut file = match sftp.open(Path::new(path)) {
+            Ok(file) => file,
+            Err(error) => {
+                let io_error: io::Error = error.into();
+                if io_error.kind() == io::ErrorKind::NotFound {
+                    return Ok(None);
+                }
+                return Err(io_error).context("Failed to open remote file through SFTP");
+            }
+        };
+        let mut content = Vec::new();
+        let mut bounded = (&mut file).take((MAX_COMMAND_OUTPUT_BYTES + 1) as u64);
+        bounded
+            .read_to_end(&mut content)
+            .context("Failed to read remote file through SFTP")?;
+        if content.len() > MAX_COMMAND_OUTPUT_BYTES {
+            bail!(
+                "Remote file exceeded the {} byte safety limit",
+                MAX_COMMAND_OUTPUT_BYTES
+            );
+        }
+        Ok(Some(content))
     }
 
     pub fn connect(host: &Host) -> Result<Self> {
@@ -1439,36 +1524,8 @@ impl SshConnection for SshClient {
     }
 
     fn read_file_bytes(&self, path: &str) -> Result<Option<Vec<u8>>> {
-        let _operation = self
-            .operation_lock
-            .lock()
-            .map_err(|_| anyhow!("SSH operation lock was poisoned"))?;
-        let sftp = self
-            .session
-            .sftp()
-            .context("Failed to initialize SFTP subsystem")?;
-        let mut file = match sftp.open(Path::new(path)) {
-            Ok(file) => file,
-            Err(error) => {
-                let io_error: io::Error = error.into();
-                if io_error.kind() == io::ErrorKind::NotFound {
-                    return Ok(None);
-                }
-                return Err(io_error).context("Failed to open remote file through SFTP");
-            }
-        };
-        let mut content = Vec::new();
-        let mut bounded = (&mut file).take((MAX_COMMAND_OUTPUT_BYTES + 1) as u64);
-        bounded
-            .read_to_end(&mut content)
-            .context("Failed to read remote file through SFTP")?;
-        if content.len() > MAX_COMMAND_OUTPUT_BYTES {
-            bail!(
-                "Remote file exceeded the {} byte safety limit",
-                MAX_COMMAND_OUTPUT_BYTES
-            );
-        }
-        Ok(Some(content))
+        self.read_remote_bytes(path)
+            .map_err(|error| transport_error(error, true, false))
     }
 
     fn read_file_bytes_with_sudo(&self, path: &str, sudo_user: &str) -> Result<Option<Vec<u8>>> {

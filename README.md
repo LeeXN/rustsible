@@ -133,6 +133,21 @@ JSON string or `{"cmd":"..."}`. Structured module data such as `ansible_facts`,
 gathering uses the `setup` module rather than the play-only `gather_facts`
 keyword.
 
+Playbook and ad-hoc execution share one module registry, argument schema,
+capability policy, dispatcher, and common result conversion. Unsupported keys
+and wrong types fail before dispatch, including during check mode. The check
+policy is read-only for `debug/setup/stat`, predictive for state modules, and
+skip for commands without a safe prediction. Diff and async remain unsupported
+and are rejected; later implementation stages will enable them explicitly.
+
+Results distinguish `ok`, `failed`, `skipped`, `unreachable`, and `uncertain`
+through `outcome` and the `failed/skipped/unreachable/uncertain` flags. `rc`, output, and confirmed
+earlier changes survive a failed operation. A lost response after a potentially
+modifying execution is `uncertain`; it is not replayed, is not swallowed by
+`ignore_errors`, and excludes that host from later work. The same rule stops
+remaining loop items. `no_log` still censors user-facing payloads and diagnostics.
+See [examples/module_contract.yml](examples/module_contract.yml).
+
 Inspect the parsed inventory without running tasks:
 
 ```bash

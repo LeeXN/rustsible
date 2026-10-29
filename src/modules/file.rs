@@ -4,7 +4,7 @@ use serde_yaml::Value;
 use std::path::Component;
 
 use crate::inventory::Host;
-use crate::modules::param::{get_optional_param, get_param, validate_params};
+use crate::modules::param::{get_optional_param, get_param};
 use crate::modules::ModuleResult;
 use crate::ssh::connection::{Connection, SshConnection};
 
@@ -128,6 +128,45 @@ impl FileState {
     }
 }
 
+/// Resolve requested names before creating/removing the object. Syntax/type
+/// checks live in the registry; these are the target-dependent, read-only checks.
+pub(crate) fn validate_identities(
+    connection: &dyn SshConnection,
+    owner: Option<&str>,
+    group: Option<&str>,
+    use_become: bool,
+    become_user: &str,
+) -> Result<()> {
+    for (kind, value) in [("owner", owner), ("group", group)] {
+        if let Some(value) = value.filter(|value| !value.bytes().all(|byte| byte.is_ascii_digit()))
+        {
+            let command = format!(
+                "{} {}",
+                if kind == "owner" {
+                    "id -u --"
+                } else {
+                    "getent -- group"
+                },
+                quote_posix_shell_arg(value)?
+            );
+            let (code, stdout, stderr) = if use_become {
+                connection.execute_sudo_command(&command, become_user)?
+            } else {
+                connection.execute_command(&command)?
+            };
+            if code != 0 {
+                return Err(crate::modules::result::command_error(
+                    anyhow::anyhow!("Invalid file {kind}: {}", stderr.trim()),
+                    code,
+                    stdout,
+                    stderr,
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
 /// Execute the file module logic: create/remove/touch/set permissions/ownership for files or directories.
 pub fn execute(
     connection: &dyn SshConnection,
@@ -136,10 +175,7 @@ pub fn execute(
     become_user: &str,
     check_mode: bool,
 ) -> Result<ModuleResult> {
-    validate_params(
-        file_args,
-        &["path", "dest", "state", "src", "mode", "owner", "group"],
-    )?;
+    crate::modules::registry::Builtin::File.validate_parameters(file_args)?;
     let map = file_args
         .as_mapping()
         .ok_or_else(|| anyhow::anyhow!("File module requires a mapping of arguments"))?;
@@ -168,6 +204,13 @@ pub fn execute(
     let owner = get_optional_param::<String>(file_args, "owner")?;
     let group = get_optional_param::<String>(file_args, "group")?;
 
+    validate_identities(
+        connection,
+        owner.as_deref(),
+        group.as_deref(),
+        use_become,
+        become_user,
+    )?;
     let current = inspect_path(connection, &path, use_become, become_user)?;
     let mut object_changed = false;
     let mut replacement = false;
@@ -282,6 +325,9 @@ pub fn execute(
         rc: None,
         changed,
         failed: false,
+        skipped: false,
+        unreachable: false,
+        uncertain: false,
         msg: if changed {
             format!(
                 "File {} {}",
@@ -311,10 +357,14 @@ fn execute_inspection_command(
         connection.execute_command(command)?
     };
     if exit_code != 0 {
-        return Err(anyhow::anyhow!(
-            "Failed to inspect path (exit code {}): {}",
+        return Err(crate::modules::result::command_error(
+            anyhow::anyhow!(
+                "Failed to inspect path (exit code {exit_code}): {}",
+                stderr.trim()
+            ),
             exit_code,
-            stderr.trim()
+            stdout,
+            stderr,
         ));
     }
     Ok(stdout)
@@ -379,17 +429,8 @@ pub(crate) fn inspect_path(
     })
 }
 
-fn normalize_mode(mode: &str) -> Result<String> {
-    if mode.is_empty() || !mode.chars().all(|character| matches!(character, '0'..='7')) {
-        return Err(anyhow::anyhow!(
-            "File mode must be a non-empty octal string"
-        ));
-    }
-    let parsed = u32::from_str_radix(mode, 8).map_err(|_| anyhow::anyhow!("Invalid mode"))?;
-    if parsed > 0o7777 {
-        return Err(anyhow::anyhow!("File mode is outside the supported range"));
-    }
-    Ok(format!("{:o}", parsed))
+pub(crate) fn normalize_mode(mode: &str) -> Result<String> {
+    Ok(format!("{:o}", crate::modules::param::parse_mode(mode)?))
 }
 
 pub(crate) fn plan_metadata_changes(
@@ -475,18 +516,21 @@ fn execute_mutating_command(
     become_user: &str,
     operation: &str,
 ) -> Result<()> {
-    let (exit_code, _, stderr) = if use_become {
+    crate::modules::result::ensure_mutation_allowed()?;
+    let (exit_code, stdout, stderr) = if use_become {
         connection.execute_sudo_command(command, become_user)?
     } else {
         connection.execute_command(command)?
     };
     if exit_code != 0 {
-        Err(anyhow::anyhow!(
-            "Failed to {}: {}",
-            operation,
-            stderr.trim()
+        Err(crate::modules::result::command_error(
+            anyhow::anyhow!("Failed to {operation}: {}", stderr.trim()),
+            exit_code,
+            stdout,
+            stderr,
         ))
     } else {
+        crate::modules::result::record_change();
         Ok(())
     }
 }
@@ -501,15 +545,13 @@ fn create_directory(
     info!("Creating a directory");
     let quoted_path = quote_posix_shell_arg(path)?;
     let cmd = format!("mkdir -p -- {}", quoted_path);
-    let (exit_code, _, stderr) = if use_become {
-        connection.execute_sudo_command(&cmd, become_user)?
-    } else {
-        connection.execute_command(&cmd)?
-    };
-    if exit_code != 0 {
-        return Err(anyhow::anyhow!("Failed to create directory: {}", stderr));
-    }
-    Ok(())
+    execute_mutating_command(
+        connection,
+        &cmd,
+        use_become,
+        become_user,
+        "create directory",
+    )
 }
 
 /// Remove a file or directory.
@@ -523,18 +565,13 @@ fn remove_file(
     validate_removal_path(path)?;
     let quoted_path = quote_posix_shell_arg(path)?;
     let cmd = format!("rm -rf -- {}", quoted_path);
-    let (exit_code, _, stderr) = if use_become {
-        connection.execute_sudo_command(&cmd, become_user)?
-    } else {
-        connection.execute_command(&cmd)?
-    };
-    if exit_code != 0 {
-        return Err(anyhow::anyhow!(
-            "Failed to remove file/directory: {}",
-            stderr
-        ));
-    }
-    Ok(())
+    execute_mutating_command(
+        connection,
+        &cmd,
+        use_become,
+        become_user,
+        "remove file/directory",
+    )
 }
 
 /// Touch a file (update timestamp or create if not exists).
@@ -547,15 +584,7 @@ fn touch_file(
     info!("Updating a file timestamp");
     let quoted_path = quote_posix_shell_arg(path)?;
     let cmd = format!("touch -- {}", quoted_path);
-    let (exit_code, _, stderr) = if use_become {
-        connection.execute_sudo_command(&cmd, become_user)?
-    } else {
-        connection.execute_command(&cmd)?
-    };
-    if exit_code != 0 {
-        return Err(anyhow::anyhow!("Failed to touch file: {}", stderr));
-    }
-    Ok(())
+    execute_mutating_command(connection, &cmd, use_become, become_user, "touch file")
 }
 
 /// Create a symbolic link.
@@ -570,15 +599,7 @@ fn create_symlink(
     let quoted_src = quote_posix_shell_arg(src)?;
     let quoted_dest = quote_posix_shell_arg(dest)?;
     let cmd = format!("ln -sfn -- {} {}", quoted_src, quoted_dest);
-    let (exit_code, _, stderr) = if use_become {
-        connection.execute_sudo_command(&cmd, become_user)?
-    } else {
-        connection.execute_command(&cmd)?
-    };
-    if exit_code != 0 {
-        return Err(anyhow::anyhow!("Failed to create symlink: {}", stderr));
-    }
-    Ok(())
+    execute_mutating_command(connection, &cmd, use_become, become_user, "create symlink")
 }
 
 /// Execute the file module in ad-hoc mode for a single host.
@@ -756,6 +777,39 @@ mod tests {
         assert_eq!(
             std::fs::read_link(path).unwrap(),
             std::path::Path::new("first target")
+        );
+    }
+
+    #[test]
+    fn invalid_metadata_does_not_create_or_remove_paths() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("must-not-exist");
+        let connection =
+            crate::ssh::connection::LocalConnection::new(&Host::new("localhost")).unwrap();
+        let args = serde_yaml::from_str(&format!(
+            "path: {}\nstate: directory\nmode: '888'",
+            path.display()
+        ))
+        .unwrap();
+        assert!(execute(&connection, &args, false, "root", false).is_err());
+        assert!(!path.exists());
+        std::fs::write(&path, b"keep").unwrap();
+        let args = serde_yaml::from_str(&format!(
+            "path: {}\nstate: absent\nmode: '888'",
+            path.display()
+        ))
+        .unwrap();
+        assert!(execute(&connection, &args, false, "root", false).is_err());
+        assert_eq!(std::fs::read(path).unwrap(), b"keep");
+    }
+
+    #[test]
+    fn a_scoped_dry_run_blocks_a_mutation_before_any_command_is_sent() {
+        let _scope = crate::modules::result::ChangeScope::enter(true);
+        let connection = crate::ssh::connection::MockSshConnection::new();
+        assert!(
+            super::create_directory(&connection, "/tmp/must-not-be-created", false, "root")
+                .is_err()
         );
     }
 }

@@ -9,9 +9,12 @@ use std::collections::HashMap;
 use std::time::Instant;
 
 use crate::inventory::Host;
-use crate::modules::ModuleResult;
+use crate::modules::result::insert_output_values;
+use crate::modules::{
+    registry::{Builtin, Invocation},
+    ModuleResult,
+};
 use crate::ssh::config::ConnectionConfig;
-use crate::ssh::connection::Connection;
 
 const MAX_ARGUMENT_TEMPLATE_DEPTH: usize = 64;
 const MAX_ARGUMENT_TEMPLATE_NODES: usize = 10_000;
@@ -22,6 +25,7 @@ pub struct TaskResult {
     pub changed: bool,
     pub failed: bool,
     pub unreachable: bool,
+    pub uncertain: bool,
     pub skipped: bool,
     pub msg: String,
     #[allow(dead_code)]
@@ -32,6 +36,22 @@ pub struct TaskResult {
 }
 
 impl TaskResult {
+    pub fn outcome(&self) -> crate::modules::Outcome {
+        crate::modules::Outcome::from_flags(
+            self.failed,
+            self.skipped,
+            self.unreachable,
+            self.uncertain,
+        )
+    }
+    pub(crate) fn registered_value(&self) -> Value {
+        Value::Mapping(crate::modules::result::result_fields(
+            self.changed,
+            self.outcome(),
+            &self.msg,
+            &self.values,
+        ))
+    }
     pub fn new(host: &str) -> Self {
         let mut values = HashMap::new();
         insert_output_values(&mut values, String::new(), String::new(), None);
@@ -39,6 +59,7 @@ impl TaskResult {
             changed: false,
             failed: false,
             unreachable: false,
+            uncertain: false,
             skipped: false,
             msg: String::new(),
             host: host.to_string(),
@@ -58,39 +79,19 @@ impl TaskResult {
 
         TaskResult {
             changed: module_result.changed,
-            failed: module_result.failed,
-            unreachable: false,
-            skipped: false,
+            failed: module_result.failed
+                || module_result.rc.is_some_and(|rc| rc != 0)
+                || module_result.unreachable
+                || module_result.uncertain,
+            unreachable: module_result.unreachable,
+            uncertain: module_result.uncertain,
+            skipped: module_result.skipped,
             msg: module_result.msg,
             host: host.to_string(),
             values,
             no_log: false,
         }
     }
-}
-
-fn insert_output_values(
-    values: &mut HashMap<String, Value>,
-    stdout: String,
-    stderr: String,
-    rc: Option<i32>,
-) {
-    let stdout_lines = stdout
-        .lines()
-        .map(|line| Value::String(line.to_string()))
-        .collect();
-    let stderr_lines = stderr
-        .lines()
-        .map(|line| Value::String(line.to_string()))
-        .collect();
-    values.insert("stdout".to_string(), Value::String(stdout));
-    values.insert("stderr".to_string(), Value::String(stderr));
-    values.insert("stdout_lines".to_string(), Value::Sequence(stdout_lines));
-    values.insert("stderr_lines".to_string(), Value::Sequence(stderr_lines));
-    values.insert(
-        "rc".to_string(),
-        rc.map_or(Value::Null, |code| Value::Number(code.into())),
-    );
 }
 
 /// Task structure representing a single action in a play
@@ -214,8 +215,8 @@ impl Task {
             let initial_context = crate::playbook::templar::create_context(&vars)?;
             let items_list =
                 match self.resolve_loop_items(items, &mut engine, &initial_context, &vars)? {
-                    Some(list) => list,
-                    None => {
+                    Some(list) if !list.is_empty() => list,
+                    _ => {
                         let mut result = TaskResult::new(&host.name);
                         result.skipped = true;
                         result.msg = "No items in loop".to_string();
@@ -319,7 +320,11 @@ impl Task {
                     self.index_var_name.as_deref(),
                     idx,
                 ));
+                let stop = result.unreachable || result.uncertain;
                 results.push(result);
+                if stop {
+                    break;
+                }
             }
         } else {
             let context = crate::playbook::templar::create_context(&vars)?;
@@ -360,6 +365,7 @@ impl Task {
         // (registered variables and recap still need to see `failed: true`).
         final_result.failed = failed;
         final_result.unreachable = results.iter().any(|result| result.unreachable);
+        final_result.uncertain = results.iter().any(|result| result.uncertain);
         final_result.skipped = skipped;
         final_result.no_log = self.no_log;
 
@@ -467,32 +473,13 @@ impl Task {
                 }
             }
         }
-        if !Self::is_supported_module(module_name) {
-            return Err(anyhow!("Unsupported module: {}", self.module));
-        }
-
-        if check_mode && matches!(module_name, "command" | "shell") {
-            let mut result = TaskResult::new(&host.name);
-            result.skipped = true;
-            result.msg = format!(
-                "Check mode: {} was not executed because it has no safe change prediction",
-                module_name
-            );
-            result
-                .values
-                .insert("check_mode".to_string(), Value::Bool(true));
-            insert_output_values(&mut result.values, String::new(), String::new(), None);
-            return Ok(result);
-        }
-
-        if module_name == "debug" {
-            let module_result =
-                crate::modules::debug::execute_without_connection(&Value::Mapping(resolved_args))?;
-            return Ok(TaskResult::from_module_result(&host.name, module_result));
-        }
-
-        if module_name == "setup" {
-            crate::modules::setup::validate_args(&Value::Mapping(resolved_args.clone()))?;
+        let invocation =
+            Invocation::prepare(module_name, &Value::Mapping(resolved_args), check_mode)?;
+        if !invocation.needs_connection() {
+            return Ok(TaskResult::from_module_result(
+                &host.name,
+                invocation.execute(None, vars),
+            ));
         }
         let mut connection_vars = vars.clone();
         if let Some(connection) = &self.connection {
@@ -508,161 +495,14 @@ impl Task {
             .entry("ansible_become_user".into())
             .or_insert(Value::String(become_user));
         let config = ConnectionConfig::from_context(&host.name, connection_vars)?;
-        let use_become = config.use_become;
-        let become_user = config.become_user.clone();
-        let connection = match Connection::from_config(&config) {
-            Ok(connection) => connection,
-            Err(e) => {
-                let mut result = TaskResult::new(&host.name);
-                result.failed = true;
-                result.unreachable = true;
-                result.msg = format!("Failed to connect to host: {}", e);
-                return Ok(result);
-            }
-        };
-        let connection = connection.as_connection();
-
-        let module_result = match module_name {
-            "command" | "shell" => {
-                debug!("Executing command/shell module");
-                let command_args = resolved_args
-                    .get(Value::String("_raw_params".to_string()))
-                    .cloned()
-                    .unwrap_or_else(|| Value::Mapping(resolved_args.clone()));
-                if module_name == "command" {
-                    crate::modules::command::execute(
-                        connection,
-                        &command_args,
-                        use_become,
-                        &become_user,
-                        check_mode,
-                    )?
-                } else {
-                    crate::modules::shell::execute(
-                        connection,
-                        &command_args,
-                        use_become,
-                        &become_user,
-                        check_mode,
-                    )?
-                }
-            }
-            "copy" => {
-                debug!("Executing copy module");
-                crate::modules::copy::execute(
-                    connection,
-                    &Value::Mapping(resolved_args),
-                    use_become,
-                    &become_user,
-                    check_mode,
-                )?
-            }
-            "file" => {
-                debug!("Executing file module");
-                crate::modules::file::execute(
-                    connection,
-                    &Value::Mapping(resolved_args),
-                    use_become,
-                    &become_user,
-                    check_mode,
-                )?
-            }
-            "get_url" => crate::modules::get_url::execute(
-                connection,
-                &Value::Mapping(resolved_args),
-                use_become,
-                &become_user,
-                check_mode,
-            )?,
-            "template" => crate::modules::template::execute_with_context(
-                connection,
-                &Value::Mapping(resolved_args),
-                use_become,
-                &become_user,
-                check_mode,
-                vars,
-            )?,
-            "package" => {
-                debug!("Executing package module");
-                crate::modules::package::execute(
-                    connection,
-                    &Value::Mapping(resolved_args),
-                    use_become,
-                    &become_user,
-                    check_mode,
-                )?
-            }
-            "service" => {
-                debug!("Executing service module");
-                crate::modules::service::execute(
-                    connection,
-                    &Value::Mapping(resolved_args),
-                    use_become,
-                    &become_user,
-                    check_mode,
-                )?
-            }
-            "setup" => crate::modules::setup::execute(connection, use_become, &become_user)?,
-            "stat" => crate::modules::stat::execute(
-                connection,
-                &Value::Mapping(resolved_args),
-                use_become,
-                &become_user,
-                check_mode,
-            )?,
-            "systemd" | "systemd_service" => crate::modules::service::execute_systemd(
-                connection,
-                &Value::Mapping(resolved_args),
-                use_become,
-                &become_user,
-                check_mode,
-            )?,
-            "lineinfile" => crate::modules::lineinfile::execute(
-                connection,
-                &Value::Mapping(resolved_args),
-                use_become,
-                &become_user,
-                check_mode,
-            )?,
-            "user" => crate::modules::user::execute(
-                connection,
-                &Value::Mapping(resolved_args),
-                use_become,
-                &become_user,
-                check_mode,
-            )?,
-            _ => return Err(anyhow!("Unsupported module: {}", self.module)),
-        };
-
-        Ok(TaskResult::from_module_result(&host.name, module_result))
+        let result = invocation.execute(Some(&config), vars);
+        Ok(TaskResult::from_module_result(&host.name, result))
     }
 
     fn normalized_module_name(&self) -> &str {
-        self.module
-            .strip_prefix("ansible.builtin.")
-            .or_else(|| self.module.strip_prefix("ansible.legacy."))
+        Builtin::lookup(&self.module)
+            .map(Builtin::name)
             .unwrap_or(&self.module)
-    }
-
-    fn is_supported_module(module_name: &str) -> bool {
-        matches!(
-            module_name,
-            "command"
-                | "shell"
-                | "debug"
-                | "copy"
-                | "file"
-                | "get_url"
-                | "template"
-                | "package"
-                | "service"
-                | "setup"
-                | "stat"
-                | "systemd"
-                | "systemd_service"
-                | "lineinfile"
-                | "user"
-        )
     }
 
     fn evaluate_condition(
@@ -923,7 +763,12 @@ fn loop_iteration_value(
     index_var: Option<&str>,
     index: usize,
 ) -> Value {
-    let mut value = Mapping::new();
+    let mut value = crate::modules::result::result_fields(
+        result.changed,
+        result.outcome(),
+        &result.msg,
+        &result.values,
+    );
     value.insert(Value::String(loop_var.to_string()), item.clone());
     value.insert(
         Value::String("ansible_loop_var".to_string()),
@@ -939,29 +784,7 @@ fn loop_iteration_value(
             Value::String(index_var.to_string()),
         );
     }
-    value.insert(
-        Value::String("changed".to_string()),
-        Value::Bool(result.changed),
-    );
-    value.insert(
-        Value::String("failed".to_string()),
-        Value::Bool(result.failed),
-    );
-    value.insert(
-        Value::String("unreachable".to_string()),
-        Value::Bool(result.unreachable),
-    );
-    value.insert(
-        Value::String("skipped".to_string()),
-        Value::Bool(result.skipped),
-    );
-    value.insert(
-        Value::String("msg".to_string()),
-        Value::String(result.msg.clone()),
-    );
-    for (key, item) in &result.values {
-        value.insert(Value::String(key.clone()), item.clone());
-    }
+
     Value::Mapping(value)
 }
 
@@ -971,7 +794,9 @@ pub(crate) fn print_task_result(
     result: &TaskResult,
     execution_time: &str,
 ) {
-    let status = if result.unreachable {
+    let status = if result.uncertain {
+        "uncertain"
+    } else if result.unreachable {
         "unreachable"
     } else if result.failed {
         "failed"
@@ -1028,7 +853,11 @@ pub(crate) fn print_loop_iteration_result(
     iteration: usize,
     total_iterations: usize,
 ) {
-    let status = if result.failed {
+    let status = if result.uncertain {
+        "uncertain"
+    } else if result.unreachable {
+        "unreachable"
+    } else if result.failed {
         "failed"
     } else if result.skipped {
         "skipped"
