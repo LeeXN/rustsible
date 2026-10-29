@@ -68,6 +68,7 @@ struct HostStats {
 
 struct PlayStatus<'a> {
     abort: bool,
+    fatal_observed: bool,
     hosts: &'a [Host],
     definitions: HashMap<String, HashMap<String, Value>>,
     flushing: usize,
@@ -111,6 +112,54 @@ pub(crate) struct RunState {
     stats: HashMap<String, HostStats>,
     stop_play: bool,
     pub(crate) abort_book: bool,
+}
+
+/// Module arguments belong to the logical host. Connection options are rebuilt
+/// for the delegated host from the same variable layers, never copied from an
+/// already resolved connection on the original host.
+pub(crate) struct Delegation<'a> {
+    pub play: &'a Play,
+    pub state: &'a RunState,
+}
+impl Delegation<'_> {
+    pub fn connection(
+        &self,
+        name: &str,
+        task: &Task,
+        origin: &Host,
+    ) -> Result<crate::ssh::config::ConnectionConfig> {
+        let mut host = Host::new(name);
+        let mut scope =
+            self.state
+                .contexts
+                .get(name)
+                .cloned()
+                .unwrap_or_else(|| RuntimeVariables {
+                    defaults: origin.defaults.clone(),
+                    extra: self.state.extra.clone(),
+                    ..Default::default()
+                });
+        host.defaults = scope.defaults.clone();
+        host.variables = self.state.inventory.get(name).cloned().unwrap_or_default();
+        if !self.state.inventory.contains_key(name)
+            && matches!(name, "localhost" | "127.0.0.1" | "::1")
+        {
+            host.set_variable("ansible_connection", "local");
+        }
+        scope.globals = self.state.variable_globals()?;
+        let mut effective = self.play.apply_play_settings(task.raw(), &host);
+        effective.scope.locals.extend(task.scope.locals.clone());
+        let definitions = host.inventory_variables();
+        let variables = self.play.variables_for_host(&scope, &definitions, false)?;
+        let (definitions, mut data) =
+            effective.variable_layers(&host, &scope, &definitions, &variables)?;
+        data.insert(
+            "inventory_hostname".into(),
+            Value::String(origin.name.clone()),
+        );
+        let variables = crate::playbook::templar::resolve_definitions(&definitions, &data)?;
+        effective.connection_config(name, &definitions, &variables)
+    }
 }
 
 impl RunState {
@@ -252,22 +301,54 @@ impl RunState {
     }
 
     fn merge_result(&mut self, host: &str, task: &Task, result: &TaskResult) -> Result<()> {
-        let persistent = self.contexts.entry(host.to_string()).or_default();
         let mut updates = Vec::new();
         if let Some(Value::Sequence(items)) = result.values.get("results") {
             for item in items {
                 if item.get("skipped").and_then(Value::as_bool) != Some(true) {
                     if let Some(facts) = item.get("ansible_facts") {
-                        updates.push(facts);
+                        updates.push((facts, item.get("delegated_to").and_then(Value::as_str)));
                     }
                 }
             }
         } else if !result.skipped {
             if let Some(facts) = result.values.get("ansible_facts") {
-                updates.push(facts);
+                updates.push((
+                    facts,
+                    result.values.get("delegated_to").and_then(Value::as_str),
+                ));
             }
         }
-        for facts in updates {
+        for (facts, delegate) in updates {
+            let target = if task.delegate_facts.unwrap_or(false) {
+                delegate.unwrap_or(host)
+            } else {
+                host
+            };
+            let defaults = self
+                .contexts
+                .get(host)
+                .map(|scope| scope.defaults.clone())
+                .unwrap_or_default();
+            let persistent =
+                self.contexts
+                    .entry(target.to_string())
+                    .or_insert_with(|| RuntimeVariables {
+                        defaults,
+                        extra: self.extra.clone(),
+                        globals: self.globals.clone(),
+                        ..Default::default()
+                    });
+            persistent.magic.insert(
+                "inventory_hostname".into(),
+                Value::String(target.to_string()),
+            );
+            self.inventory.entry(target.to_string()).or_insert_with(|| {
+                if matches!(target, "localhost" | "127.0.0.1" | "::1") {
+                    HashMap::from([("ansible_connection".into(), Value::String("local".into()))])
+                } else {
+                    HashMap::new()
+                }
+            });
             let facts = facts
                 .as_mapping()
                 .context("Module ansible_facts must be a mapping")?;
@@ -300,7 +381,11 @@ impl RunState {
         }
         if let Some(register) = &task.register {
             let value = Play::registered_value(result);
-            persistent.registered.insert(register.clone(), value);
+            self.contexts
+                .entry(host.to_string())
+                .or_default()
+                .registered
+                .insert(register.clone(), value);
         }
         Ok(())
     }
@@ -484,6 +569,7 @@ impl Play {
 
         let mut status = PlayStatus {
             abort: false,
+            fatal_observed: false,
             hosts,
             definitions,
             flushing: 0,
@@ -545,6 +631,8 @@ impl Play {
                 loop_items: None,
                 loop_var_name: None,
                 index_var_name: None,
+                delegate_to: None,
+                delegate_facts: None,
                 throttle: None,
                 run_once: Some(false),
                 any_errors_fatal: None,
@@ -573,6 +661,9 @@ impl Play {
 
         executed?;
         if status.failures.is_empty() {
+            if status.fatal_observed {
+                bail!("A task with any_errors_fatal failed; rescue restored the host but the run retains a failure status, as in Ansible 2.21");
+            }
             Ok(())
         } else {
             Err(anyhow::anyhow!(status
@@ -981,7 +1072,7 @@ impl Play {
                     continue;
                 }
 
-                if !result.skipped {
+                if !result.skipped && !result.inherited_result {
                     if let Some(role) = &effective_task.scope.role_id {
                         state.ran_roles.insert((host.name.clone(), role.clone()));
                     }
@@ -1016,6 +1107,7 @@ impl Play {
                     {
                         host_stats.ignored += usize::from(!result.inherited_result);
                     } else {
+                        status.fatal_observed |= effective_task.any_errors_fatal.unwrap_or(false);
                         if result.uncertain {
                             host_stats.uncertain += usize::from(!result.inherited_result);
                         } else if result.unreachable {
@@ -1313,7 +1405,10 @@ impl Play {
                             definitions,
                             &variables,
                             check_mode,
-                            runtime,
+                            &crate::playbook::task::TaskExecution {
+                                workers: runtime,
+                                delegation: Some(Delegation { play, state }),
+                            },
                         )
                     }
                     _ => Err(anyhow::anyhow!(
@@ -1350,6 +1445,9 @@ impl Play {
                         let mut result = result.clone();
                         result.host = host.name.clone();
                         result.inherited_result = true;
+                        result.notifications.clear();
+                        result.includes.clear();
+                        result.meta = None;
                         Ok(result)
                     }
                     Err(error) => {
@@ -1600,6 +1698,8 @@ mod tests {
             loop_items: None,
             loop_var_name: None,
             index_var_name: None,
+            delegate_to: None,
+            delegate_facts: None,
             throttle: None,
             run_once: None,
             any_errors_fatal: None,
@@ -1634,7 +1734,7 @@ mod tests {
                 &vars,
                 &play.vars,
                 false,
-                &crate::worker::Runtime::default(),
+                &crate::playbook::task::TaskExecution::new(&crate::worker::Runtime::default()),
             )
             .unwrap();
         assert_eq!(result.msg, "play:one");

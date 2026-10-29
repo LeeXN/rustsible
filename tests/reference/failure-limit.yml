@@ -1,4 +1,4 @@
-- hosts: all
+- hosts: rollout
   gather_facts: false
   serial: 2
   max_fail_percentage: @PERCENTAGE@

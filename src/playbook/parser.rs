@@ -884,6 +884,8 @@ const UNSUPPORTED_PLAY_KEYWORDS: &[&str] = &[
 ];
 
 const SUPPORTED_TASK_KEYWORDS: &[&str] = &[
+    "delegate_to",
+    "delegate_facts",
     "throttle",
     "run_once",
     "any_errors_fatal",
@@ -922,8 +924,6 @@ const UNSUPPORTED_TASK_KEYWORDS: &[&str] = &[
     "block",
     "collections",
     "debugger",
-    "delegate_facts",
-    "delegate_to",
     "diff",
     "listen",
     "module_defaults",
@@ -1469,6 +1469,8 @@ fn parse_task_parts(
         loop_items,
         loop_var_name,
         index_var_name,
+        delegate_to: parse_optional_nonempty_string(&task_map, "delegate_to", kind.label())?,
+        delegate_facts: parse_optional_bool(&task_map, "delegate_facts", kind.label())?,
         throttle: parse_optional_usize(&task_map, "throttle", kind.label())?,
         run_once: parse_optional_bool(&task_map, "run_once", kind.label())?,
         any_errors_fatal: parse_optional_bool(&task_map, "any_errors_fatal", kind.label())?,
@@ -2106,7 +2108,7 @@ mod tests {
 
     #[test]
     fn recognized_but_unsupported_task_keywords_are_not_modules() {
-        for keyword in ["delegate_to", "async", "poll"] {
+        for keyword in ["async", "poll"] {
             let content = format!(
                 "---\n- hosts: all\n  tasks:\n    - command: echo\n      {keyword}: true\n"
             );

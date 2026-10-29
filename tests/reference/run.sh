@@ -69,7 +69,7 @@ mkdir "$fixture_dir/reuse-output"
 "$binary" --config "$fixture_dir/reuse/ansible.cfg" playbook -i "$fixture_dir/inventory" "$fixture_dir/reuse/main.yml" > "$fixture_dir/native-reuse.log" 2>&1
 diff -r "$fixture_dir/reference-reuse" "$fixture_dir/reuse-output"
 [[ ! -e $fixture_dir/reuse-output/must-not-run ]]
-printf 'a ansible_connection=local\nb ansible_connection=local\nc ansible_connection=local\nd ansible_connection=local\n' > "$fixture_dir/strategy-inventory"
+printf '[rollout]\na ansible_connection=local\nb ansible_connection=local\nc ansible_connection=local\nd ansible_connection=local\n[delegation]\norigin ansible_connection=ssh ansible_host=unreachable.invalid marker=origin\ntarget ansible_connection=local marker=target\n' > "$fixture_dir/strategy-inventory"
 mkdir "$fixture_dir/strategy-output"
 sed "s|@OUTPUT@|$fixture_dir/strategy-output|g" "$repo_dir/tests/reference/strategy.yml" > "$fixture_dir/strategy.yml"
 uv tool run --from ansible-core==2.21.0 ansible-playbook -i "$fixture_dir/strategy-inventory" "$fixture_dir/strategy.yml" > "$fixture_dir/reference-strategy.log" 2>&1
@@ -90,6 +90,18 @@ for percentage in 49 50; do
     fi
     diff -r "$fixture_dir/reference-limit-$percentage" "$fixture_dir/limit-$percentage"
 done
+mkdir "$fixture_dir/fatal-output"
+sed "s|@OUTPUT@|$fixture_dir/fatal-output|g" "$repo_dir/tests/reference/fatal-rescue.yml" > "$fixture_dir/fatal.yml"
+if uv tool run --from ansible-core==2.21.0 ansible-playbook -i "$fixture_dir/strategy-inventory" "$fixture_dir/fatal.yml" > "$fixture_dir/reference-fatal.log" 2>&1; then
+    echo 'Ansible 2.21 unexpectedly cleared the fatal failure exit status' >&2; exit 1
+fi
+[[ $(cat "$fixture_dir/fatal-output/continued-a") == continued && $(cat "$fixture_dir/fatal-output/later-d") == later-play ]]
+mv "$fixture_dir/fatal-output" "$fixture_dir/reference-fatal"
+mkdir "$fixture_dir/fatal-output"
+if "$binary" playbook -i "$fixture_dir/strategy-inventory" "$fixture_dir/fatal.yml" > "$fixture_dir/native-fatal.log" 2>&1; then
+    echo 'Rustsible unexpectedly cleared the fatal failure exit status' >&2; exit 1
+fi
+diff -r "$fixture_dir/reference-fatal" "$fixture_dir/fatal-output"
 if uv tool run --from ansible-core==2.21.0 ansible-playbook \
     -i "$fixture_dir/inventory" "$fixture_dir/non_boolean.yml" > "$fixture_dir/reference-condition.log" 2>&1; then
     echo 'Reference unexpectedly accepted a string condition' >&2; exit 1
@@ -98,4 +110,4 @@ if "$binary" playbook -i "$fixture_dir/inventory" "$fixture_dir/non_boolean.yml"
     echo 'Rustsible unexpectedly accepted a string condition' >&2; exit 1
 fi
 [[ ! -e $fixture_dir/result/unsafe-condition ]]
-printf 'Ansible 2.21.0 comparison passed: templates/types, native files, retries/conditions, environment, command prediction, fact names/fields/filtering, variable sources, host scope, imports/roles and handler/rescue phases\n'
+printf 'Ansible 2.21.0 comparison passed: templates/types, native files, retries/conditions, environment, command prediction, facts, variables, imports/roles, handlers/rescue, serial/run_once, failure thresholds and delegation\n'

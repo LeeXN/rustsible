@@ -16,6 +16,19 @@ use crate::modules::{
 };
 use crate::ssh::config::ConnectionConfig;
 
+pub(crate) struct TaskExecution<'a> {
+    pub workers: &'a crate::worker::Runtime,
+    pub delegation: Option<crate::playbook::play::Delegation<'a>>,
+}
+impl<'a> TaskExecution<'a> {
+    pub fn new(workers: &'a crate::worker::Runtime) -> Self {
+        Self {
+            workers,
+            delegation: None,
+        }
+    }
+}
+
 const MAX_ARGUMENT_TEMPLATE_DEPTH: usize = 64;
 const MAX_ARGUMENT_TEMPLATE_NODES: usize = 10_000;
 
@@ -180,6 +193,8 @@ pub struct Task {
     /// Distinguishes an explicit task override from the default user.
     pub become_user_override: Option<String>,
     pub connection: Option<String>,
+    pub delegate_to: Option<String>,
+    pub delegate_facts: Option<bool>,
     pub throttle: Option<usize>,
     pub run_once: Option<bool>,
     pub any_errors_fatal: Option<bool>,
@@ -299,6 +314,11 @@ impl Task {
             .clone()
             .or_else(|| parent.connection.clone());
         self.check_mode = self.check_mode.or(parent.check_mode);
+        self.delegate_to = self
+            .delegate_to
+            .clone()
+            .or_else(|| parent.delegate_to.clone());
+        self.delegate_facts = self.delegate_facts.or(parent.delegate_facts);
         self.throttle = self.throttle.or(parent.throttle);
         self.run_once = self.run_once.or(parent.run_once);
         self.any_errors_fatal = self.any_errors_fatal.or(parent.any_errors_fatal);
@@ -345,29 +365,17 @@ impl Task {
             &definitions,
             &Mapping::new(),
             check_mode,
-            &crate::worker::Runtime::default(),
+            &TaskExecution::new(&crate::worker::Runtime::default()),
         )
     }
 
-    pub(crate) fn execute_with_definitions(
+    pub(crate) fn variable_layers(
         &self,
         host: &Host,
         runtime: &RuntimeVariables,
         definitions: &HashMap<String, Value>,
         play_vars: &Mapping,
-        check_mode: bool,
-        workers: &crate::worker::Runtime,
-    ) -> Result<TaskResult> {
-        if self.original.is_none() && self.parent.is_some() {
-            return self.effective().execute_with_definitions(
-                host,
-                runtime,
-                definitions,
-                play_vars,
-                check_mode,
-                workers,
-            );
-        }
+    ) -> Result<(HashMap<String, Value>, HashMap<String, Value>)> {
         let mut keywords = HashMap::new();
         if let Some(value) = self.become_override.or(self.is_become.then_some(true)) {
             keywords.insert("ansible_become".into(), Value::Bool(value));
@@ -395,7 +403,7 @@ impl Task {
         crate::inventory::host::merge_variable_layer(&mut scoped_definitions, definitions);
         let mut params = self.scope.role_params.clone();
         crate::vars::merge(&mut params, self.scope.params.clone());
-        let (mut definitions, mut data) = runtime.layers(
+        let (definitions, mut data) = runtime.layers(
             &scoped_definitions,
             &[play_vars, &self.scope.role_vars, &self.vars],
             Some(&keywords),
@@ -416,6 +424,30 @@ impl Task {
             "inventory_hostname".into(),
             Value::String(host.name.clone()),
         );
+        Ok((definitions, data))
+    }
+
+    pub(crate) fn execute_with_definitions(
+        &self,
+        host: &Host,
+        runtime: &RuntimeVariables,
+        definitions: &HashMap<String, Value>,
+        play_vars: &Mapping,
+        check_mode: bool,
+        execution: &TaskExecution<'_>,
+    ) -> Result<TaskResult> {
+        if self.original.is_none() && self.parent.is_some() {
+            return self.effective().execute_with_definitions(
+                host,
+                runtime,
+                definitions,
+                play_vars,
+                check_mode,
+                execution,
+            );
+        }
+        let (mut definitions, mut data) =
+            self.variable_layers(host, runtime, definitions, play_vars)?;
         let vars = crate::playbook::templar::resolve_definitions(&definitions, &data)?;
         let start_time = Instant::now();
         info!("TASK [{}] on host {}", self.name, host.name);
@@ -519,7 +551,7 @@ impl Task {
                     &mut engine,
                     &iter_vars,
                     check_mode,
-                    workers,
+                    execution,
                     &definitions,
                 ) {
                     Ok(result) => result,
@@ -536,7 +568,7 @@ impl Task {
                     include.iteration = idx;
                 }
 
-                if !result.skipped {
+                if !result.skipped && self.facts_belong_to_host(&result) {
                     if let Some(Value::Mapping(facts)) = result.values.get("ansible_facts") {
                         let variables = facts
                             .iter()
@@ -617,8 +649,14 @@ impl Task {
                 }
             }
 
-            let mut result =
-                self.execute_attempts(host, &mut engine, &vars, check_mode, workers, &definitions)?;
+            let mut result = self.execute_attempts(
+                host,
+                &mut engine,
+                &vars,
+                check_mode,
+                execution,
+                &definitions,
+            )?;
             result.no_log = self.no_log.unwrap_or(false);
             self.resolve_notifications(&mut result, &vars, &mut engine);
             results.push(result);
@@ -717,7 +755,7 @@ impl Task {
         engine: &mut Environment<'_>,
         vars: &HashMap<String, Value>,
         check: bool,
-        workers: &crate::worker::Runtime,
+        execution: &TaskExecution<'_>,
         definitions: &HashMap<String, Value>,
     ) -> Result<TaskResult> {
         let context = crate::playbook::templar::create_context(vars)?;
@@ -745,7 +783,7 @@ impl Task {
         let mut attempt_vars = vars.clone();
         for attempt in 1..=total {
             let mut result =
-                self.execute_module(host, engine, definitions, &attempt_vars, check, workers)?;
+                self.execute_module(host, engine, definitions, &attempt_vars, check, execution)?;
             if total > 1 {
                 result
                     .values
@@ -864,7 +902,7 @@ impl Task {
         definitions: &HashMap<String, Value>,
         vars: &HashMap<String, Value>,
         check_mode: bool,
-        workers: &crate::worker::Runtime,
+        execution: &TaskExecution<'_>,
     ) -> Result<TaskResult> {
         debug!(
             "Executing module '{}' for task '{}'",
@@ -872,16 +910,6 @@ impl Task {
         );
 
         let context = crate::playbook::templar::create_context(vars)?;
-        let Value::String(become_user) =
-            crate::playbook::templar::render_value(&self.become_user, engine, &context, true)?
-        else {
-            return Err(anyhow!("become_user must render to a string"));
-        };
-        if become_user.trim().is_empty() || become_user.chars().any(char::is_control) {
-            return Err(anyhow!(
-                "become_user must render to a non-empty string without control characters"
-            ));
-        }
         let mut resolved_args = self.resolve_args(engine, &context, vars)?;
         if matches!(Builtin::lookup(&self.module), Ok(Builtin::Meta)) {
             Builtin::Meta.validate_parameters(&Value::Mapping(resolved_args.clone()))?;
@@ -998,16 +1026,52 @@ impl Task {
         let invocation =
             Invocation::prepare(module_name, &Value::Mapping(resolved_args), check_mode)?
                 .with_execution(environment, (timeout > 0).then_some(timeout as u64 * 1000));
-        if !invocation.needs_connection() {
-            return Ok(TaskResult::from_module_result(
-                &host.name,
-                invocation.execute(None, vars, workers),
-            ));
+        let delegate = self.delegate_to.as_ref().map(|source| -> Result<String> {
+            let value = crate::playbook::templar::render_value(source, engine, &context, true)?;
+            let name = value.as_str().filter(|name| !name.trim().is_empty() && !name.chars().any(|ch| ch.is_control() || ch.is_whitespace()))
+                .context("delegate_to must resolve to a nonempty host name without control characters")?;
+            Ok(name.to_owned())
+        }).transpose()?;
+        let module_result = if !invocation.needs_connection() {
+            if delegate.is_none() {
+                self.render_become_user(engine, &context)?;
+            }
+            invocation.execute(None, vars, execution.workers)
+        } else {
+            let config = if let Some(target) = &delegate {
+                execution
+                    .delegation
+                    .as_ref()
+                    .context("Delegation requires playbook execution")?
+                    .connection(target, self, host)?
+            } else {
+                self.connection_config(&host.name, definitions, vars)?
+            };
+            invocation.execute(Some(&config), vars, execution.workers)
+        };
+        let mut result = TaskResult::from_module_result(&host.name, module_result);
+        if let Some(target) = delegate {
+            result
+                .values
+                .insert("delegated_to".into(), Value::String(target));
         }
+        Ok(result)
+    }
+
+    pub(crate) fn connection_config(
+        &self,
+        name: &str,
+        definitions: &HashMap<String, Value>,
+        vars: &HashMap<String, Value>,
+    ) -> Result<ConnectionConfig> {
         ConnectionConfig::require_resolved(definitions, vars)?;
+        let mut engine = crate::playbook::templar::environment();
+        let context = crate::playbook::templar::create_context(vars)?;
+        let become_user = self.render_become_user(&mut engine, &context)?;
         let mut connection_vars = vars.clone();
         if let Some(connection) = &self.connection {
-            let value = crate::playbook::templar::render_value(connection, engine, &context, true)?;
+            let value =
+                crate::playbook::templar::render_value(connection, &mut engine, &context, true)?;
             connection_vars
                 .entry("ansible_connection".into())
                 .or_insert(value);
@@ -1018,9 +1082,25 @@ impl Task {
         connection_vars
             .entry("ansible_become_user".into())
             .or_insert(Value::String(become_user));
-        let config = ConnectionConfig::from_context(&host.name, connection_vars)?;
-        let result = invocation.execute(Some(&config), vars, workers);
-        Ok(TaskResult::from_module_result(&host.name, result))
+        ConnectionConfig::from_context(name, connection_vars)
+    }
+
+    fn render_become_user(
+        &self,
+        engine: &mut Environment<'_>,
+        context: &TemplateContext,
+    ) -> Result<String> {
+        let Value::String(become_user) =
+            crate::playbook::templar::render_value(&self.become_user, engine, context, true)?
+        else {
+            return Err(anyhow!("become_user must render to a string"));
+        };
+        if become_user.trim().is_empty() || become_user.chars().any(char::is_control) {
+            return Err(anyhow!(
+                "become_user must render to a non-empty string without control characters"
+            ));
+        }
+        Ok(become_user)
     }
 
     fn normalized_module_name(&self) -> &str {
@@ -1033,6 +1113,9 @@ impl Task {
         result: &TaskResult,
         variables: &mut HashMap<String, Value>,
     ) -> Result<()> {
+        if !self.facts_belong_to_host(result) {
+            return Ok(());
+        }
         let Some(Value::Mapping(facts)) = result.values.get("ansible_facts") else {
             return Ok(());
         };
@@ -1073,6 +1156,14 @@ impl Task {
             _ => {}
         }
         Ok(())
+    }
+    fn facts_belong_to_host(&self, result: &TaskResult) -> bool {
+        !self.delegate_facts.unwrap_or(false)
+            || result
+                .values
+                .get("delegated_to")
+                .and_then(Value::as_str)
+                .is_none_or(|target| target == result.host)
     }
     fn resolve_notifications(
         &self,
@@ -1613,6 +1704,8 @@ mod tests {
             loop_items: None,
             loop_var_name: None,
             index_var_name: None,
+            delegate_to: None,
+            delegate_facts: None,
             throttle: None,
             run_once: None,
             any_errors_fatal: None,
