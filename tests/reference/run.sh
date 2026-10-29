@@ -130,6 +130,13 @@ mv "$fixture_dir/async-output" "$fixture_dir/reference-async"
 mkdir "$fixture_dir/async-output"
 "$binary" playbook -i "$fixture_dir/inventory" "$fixture_dir/async.yml" > "$fixture_dir/native-async.log" 2>&1
 diff -r "$fixture_dir/reference-async" "$fixture_dir/async-output"
+mkdir "$fixture_dir/assert-output"
+sed "s|@OUTPUT@|$fixture_dir/assert-output|g" "$repo_dir/tests/reference/assertions.yml" > "$fixture_dir/assertions.yml"
+uv tool run --from ansible-core==2.21.0 ansible-playbook -i "$fixture_dir/inventory" "$fixture_dir/assertions.yml" > "$fixture_dir/reference-assertions.log" 2>&1
+mv "$fixture_dir/assert-output" "$fixture_dir/reference-assertions"
+mkdir "$fixture_dir/assert-output"
+"$binary" playbook -i "$fixture_dir/inventory" "$fixture_dir/assertions.yml" > "$fixture_dir/native-assertions.log" 2>&1
+diff -r "$fixture_dir/reference-assertions" "$fixture_dir/assert-output"
 if uv tool run --from ansible-core==2.21.0 ansible-playbook \
     -i "$fixture_dir/inventory" "$fixture_dir/non_boolean.yml" > "$fixture_dir/reference-condition.log" 2>&1; then
     echo 'Reference unexpectedly accepted a string condition' >&2; exit 1

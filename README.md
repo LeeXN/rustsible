@@ -300,6 +300,25 @@ See [the rolling example](examples/rolling/playbook.yml). The SSH strategy
 fixture uses three distinct servers and checks physical identities, batch
 barriers, cross-host facts, parallel delegation, idempotency, check and cleanup.
 
+## Assertions and groups
+
+`assert` and `fail` run on the controller and do not require a target connection.
+Assert accepts `that` as a raw boolean expression, boolean, or a list of those;
+the same strict boolean evaluator handles when/until/result conditions. Its
+string messages are `fail_msg` (`msg` alias) and `success_msg`; `quiet` suppresses
+the successful message while register retains it. String/list message mixtures
+and templated expression containers are outside this subset. Runtime output is
+data and is never evaluated again as an assertion. Fail accepts a string `msg`.
+Both honor no_log and work in check and block rescue paths. See
+[the assertion example](examples/assertions.yml).
+
+Native `group` accepts name, optional integer gid, present/absent state and the
+creation-only system boolean. Account queries and groupadd/groupmod/groupdel
+use the existing account/tool path; standard administrative directories are
+also searched when an ordinary SSH PATH omits them. GID conflicts and parameter
+types fail before mutation. Check queries and predicts; it does not modify the
+group database. Missing tools and primary-group deletion failures are explicit.
+
 ## Native background tasks
 
 Tasks accept `async: SECONDS` and `poll: SECONDS`; ad-hoc accepts `-B/--background`
@@ -555,6 +574,9 @@ The following built-in modules are registered for playbooks:
 | `set_fact` | Retain typed host values during a playbook run |
 | `include_vars` | Load controller variable files or directories |
 | `async_status` | Query or clean a native background job for the execution identity |
+| `assert` | Evaluate raw boolean conditions on the controller, with success/failure messages and quiet display |
+| `fail` | Fail deliberately with a message on the controller |
+| `group` | Manage Linux group names/GIDs/present/absent/system through account tools |
 | `meta` | Flush handlers, clear host errors, reset connections, or end host/play execution |
 | `copy` | Copy a controller file or literal content |
 | `file` | Manage files, directories, links, and permissions |

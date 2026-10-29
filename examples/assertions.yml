@@ -1,0 +1,21 @@
+- hosts: localhost
+  gather_facts: false
+  vars:
+    release_name: demo
+    enabled: true
+  tasks:
+    - assert:
+        that:
+          - release_name is defined
+          - release_name | length > 0
+          - enabled
+        fail_msg: Release inputs are invalid
+        success_msg: Release inputs accepted
+    - block:
+        - fail:
+            msg: Demonstrate a deliberate failure
+      rescue:
+        - assert:
+            that: ansible_failed_result.failed
+        - debug:
+            msg: '{{ ansible_failed_result.msg }}'

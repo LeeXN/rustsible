@@ -92,7 +92,12 @@ impl Invocation {
     pub fn needs_connection(&self) -> bool {
         !matches!(
             self.module,
-            Builtin::Debug | Builtin::SetFact | Builtin::IncludeVars | Builtin::Meta
+            Builtin::Debug
+                | Builtin::Assert
+                | Builtin::Fail
+                | Builtin::SetFact
+                | Builtin::IncludeVars
+                | Builtin::Meta
         ) && !self.skip_check()
     }
     pub(crate) fn execute(
@@ -123,6 +128,9 @@ impl Invocation {
         let result = (|| {
             if self.module == Builtin::Debug {
                 return super::debug::execute_without_connection(&self.args);
+            }
+            if matches!(self.module, Builtin::Assert | Builtin::Fail) {
+                return super::assertion::execute(self.module, &self.args, vars);
             }
             if self.module == Builtin::IncludeVars {
                 return crate::vars::include(&self.args);

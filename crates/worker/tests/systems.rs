@@ -52,6 +52,87 @@ fn script(path: &Path, text: &str) {
     fs::write(path, text).unwrap();
     fs::set_permissions(path, fs::Permissions::from_mode(0o755)).unwrap();
 }
+
+#[test]
+fn group_lifecycle_validates_before_mutation_predicts_and_preserves_idempotency() {
+    let directory = tempfile::tempdir().unwrap();
+    let state = directory.path().join("group-state");
+    let log = directory.path().join("group-log");
+    script(
+        &directory.path().join("getent"),
+        r#"#!/bin/sh
+[ "$1" = group ] || exit 2
+[ -f "$STATE" ] || exit 2
+IFS=: read -r name password gid members < "$STATE"
+[ "$2" = "$name" ] || [ "$2" = "$gid" ] || exit 2
+/bin/cat "$STATE"
+"#,
+    );
+    for operation in ["groupadd", "groupmod", "groupdel"] {
+        script(
+            &directory.path().join(operation),
+            r#"#!/bin/sh
+printf '%s\000' "$@" >> "$LOG"
+operation=${0##*/}
+gid=31001
+while [ "$#" -gt 0 ]; do
+    case "$1" in
+    --gid) gid=$2; shift 2;;
+    --system) shift;;
+    --) shift; name=$1; break;;
+    *) exit 9;;
+    esac
+done
+if [ "$operation" = groupdel ]; then /bin/rm "$STATE"; else printf '%s:x:%s:\n' "$name" "$gid" > "$STATE"; fi
+"#,
+        );
+    }
+    let mut worker = Worker::new(&[
+        ("PATH", directory.path().to_string_lossy().into_owned()),
+        ("STATE", state.to_string_lossy().into_owned()),
+        ("LOG", log.to_string_lossy().into_owned()),
+    ]);
+    let invalid = worker.run("group", json!({"name":"fixture","gid":-1}), false);
+    assert!(invalid.failed && !state.exists() && !log.exists());
+    let requested = json!({"name":"fixture","gid":31001,"system":true});
+    let predicted = worker.run("group", requested.clone(), true);
+    assert!(
+        predicted.changed && !predicted.failed && !state.exists() && !log.exists(),
+        "{}",
+        predicted.msg
+    );
+    let created = worker.run("group", requested.clone(), false);
+    assert!(created.changed && !created.failed, "{}", created.msg);
+    assert_eq!(fs::read_to_string(&state).unwrap(), "fixture:x:31001:\n");
+    let original_log = fs::read(&log).unwrap();
+    assert_eq!(original_log, b"--system\0--gid\x0031001\0--\0fixture\0");
+    let repeat = worker.run("group", requested, false);
+    assert!(!repeat.changed && !repeat.failed);
+    assert_eq!(fs::read(&log).unwrap(), original_log);
+    let collision = worker.run("group", json!({"name":"other","gid":31001}), false);
+    assert!(collision.failed);
+    assert_eq!(fs::read(&log).unwrap(), original_log);
+    let predicted = worker.run("group", json!({"name":"fixture","gid":31002}), true);
+    assert!(predicted.changed && !predicted.failed);
+    assert_eq!(fs::read_to_string(&state).unwrap(), "fixture:x:31001:\n");
+    let modified = worker.run("group", json!({"name":"fixture","gid":31002}), false);
+    assert!(modified.changed && !modified.failed, "{}", modified.msg);
+    assert_eq!(fs::read_to_string(&state).unwrap(), "fixture:x:31002:\n");
+    assert!(
+        worker
+            .run("group", json!({"name":"fixture","state":"absent"}), true)
+            .changed
+    );
+    assert!(state.exists());
+    let removed = worker.run("group", json!({"name":"fixture","state":"absent"}), false);
+    assert!(removed.changed && !removed.failed);
+    assert!(!state.exists());
+    assert!(
+        !worker
+            .run("group", json!({"name":"fixture","state":"absent"}), false)
+            .changed
+    );
+}
 #[test]
 fn native_sysv_daemon_survives_next_synchronous_task_and_is_stopped_by_service() {
     let temp = tempfile::tempdir().unwrap();

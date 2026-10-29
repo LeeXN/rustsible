@@ -51,6 +51,10 @@ rustsible playbook examples/async/playbook.yml -i examples/async/inventory --che
 rustsible playbook examples/async/playbook.yml -i examples/async/inventory
 ```
 
+`assertions.yml` 展示原始布尔表达式、断言消息和 fail/rescue。使用本地
+inventory 即可验证，不创建业务文件。`group` 会修改目标组数据库，完整的
+创建、GID 更新、幂等、删除和 check 场景在隔离 SSH fixture 中运行。
+
 ## 运行
 
 ```bash
