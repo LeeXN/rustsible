@@ -836,6 +836,7 @@ fn short_name(name: &str) -> &str {
 }
 
 const SUPPORTED_PLAY_KEYWORDS: &[&str] = &[
+    "strategy",
     "serial",
     "throttle",
     "run_once",
@@ -877,7 +878,6 @@ const UNSUPPORTED_PLAY_KEYWORDS: &[&str] = &[
     "order",
     "port",
     "remote_user",
-    "strategy",
     "tags",
     "timeout",
     "vars_prompt",
@@ -1077,7 +1077,20 @@ impl Loader<'_> {
             handlers.len()
         );
 
-        Ok(Play {
+        let strategy = match parse_optional_nonempty_string(&play_map, "strategy", "Play")?
+            .as_deref()
+            .unwrap_or("linear")
+        {
+            "linear" | "ansible.builtin.linear" | "ansible.legacy.linear" => {
+                crate::playbook::Strategy::Linear
+            }
+            "free" | "ansible.builtin.free" | "ansible.legacy.free" => {
+                crate::playbook::Strategy::Free
+            }
+            strategy => bail!("Unsupported strategy: {strategy}"),
+        };
+        let play = Play {
+            strategy,
             name,
             hosts,
             tasks,
@@ -1119,7 +1132,9 @@ impl Loader<'_> {
             gather_subset,
             gather_timeout,
             tags: Vec::new(),
-        })
+        };
+        play.validate_strategy()?;
+        Ok(play)
     }
 }
 
@@ -1310,6 +1325,7 @@ impl Loader<'_> {
             };
             handler.task.source_file = Some(source.to_path_buf());
             handler.task.scope = self.options.scope.clone();
+            handler.task.scope.source_index = index;
             handler.task.scope.ancestors = self.stack.clone();
             parsed.push(handler);
         }

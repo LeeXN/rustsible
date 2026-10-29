@@ -1,0 +1,7 @@
+[web]
+node1
+node2
+node3
+
+[all:vars]
+ansible_connection=local

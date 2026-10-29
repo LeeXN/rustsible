@@ -1,0 +1,44 @@
+- hosts: rollout
+  gather_facts: false
+  strategy: free
+  tasks:
+    - shell: 'if [ "{{ inventory_hostname }}" = a ]; then n=0; while [ ! -f @OUTPUT@/signal ]; do n=$((n+1)); [ "$n" -le 1000 ] || exit 41; sleep 0.01; done; fi'
+      delegate_to: a
+      timeout: 15
+    - set_fact:
+        published: from-b
+      when: inventory_hostname == 'b'
+    - copy:
+        content: ready
+        dest: '@OUTPUT@/signal'
+      delegate_to: a
+      when: inventory_hostname == 'b'
+    - copy:
+        content: '{{ hostvars.b.published }}'
+        dest: '@OUTPUT@/observed-{{ inventory_hostname }}'
+      when: inventory_hostname in ['a', 'b']
+- hosts: rollout
+  gather_facts: false
+  strategy: free
+  tasks:
+    - include_role:
+        name: demo
+        public: true
+      when: inventory_hostname == 'b'
+    - shell: 'if [ "{{ inventory_hostname }}" = a ]; then n=0; while [ ! -f @OUTPUT@/role-ready ]; do n=$((n+1)); [ "$n" -le 1000 ] || exit 41; sleep 0.01; done; fi'
+      timeout: 15
+    - copy:
+        content: ready
+        dest: '@OUTPUT@/role-ready'
+      when: inventory_hostname == 'b'
+    - copy:
+        content: '{{ published_role }}'
+        dest: '@OUTPUT@/role-{{ inventory_hostname }}'
+      when: inventory_hostname in ['a', 'b']
+- hosts: rollout
+  gather_facts: false
+  tasks:
+    - copy:
+        content: '{{ published_role | default("private") }}'
+        dest: '@OUTPUT@/later-{{ inventory_hostname }}'
+

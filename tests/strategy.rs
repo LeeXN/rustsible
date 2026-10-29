@@ -9,6 +9,9 @@ use tempfile::TempDir;
 mod support;
 
 fn run(directory: &Path, playbook: &str, hosts: &str) -> Result<Output> {
+    run_with_flags(directory, playbook, hosts, &[])
+}
+fn run_with_flags(directory: &Path, playbook: &str, hosts: &str, flags: &[&str]) -> Result<Output> {
     fs::write(directory.join("site.yml"), playbook)?;
     fs::write(directory.join("inventory"), hosts)?;
     Ok(Command::new(env!("CARGO_BIN_EXE_rustsible"))
@@ -19,6 +22,7 @@ fn run(directory: &Path, playbook: &str, hosts: &str) -> Result<Output> {
         .arg("-i")
         .arg(directory.join("inventory"))
         .args(["--forks", "4"])
+        .args(flags)
         .output()?)
 }
 fn diagnostics(output: &Output) -> String {
@@ -31,6 +35,192 @@ fn diagnostics(output: &Output) -> String {
 const THREE: &str =
     "a ansible_connection=local\nb ansible_connection=local\nc ansible_connection=local\n";
 const FOUR: &str = "a ansible_connection=local\nb ansible_connection=local\nc ansible_connection=local\nd ansible_connection=local\n";
+
+#[test]
+fn free_hosts_advance_without_a_task_barrier_and_observe_published_host_facts() -> Result<()> {
+    let directory = TempDir::new()?;
+    let root = directory.path().display();
+    let output = run(
+        directory.path(),
+        &format!(
+            r#"
+- hosts: all
+  gather_facts: false
+  strategy: free
+  tasks:
+    - shell: 'if [ "{{{{ inventory_hostname }}}}" = a ]; then n=0; while [ ! -f {root}/signal ]; do n=$((n+1)); [ "$n" -le 1000 ] || exit 41; sleep 0.01; done; fi'
+      timeout: 15
+      delegate_to: a
+    - set_fact:
+        published: from-b
+      when: inventory_hostname == 'b'
+    - copy:
+        content: ready
+        dest: {root}/signal
+      when: inventory_hostname == 'b'
+      delegate_to: a
+      notify: completed
+    - copy:
+        content: '{{{{ hostvars.b.published }}}}'
+        dest: {root}/observed-{{{{ inventory_hostname }}}}
+  handlers:
+    - name: completed
+      copy:
+        content: handled
+        dest: {root}/handled-{{{{ inventory_hostname }}}}
+"#
+        ),
+        "a ansible_connection=local\nb ansible_connection=local\n",
+    )?;
+    assert!(output.status.success(), "{}", diagnostics(&output));
+    for host in ["a", "b"] {
+        assert_eq!(
+            fs::read_to_string(directory.path().join(format!("observed-{host}")))?,
+            "from-b"
+        );
+    }
+    assert!(directory.path().join("handled-b").exists());
+    assert!(!directory.path().join("handled-a").exists());
+    Ok(())
+}
+
+#[test]
+fn free_throttle_is_shared_across_independent_host_controllers() -> Result<()> {
+    let directory = TempDir::new()?;
+    let root = directory.path().display();
+    let output = run(
+        directory.path(),
+        &format!(
+            r#"
+- hosts: all
+  gather_facts: false
+  strategy: free
+  tasks:
+    - shell: 'mkdir {root}/lock && sleep 0.03 && printf "%s\n" "{{{{ inventory_hostname }}}}" >> {root}/order && rmdir {root}/lock'
+      throttle: 1
+"#
+        ),
+        FOUR,
+    )?;
+    assert!(output.status.success(), "{}", diagnostics(&output));
+    let contents = fs::read_to_string(directory.path().join("order"))?;
+    let mut hosts = contents.lines().collect::<Vec<_>>();
+    hosts.sort();
+    assert_eq!(hosts, vec!["a", "b", "c", "d"]);
+    assert!(!directory.path().join("lock").exists());
+    Ok(())
+}
+
+#[test]
+fn free_check_cannot_be_disabled_by_a_task_and_unsupported_controls_fail_before_mutation(
+) -> Result<()> {
+    let directory = TempDir::new()?;
+    let root = directory.path().display();
+    let output = run_with_flags(
+        directory.path(),
+        &format!(
+            r#"
+- hosts: all
+  gather_facts: false
+  strategy: free
+  tasks:
+    - copy:
+        content: must-not-write
+        dest: {root}/check-{{{{ inventory_hostname }}}}
+      check_mode: false
+"#
+        ),
+        THREE,
+        &["--check"],
+    )?;
+    assert!(output.status.success(), "{}", diagnostics(&output));
+    for host in ["a", "b", "c"] {
+        assert!(!directory.path().join(format!("check-{host}")).exists());
+    }
+    for control in [
+        "run_once: true",
+        "any_errors_fatal: true",
+        "max_fail_percentage: 50",
+    ] {
+        let output = run(
+            directory.path(),
+            &format!(
+                r#"
+- hosts: all
+  gather_facts: false
+  strategy: free
+  {control}
+  tasks:
+    - command: touch {root}/mutated
+"#
+            ),
+            THREE,
+        )?;
+        assert!(!output.status.success());
+        assert!(!directory.path().join("mutated").exists());
+        assert!(
+            diagnostics(&output).contains("free strategy cannot"),
+            "{}",
+            diagnostics(&output)
+        );
+    }
+    Ok(())
+}
+
+#[test]
+fn free_dynamic_public_roles_publish_to_other_hosts_without_leaking_into_later_plays() -> Result<()>
+{
+    let directory = TempDir::new()?;
+    let root = directory.path().display();
+    fs::create_dir_all(directory.path().join("roles/demo/vars"))?;
+    fs::write(
+        directory.path().join("roles/demo/vars/main.yml"),
+        "published_role: from-role\n",
+    )?;
+    let output = run(
+        directory.path(),
+        &format!(
+            r#"
+- hosts: all
+  gather_facts: false
+  strategy: free
+  tasks:
+    - include_role:
+        name: demo
+        public: true
+      when: inventory_hostname == 'b'
+    - shell: 'if [ "{{{{ inventory_hostname }}}}" = a ]; then n=0; while [ ! -f {root}/role-ready ]; do n=$((n+1)); [ "$n" -le 1000 ] || exit 41; sleep 0.01; done; fi'
+      timeout: 15
+    - copy:
+        content: ready
+        dest: {root}/role-ready
+      when: inventory_hostname == 'b'
+    - copy:
+        content: '{{{{ published_role }}}}'
+        dest: {root}/role-{{{{ inventory_hostname }}}}
+- hosts: all
+  gather_facts: false
+  tasks:
+    - copy:
+        content: '{{{{ published_role | default("private") }}}}'
+        dest: {root}/later-{{{{ inventory_hostname }}}}
+"#
+        ),
+        "a ansible_connection=local\nb ansible_connection=local\n",
+    )?;
+    assert!(output.status.success(), "{}", diagnostics(&output));
+    for host in ["a", "b"] {
+        assert_eq!(
+            fs::read_to_string(directory.path().join(format!("role-{host}")))?,
+            "from-role"
+        );
+        assert_eq!(
+            fs::read_to_string(directory.path().join(format!("later-{host}")))?,
+            "private"
+        );
+    }
+    Ok(())
+}
 
 #[test]
 fn delegation_uses_target_connections_keeps_logical_arguments_and_assigns_facts_explicitly(
@@ -159,6 +349,171 @@ fn previously_failed_hosts_cannot_block_a_later_healthy_serial_batch() -> Result
     assert!(!directory.path().join("later-a").exists());
     assert!(directory.path().join("later-b").exists());
     assert!(directory.path().join("later-c").exists());
+    Ok(())
+}
+
+#[test]
+fn previous_failures_keep_original_percentage_partitions_and_failure_denominators() -> Result<()> {
+    let directory = TempDir::new()?;
+    let root = directory.path().display();
+    let output = run(
+        directory.path(),
+        &format!(
+            r#"
+- hosts: all
+  gather_facts: false
+  tasks:
+    - command: /bin/false
+      when: inventory_hostname == 'a'
+- hosts: all
+  gather_facts: false
+  serial: '50%'
+  tasks:
+    - copy:
+        content: '{{{{ ansible_play_batch | join(",") }}}}'
+        dest: {root}/batch-{{{{ inventory_hostname }}}}
+- hosts: all
+  gather_facts: false
+  serial: '50%'
+  max_fail_percentage: 50
+  tasks:
+    - command: /bin/false
+      when: inventory_hostname == 'b'
+    - command: touch {root}/survived-{{{{ inventory_hostname }}}}
+"#
+        ),
+        FOUR,
+    )?;
+    assert!(!output.status.success());
+    for (host, batch) in [("b", "b"), ("c", "c,d"), ("d", "c,d")] {
+        assert_eq!(
+            fs::read_to_string(directory.path().join(format!("batch-{host}")))?,
+            batch,
+            "{}",
+            diagnostics(&output)
+        );
+    }
+    assert!(!directory.path().join("survived-b").exists());
+    for host in ["c", "d"] {
+        assert!(directory.path().join(format!("survived-{host}")).exists());
+    }
+    Ok(())
+}
+
+#[test]
+fn serial_reads_static_vars_files_and_literal_counts_do_not_force_early_fact_paths() -> Result<()> {
+    let directory = TempDir::new()?;
+    let root = directory.path().display();
+    fs::write(directory.path().join("deployment.yml"), "batch_size: 2\n")?;
+    fs::write(
+        directory
+            .path()
+            .join(format!("{}.yml", std::env::consts::ARCH)),
+        "batch_size: 2\n",
+    )?;
+    for (name, serial, file, gather) in [
+        ("template", "'{{ batch_size }}'", "deployment.yml", false),
+        ("literal", "2", "{{ ansible_architecture }}.yml", true),
+    ] {
+        let output = run(
+            directory.path(),
+            &format!(
+                r#"
+- hosts: all
+  gather_facts: {gather}
+  gather_subset: [architecture]
+  serial: {serial}
+  vars_files: ['{file}']
+  tasks:
+    - copy:
+        content: '{{{{ ansible_play_batch | join(",") }}}}'
+        dest: {root}/{name}-{{{{ inventory_hostname }}}}
+"#
+            ),
+            THREE,
+        )?;
+        assert!(output.status.success(), "{}", diagnostics(&output));
+        for (host, batch) in [("a", "a,b"), ("b", "a,b"), ("c", "c")] {
+            assert_eq!(
+                fs::read_to_string(directory.path().join(format!("{name}-{host}")))?,
+                batch
+            );
+        }
+    }
+    Ok(())
+}
+
+#[test]
+fn serial_planning_errors_respect_play_no_log_even_with_verbose_logging() -> Result<()> {
+    let directory = TempDir::new()?;
+    fs::write(
+        directory.path().join("SERIAL_PRIVATE_SENTINEL.yml"),
+        "[not, a, mapping]\n",
+    )?;
+    let output = run_with_flags(
+        directory.path(),
+        r#"
+- hosts: all
+  gather_facts: false
+  no_log: true
+  serial: '{{ batch_size }}'
+  vars_files: ['{{ private_file }}']
+  vars:
+    private_file: SERIAL_PRIVATE_SENTINEL.yml
+  tasks:
+    - debug: {msg: unreachable}
+"#,
+        THREE,
+        &["-vvvv"],
+    )?;
+    assert!(!output.status.success());
+    let text = diagnostics(&output);
+    assert!(text.contains("output censored"), "{text}");
+    assert!(!text.contains("SERIAL_PRIVATE_SENTINEL"), "{text}");
+    Ok(())
+}
+
+#[test]
+fn free_dynamic_imports_validate_controls_only_when_selected_before_running_children() -> Result<()>
+{
+    let directory = TempDir::new()?;
+    let root = directory.path().display();
+    fs::write(
+        directory.path().join("selected.yml"),
+        format!("- command: touch {root}/must-not-run\n  run_once: true\n"),
+    )?;
+    for selected in [false, true] {
+        let output = run(
+            directory.path(),
+            &format!(
+                r#"
+- hosts: all
+  gather_facts: false
+  strategy: free
+  tasks:
+    - include_tasks: selected.yml
+      when: {selected}
+    - copy:
+        content: continued
+        dest: {root}/{selected}-{{{{ inventory_hostname }}}}
+"#
+            ),
+            THREE,
+        )?;
+        assert_eq!(
+            output.status.success(),
+            !selected,
+            "{}",
+            diagnostics(&output)
+        );
+        assert!(!directory.path().join("must-not-run").exists());
+        for host in ["a", "b", "c"] {
+            assert_eq!(
+                directory.path().join(format!("{selected}-{host}")).exists(),
+                !selected
+            );
+        }
+    }
     Ok(())
 }
 
@@ -320,7 +675,7 @@ fn fatal_errors_allow_rescue_and_always_but_stop_following_tasks_and_plays() -> 
                     .path()
                     .join(format!("{rescue}-play-{host}"))
                     .exists(),
-                rescue
+                rescue && host == "a"
             );
         }
     }

@@ -19,7 +19,7 @@ Rustsible currently provides:
 - short module names and the `ansible.builtin.*` / `ansible.legacy.*` name prefixes;
 - playbook `--limit`, `--check`, and `--forks` options.
 
-Tasks retain playbook order, while hosts within a task run concurrently with a bounded worker count (`--forks`, default 5). Most state-management modules and remote commands assume a POSIX shell, and the `package`, `service`, and `user` modules target Linux-style system tools. Linux is the primary supported and tested platform; Windows support is not claimed.
+The default `linear` strategy retains task barriers; `free` lets hosts advance independently. Both bound active host controllers with `--forks` (default 5). Most state-management modules and remote commands assume a POSIX shell, and the `package`, `service`, and `user` modules target Linux-style system tools. Linux is the primary supported and tested platform; Windows support is not claimed.
 
 Module names and common parameters resemble Ansible, but their complete argument schemas, facts, plugin system, transports, strategy engine, Vault support, and all Ansible edge cases are not implemented. Idempotency and check-mode prediction can also differ from Ansible.
 
@@ -259,10 +259,46 @@ Playbooks support `meta: flush_handlers`, `clear_host_errors`, `reset_connection
 `end_host`, and `end_play`. Clear errors allows excluded hosts into later plays;
 it preserves the failure recap and exit status. End host/play stops that play
 without excluding the host from later plays. Ad-hoc meta supports only reset.
-Blocks cannot loop or register as a unit; static imports cannot loop. Tags,
-rolling batches, delegation, and async are still outside the implemented scope.
+Blocks cannot loop or register as a unit; static imports cannot loop. Tags and
+async are still outside the implemented scope.
 See [the reusable deployment example](examples/reuse/main.yml) and the pinned
 reference scenarios under [tests/reference/reuse](tests/reference/reuse).
+
+## Rolling deployment and delegation
+
+| Control | Scope and behavior |
+| --- | --- |
+| `serial` | Play count, integer string, percentage from 0–100%, or list; list entries advance by batch and the last entry repeats. Percentages use the original selected host count, including previously failed hosts. Empty batches are skipped. Nonpositive counts mean the remainder; percentage batches contain at least one host. Templates can use play/role definitions, static vars_files and extra variables. |
+| `throttle` | Play/block/task nonnegative integer; caps a task below forks/batch limits, including across free host controllers. Zero removes that throttle limit. |
+| `run_once` | Play/block/task boolean; evaluates on the first eligible host of each serial batch. Register/fact data is shared with that batch. Only the executing host receives its handler notifications, dynamic children and execution counts. Implicit gathering still runs on each host. |
+| `max_fail_percentage` | Play integer from 0–100; the percentage must be exceeded, rather than equaled. Uses the original batch size and stops subsequent deployment work after unhandled failures. |
+| `any_errors_fatal` | Play/block/task boolean; propagates a failure through the current batch and stops unhandled deployment work. Rescue/always still apply. |
+| `strategy` | `linear` by default, or `free`; built-in FQCN spellings are accepted. Free rejects run_once, any_errors_fatal and max_fail_percentage combinations before executing static tasks or selected dynamic children. |
+
+`ansible_play_hosts_all` and `ansible_play_batch` expose the selected hosts and
+the current eligible batch. Pre/main/post tasks and handlers complete within a
+serial batch before the next batch starts. Free preserves each host's sequence
+and failure handling while sharing published host values and public role variables.
+`fail_fast` remains a Rustsible extension that stops the playbook after a failed play.
+
+`delegate_to` accepts a host name or template, including inside loops.
+Arguments retain the logical host's variables and `inventory_hostname`;
+connection and become options resolve against the delegated host. Register and
+failure state belong to the logical host. Facts also belong to it by default;
+`delegate_facts: true` assigns them to the delegated host, including per-item
+loop targets. An implicit localhost uses local execution. Logical hosts retain
+independent workers when delegating concurrently to one target; use throttle
+when shared files require serialization.
+
+The pinned Ansible 2.21 behavior of fatal recovery has an additional consequence:
+rescue restores execution within the play, while peer hosts stopped by fatal
+propagation remain excluded from later plays until clear_host_errors. The run
+retains a failure exit status. Ordinary rescued module failures keep their
+existing successful recovery behavior.
+
+See [the rolling example](examples/rolling/playbook.yml). The SSH strategy
+fixture uses three distinct servers and checks physical identities, batch
+barriers, cross-host facts, parallel delegation, idempotency, check and cleanup.
 
 ## Build
 
@@ -548,9 +584,13 @@ tests. The comparison checks target file bytes, including literal runtime
 output, defaults/omit, loop values, string types, and rejected string conditions.
 It also compares imported tasks, role dependencies/parameters/templates,
 handler phases and listen topics, and block rescue/always file results.
+Rolling, run_once notification/count behavior, failure thresholds, delegation,
+and free progression/public role scope have separate reference scenarios.
 `bash tests/ssh/run.sh CONTROLLER WORKER_DIRECTORY reuse [glibc|musl]`
 checks that deployment through real SSH with three execution identities,
 including check-mode business-state equality and worker cleanup.
+`bash tests/ssh/run.sh CONTROLLER WORKER_DIRECTORY strategy [glibc|musl]`
+runs the three-server deployment/delegation scenarios.
 
 Dependency advisories are checked in CI against `Cargo.lock`. CI also enforces
 an 80% line-coverage floor. This is a regression baseline, not a claim that every remote SSH path is exercised end to

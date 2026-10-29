@@ -14,6 +14,7 @@ use std::collections::HashSet;
 pub use handlers::Handler;
 pub use play::Play;
 pub(crate) use play::RunState;
+pub use strategy::Strategy;
 pub(crate) use task::render_module_arguments;
 pub use task::{Task, TaskGroup, TaskResult, TaskScope};
 
@@ -93,7 +94,7 @@ pub fn execute_with_options(
 
     let mut failures = Vec::new();
     let mut state = play::RunState::default();
-    state.workers = crate::worker::Runtime::new(options.worker_dir.clone());
+    state.workers = std::sync::Arc::new(crate::worker::Runtime::new(options.worker_dir.clone()));
     state.extra = std::sync::Arc::new(extra);
     state.prepare(
         &inventory,

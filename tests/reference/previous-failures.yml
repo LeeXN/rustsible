@@ -1,0 +1,24 @@
+- hosts: rollout
+  gather_facts: false
+  tasks:
+    - command: /bin/false
+      when: inventory_hostname == 'a'
+# Failed hosts still belong to the original percentage partition. Skipping
+# their execution must not shrink later batches or their failure denominator.
+- hosts: rollout
+  gather_facts: false
+  serial: '50%'
+  tasks:
+    - copy:
+        content: '{{ ansible_play_batch | join(",") }}'
+        dest: '@OUTPUT@/batch-{{ inventory_hostname }}'
+- hosts: rollout
+  gather_facts: false
+  serial: '50%'
+  max_fail_percentage: 50
+  tasks:
+    - command: /bin/false
+      when: inventory_hostname == 'b'
+    - copy:
+        content: survived
+        dest: '@OUTPUT@/survived-{{ inventory_hostname }}'

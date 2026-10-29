@@ -95,13 +95,34 @@ sed "s|@OUTPUT@|$fixture_dir/fatal-output|g" "$repo_dir/tests/reference/fatal-re
 if uv tool run --from ansible-core==2.21.0 ansible-playbook -i "$fixture_dir/strategy-inventory" "$fixture_dir/fatal.yml" > "$fixture_dir/reference-fatal.log" 2>&1; then
     echo 'Ansible 2.21 unexpectedly cleared the fatal failure exit status' >&2; exit 1
 fi
-[[ $(cat "$fixture_dir/fatal-output/continued-a") == continued && $(cat "$fixture_dir/fatal-output/later-d") == later-play ]]
+[[ $(cat "$fixture_dir/fatal-output/continued-a") == continued && $(cat "$fixture_dir/fatal-output/later-a") == later-play ]]
+[[ ! -e $fixture_dir/fatal-output/later-d ]]
 mv "$fixture_dir/fatal-output" "$fixture_dir/reference-fatal"
 mkdir "$fixture_dir/fatal-output"
 if "$binary" playbook -i "$fixture_dir/strategy-inventory" "$fixture_dir/fatal.yml" > "$fixture_dir/native-fatal.log" 2>&1; then
     echo 'Rustsible unexpectedly cleared the fatal failure exit status' >&2; exit 1
 fi
 diff -r "$fixture_dir/reference-fatal" "$fixture_dir/fatal-output"
+mkdir "$fixture_dir/previous-output"
+sed "s|@OUTPUT@|$fixture_dir/previous-output|g" "$repo_dir/tests/reference/previous-failures.yml" > "$fixture_dir/previous.yml"
+if uv tool run --from ansible-core==2.21.0 ansible-playbook -i "$fixture_dir/strategy-inventory" "$fixture_dir/previous.yml" > "$fixture_dir/reference-previous.log" 2>&1; then
+    echo 'Reference unexpectedly cleared earlier host failures' >&2; exit 1
+fi
+[[ $(cat "$fixture_dir/previous-output/batch-c") == c,d && $(cat "$fixture_dir/previous-output/survived-d") == survived ]]
+mv "$fixture_dir/previous-output" "$fixture_dir/reference-previous"
+mkdir "$fixture_dir/previous-output"
+if "$binary" playbook -i "$fixture_dir/strategy-inventory" "$fixture_dir/previous.yml" > "$fixture_dir/native-previous.log" 2>&1; then
+    echo 'Rustsible unexpectedly cleared earlier host failures' >&2; exit 1
+fi
+diff -r "$fixture_dir/reference-previous" "$fixture_dir/previous-output"
+mkdir -p "$fixture_dir/roles" "$fixture_dir/free-output"
+cp -a "$repo_dir/tests/reference/free-role" "$fixture_dir/roles/demo"
+sed "s|@OUTPUT@|$fixture_dir/free-output|g" "$repo_dir/tests/reference/free.yml" > "$fixture_dir/free.yml"
+uv tool run --from ansible-core==2.21.0 ansible-playbook -i "$fixture_dir/strategy-inventory" "$fixture_dir/free.yml" > "$fixture_dir/reference-free.log" 2>&1
+mv "$fixture_dir/free-output" "$fixture_dir/reference-free"
+mkdir "$fixture_dir/free-output"
+"$binary" playbook -i "$fixture_dir/strategy-inventory" "$fixture_dir/free.yml" > "$fixture_dir/native-free.log" 2>&1
+diff -r "$fixture_dir/reference-free" "$fixture_dir/free-output"
 if uv tool run --from ansible-core==2.21.0 ansible-playbook \
     -i "$fixture_dir/inventory" "$fixture_dir/non_boolean.yml" > "$fixture_dir/reference-condition.log" 2>&1; then
     echo 'Reference unexpectedly accepted a string condition' >&2; exit 1
@@ -110,4 +131,4 @@ if "$binary" playbook -i "$fixture_dir/inventory" "$fixture_dir/non_boolean.yml"
     echo 'Rustsible unexpectedly accepted a string condition' >&2; exit 1
 fi
 [[ ! -e $fixture_dir/result/unsafe-condition ]]
-printf 'Ansible 2.21.0 comparison passed: templates/types, native files, retries/conditions, environment, command prediction, facts, variables, imports/roles, handlers/rescue, serial/run_once, failure thresholds and delegation\n'
+printf 'Ansible 2.21.0 comparison passed: templates/types, native files, retries/conditions, environment, command prediction, facts, variables, imports/roles, handlers/rescue, serial/run_once, failure thresholds, delegation and free strategy\n'

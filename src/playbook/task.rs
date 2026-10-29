@@ -34,6 +34,8 @@ const MAX_ARGUMENT_TEMPLATE_NODES: usize = 10_000;
 
 #[derive(Debug, Clone, Default, serde::Serialize)]
 pub struct TaskScope {
+    /// Identical sibling tasks still have separate concurrency limits.
+    pub(crate) source_index: usize,
     pub role_id: Option<String>,
     pub allow_duplicates: bool,
     pub(crate) boundary: Option<Boundary>,

@@ -31,6 +31,17 @@ handler 和 block/rescue/always。用本地 inventory 运行，文件仅写入
 `/tmp/rustsible-reuse-demo`；可用 `-e demo_output=/其他测试目录` 改路径。
 `--check` 下 command 不执行，救援分支不会为了示例而制造失败。
 
+`rolling/playbook.yml` 与 `rolling/inventory` 展示三台逻辑主机按 `[1, 2]`
+滚动执行、批次内 run_once、配置 handler、健康读取和委派到控制端的回执。
+默认 inventory 使用 local，文件仅写入 `/tmp/rustsible-rolling-demo*`。
+替换成 SSH inventory 后可用于隔离目标；三台独立 SSH 服务器的验收在
+`tests/ssh/strategy.sh`。运行示例：
+
+```bash
+rustsible playbook examples/rolling/playbook.yml -i examples/rolling/inventory --check
+rustsible playbook examples/rolling/playbook.yml -i examples/rolling/inventory
+```
+
 ## 运行
 
 ```bash

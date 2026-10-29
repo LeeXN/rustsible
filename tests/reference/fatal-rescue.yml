@@ -8,7 +8,7 @@
       rescue:
         - copy:
             content: rescued
-            dest: '@OUTPUT@/rescued'
+            dest: '@OUTPUT@/rescued-{{ inventory_hostname }}'
       always:
         - copy:
             content: always

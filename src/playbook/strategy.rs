@@ -1,6 +1,70 @@
 use anyhow::{bail, Context, Result};
 use serde_yaml::Value;
+use std::collections::HashMap;
 use std::ops::Range;
+use std::sync::{Arc, Condvar, Mutex};
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum Strategy {
+    #[default]
+    Linear,
+    Free,
+}
+
+#[derive(Default)]
+pub(super) struct Throttles(Mutex<HashMap<String, Arc<Limit>>>);
+struct Limit {
+    maximum: usize,
+    active: Mutex<usize>,
+    available: Condvar,
+}
+pub(super) struct Permit(Arc<Limit>);
+impl Throttles {
+    pub fn acquire(&self, key: String, maximum: usize) -> Result<Permit> {
+        if maximum == 0 {
+            bail!("Throttle permit limit must be positive");
+        }
+        let limit = self
+            .0
+            .lock()
+            .map_err(|_| anyhow::anyhow!("Throttle registry was poisoned"))?
+            .entry(key)
+            .or_insert_with(|| {
+                Arc::new(Limit {
+                    maximum,
+                    active: Mutex::new(0),
+                    available: Condvar::new(),
+                })
+            })
+            .clone();
+        let mut active = limit
+            .active
+            .lock()
+            .map_err(|_| anyhow::anyhow!("Throttle state was poisoned"))?;
+        while *active >= limit.maximum {
+            active = limit
+                .available
+                .wait(active)
+                .map_err(|_| anyhow::anyhow!("Throttle state was poisoned"))?;
+        }
+        *active += 1;
+        drop(active);
+        Ok(Permit(limit))
+    }
+}
+impl Drop for Permit {
+    fn drop(&mut self) {
+        // Unwinding must release a slot too, so a failed host cannot leave its
+        // peers parked behind a permit that will never become available.
+        let mut active = self
+            .0
+            .active
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        *active = active.saturating_sub(1);
+        self.0.available.notify_one();
+    }
+}
 
 /// Percentages always use the original play size. Once a serial list is
 /// exhausted, its last size repeats rather than consuming the whole remainder.

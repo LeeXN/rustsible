@@ -12,6 +12,7 @@ use crate::playbook::{Handler, Task, TaskResult};
 /// Play structure representing a set of tasks to run on hosts
 #[derive(Debug, Clone)]
 pub struct Play {
+    pub strategy: crate::playbook::Strategy,
     pub name: String,
     pub hosts: String,
     pub tasks: Vec<Task>,
@@ -54,7 +55,7 @@ pub struct Play {
     pub tags: Vec<String>, // Keep this for future use
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Clone)]
 struct HostStats {
     unreachable: usize,
     uncertain: usize,
@@ -67,8 +68,10 @@ struct HostStats {
 }
 
 struct PlayStatus<'a> {
+    batch_size: usize,
     abort: bool,
     fatal_observed: bool,
+    fatal_peers: HashSet<String>,
     hosts: &'a [Host],
     definitions: HashMap<String, HashMap<String, Value>>,
     flushing: usize,
@@ -83,6 +86,8 @@ struct PlayStatus<'a> {
 struct TaskFailure {
     task: Task,
     result: TaskResult,
+    fatal_peer: bool,
+    escalated: bool,
 }
 enum Scheduled {
     Task(Box<Task>, HashSet<String>, bool),
@@ -101,17 +106,30 @@ struct BlockFrame {
 /// are rebuilt each time, so persisting a register never leaks play variables.
 #[derive(Default)]
 pub(crate) struct RunState {
-    pub(crate) workers: crate::worker::Runtime,
+    pub(crate) workers: std::sync::Arc<crate::worker::Runtime>,
     pub(crate) extra: std::sync::Arc<HashMap<String, Value>>,
     globals: std::sync::Arc<HashMap<String, Value>>,
-    inventory: HashMap<String, HashMap<String, Value>>,
-    contexts: HashMap<String, RuntimeVariables>,
+    host_state: std::sync::Arc<std::sync::Mutex<HostState>>,
     seen_roles: HashSet<(String, String)>,
     ran_roles: HashSet<(String, String)>,
-    excluded: HashSet<String>,
     stats: HashMap<String, HostStats>,
-    stop_play: bool,
+    stop_play: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    throttles: std::sync::Arc<crate::playbook::strategy::Throttles>,
+    role_exports: std::sync::Arc<std::sync::Mutex<RoleExports>>,
     pub(crate) abort_book: bool,
+    batch_size: usize,
+}
+
+#[derive(Default, Clone)]
+struct HostState {
+    inventory: HashMap<String, HashMap<String, Value>>,
+    contexts: HashMap<String, RuntimeVariables>,
+    excluded: HashSet<String>,
+}
+#[derive(Default, Clone)]
+struct RoleExports {
+    defaults: Mapping,
+    variables: Mapping,
 }
 
 /// Module arguments belong to the logical host. Connection options are rebuilt
@@ -128,22 +146,26 @@ impl Delegation<'_> {
         task: &Task,
         origin: &Host,
     ) -> Result<crate::ssh::config::ConnectionConfig> {
+        let (mut scope, variables, known) = {
+            let shared = self.state.host_state()?;
+            (
+                shared
+                    .contexts
+                    .get(name)
+                    .cloned()
+                    .unwrap_or_else(|| RuntimeVariables {
+                        defaults: origin.defaults.clone(),
+                        extra: self.state.extra.clone(),
+                        ..Default::default()
+                    }),
+                shared.inventory.get(name).cloned().unwrap_or_default(),
+                shared.inventory.contains_key(name),
+            )
+        };
         let mut host = Host::new(name);
-        let mut scope =
-            self.state
-                .contexts
-                .get(name)
-                .cloned()
-                .unwrap_or_else(|| RuntimeVariables {
-                    defaults: origin.defaults.clone(),
-                    extra: self.state.extra.clone(),
-                    ..Default::default()
-                });
         host.defaults = scope.defaults.clone();
-        host.variables = self.state.inventory.get(name).cloned().unwrap_or_default();
-        if !self.state.inventory.contains_key(name)
-            && matches!(name, "localhost" | "127.0.0.1" | "::1")
-        {
+        host.variables = variables;
+        if !known && matches!(name, "localhost" | "127.0.0.1" | "::1") {
             host.set_variable("ansible_connection", "local");
         }
         scope.globals = self.state.variable_globals()?;
@@ -158,11 +180,44 @@ impl Delegation<'_> {
             Value::String(origin.name.clone()),
         );
         let variables = crate::playbook::templar::resolve_definitions(&definitions, &data)?;
-        effective.connection_config(name, &definitions, &variables)
+        let mut connection = effective.connection_config(name, &definitions, &variables)?;
+        // A delegated target may run tasks for several logical hosts at once.
+        // Their synchronous workers need separate leases; the physical address
+        // and identity have already been resolved from the delegated context.
+        connection.name = origin.name.clone();
+        Ok(connection)
     }
 }
 
 impl RunState {
+    fn role_exports(&self) -> Result<std::sync::MutexGuard<'_, RoleExports>> {
+        self.role_exports
+            .lock()
+            .map_err(|_| anyhow::anyhow!("Role export state was poisoned"))
+    }
+    fn fork_for(&self, host: &str) -> Self {
+        Self {
+            workers: self.workers.clone(),
+            extra: self.extra.clone(),
+            globals: self.globals.clone(),
+            host_state: self.host_state.clone(),
+            stop_play: self.stop_play.clone(),
+            throttles: self.throttles.clone(),
+            role_exports: self.role_exports.clone(),
+            batch_size: self.batch_size,
+            stats: self
+                .stats
+                .get(host)
+                .map(|stats| HashMap::from([(host.to_owned(), stats.clone())]))
+                .unwrap_or_default(),
+            ..Default::default()
+        }
+    }
+    fn host_state(&self) -> Result<std::sync::MutexGuard<'_, HostState>> {
+        self.host_state
+            .lock()
+            .map_err(|_| anyhow::anyhow!("Host runtime state was poisoned"))
+    }
     pub(crate) fn prepare(
         &mut self,
         inventory: &crate::inventory::Inventory,
@@ -200,10 +255,12 @@ impl RunState {
             );
         }
         self.globals = std::sync::Arc::new(globals);
+        let mut shared = self.host_state()?;
         for host in inventory.filter_hosts("all") {
-            self.inventory
+            shared
+                .inventory
                 .insert(host.name.clone(), host.inventory_variables());
-            let scope = self.contexts.entry(host.name.clone()).or_default();
+            let scope = shared.contexts.entry(host.name.clone()).or_default();
             scope.extra = self.extra.clone();
             scope.defaults = host.defaults.clone();
             scope.globals = self.globals.clone();
@@ -227,12 +284,13 @@ impl RunState {
         Ok(())
     }
     fn hostvars(&self) -> Result<Value> {
+        let shared = self.host_state()?.clone();
         let mut snapshot = HashMap::<String, Value>::new();
         for _ in 0..65 {
             let mut next = HashMap::new();
             let hosts = serde_yaml::to_value(&snapshot)?;
-            for (name, definitions) in &self.inventory {
-                let scope = self
+            for (name, definitions) in &shared.inventory {
+                let scope = shared
                     .contexts
                     .get(name)
                     .context("Missing host variable scope")?;
@@ -265,14 +323,18 @@ impl RunState {
         host: &str,
         globals: &std::sync::Arc<HashMap<String, Value>>,
     ) -> Result<HashMap<String, Value>> {
-        let mut scope = self
+        let shared = self.host_state()?.clone();
+        let mut scope = shared
             .contexts
             .get(host)
             .context("Missing host scope")?
             .clone();
         scope.globals = globals.clone();
         let (definitions, data) = scope.layers(
-            self.inventory.get(host).context("Missing inventory host")?,
+            shared
+                .inventory
+                .get(host)
+                .context("Missing inventory host")?,
             &[],
             None,
             None,
@@ -301,6 +363,12 @@ impl RunState {
     }
 
     fn merge_result(&mut self, host: &str, task: &Task, result: &TaskResult) -> Result<()> {
+        let mut shared = self.host_state()?;
+        let HostState {
+            contexts,
+            inventory,
+            ..
+        } = &mut *shared;
         let mut updates = Vec::new();
         if let Some(Value::Sequence(items)) = result.values.get("results") {
             for item in items {
@@ -324,13 +392,12 @@ impl RunState {
             } else {
                 host
             };
-            let defaults = self
-                .contexts
+            let defaults = contexts
                 .get(host)
                 .map(|scope| scope.defaults.clone())
                 .unwrap_or_default();
             let persistent =
-                self.contexts
+                contexts
                     .entry(target.to_string())
                     .or_insert_with(|| RuntimeVariables {
                         defaults,
@@ -342,7 +409,7 @@ impl RunState {
                 "inventory_hostname".into(),
                 Value::String(target.to_string()),
             );
-            self.inventory.entry(target.to_string()).or_insert_with(|| {
+            inventory.entry(target.to_string()).or_insert_with(|| {
                 if matches!(target, "localhost" | "127.0.0.1" | "::1") {
                     HashMap::from([("ansible_connection".into(), Value::String("local".into()))])
                 } else {
@@ -381,7 +448,7 @@ impl RunState {
         }
         if let Some(register) = &task.register {
             let value = Play::registered_value(result);
-            self.contexts
+            contexts
                 .entry(host.to_string())
                 .or_default()
                 .registered
@@ -392,6 +459,40 @@ impl RunState {
 }
 
 impl Play {
+    pub(crate) fn validate_strategy(&self) -> Result<()> {
+        if self.strategy != crate::playbook::Strategy::Free {
+            return Ok(());
+        }
+        if self.run_once.unwrap_or(false)
+            || self.any_errors_fatal.unwrap_or(false)
+            || self.max_fail_percentage.is_some()
+        {
+            bail!("The free strategy cannot combine run_once, any_errors_fatal, or max_fail_percentage; use linear");
+        }
+        fn validate(tasks: &[Task]) -> Result<()> {
+            for task in tasks {
+                let task = task.effective();
+                if task.run_once.unwrap_or(false) || task.any_errors_fatal.unwrap_or(false) {
+                    bail!(
+                        "The free strategy cannot combine run_once or any_errors_fatal; use linear"
+                    );
+                }
+                if let Some(group) = task.group {
+                    validate(&group.tasks)?;
+                    validate(&group.rescue)?;
+                    validate(&group.always)?;
+                }
+            }
+            Ok(())
+        }
+        validate(&self.pre_tasks)?;
+        validate(&self.tasks)?;
+        validate(&self.post_tasks)?;
+        for handler in &self.handlers {
+            validate(std::slice::from_ref(&handler.task))?;
+        }
+        Ok(())
+    }
     pub fn execute(&self, hosts: &[Host]) -> Result<()> {
         self.execute_with_options(hosts, false, 5)
     }
@@ -417,6 +518,7 @@ impl Play {
         forks: usize,
         state: &mut RunState,
     ) -> Result<()> {
+        self.validate_strategy()?;
         if forks == 0 {
             bail!("Play requires forks to be greater than zero");
         }
@@ -434,31 +536,52 @@ impl Play {
                 );
             }
         }
-        // Previously failed hosts cannot occupy a serial batch and thereby
-        // stop healthy hosts before this play has executed any work.
-        let eligible = hosts
-            .iter()
-            .filter(|host| !state.excluded.contains(&host.name))
-            .cloned()
-            .collect::<Vec<_>>();
-        let hosts = eligible.as_slice();
+        if let Some(directory) = self.source_file.as_ref().and_then(|source| source.parent()) {
+            let mut globals = (*state.globals).clone();
+            globals.insert(
+                "playbook_dir".into(),
+                Value::String(directory.to_string_lossy().into_owned()),
+            );
+            state.globals = std::sync::Arc::new(globals);
+            for scope in state.host_state()?.contexts.values_mut() {
+                scope.globals = state.globals.clone();
+            }
+        }
+        // Keep the original partition and percentage denominator. A batch
+        // containing only previously failed hosts must be skipped, rather than
+        // treating those old failures as a newly failed deployment batch.
         let serial = self
             .serial
             .as_ref()
             .map(|serial| -> Result<Value> {
-                let mut definitions = self
-                    .vars
+                fn needs_render(value: &Value) -> bool {
+                    match value {
+                        Value::String(source) => source.contains("{{") || source.contains("{%"),
+                        Value::Sequence(items) => items.iter().any(needs_render),
+                        _ => false,
+                    }
+                }
+                if !needs_render(serial) {
+                    return Ok(serial.clone());
+                }
+                let runtime = RuntimeVariables {
+                    extra: state.extra.clone(),
+                    globals: state.variable_globals()?,
+                    ..Default::default()
+                };
+                let overlays = self.variables_for_host(&runtime, &HashMap::new(), false)?;
+                let defaults = self
+                    .role_defaults
                     .iter()
                     .map(|(name, value)| {
                         (
-                            name.as_str().expect("Validated play variable").to_owned(),
+                            name.as_str().expect("Validated role default").to_owned(),
                             value.clone(),
                         )
                     })
-                    .collect::<HashMap<_, _>>();
-                crate::inventory::host::merge_variable_layer(&mut definitions, &state.extra);
-                let variables =
-                    crate::playbook::templar::resolve_definitions(&definitions, &state.globals)?;
+                    .collect();
+                let (definitions, data) = runtime.layers(&defaults, &[&overlays], None, None)?;
+                let variables = crate::playbook::templar::resolve_definitions(&definitions, &data)?;
                 let context = crate::playbook::templar::create_context(&variables)?;
                 let args = Mapping::from_iter([(Value::String("serial".into()), serial.clone())]);
                 let mut result = crate::playbook::task::render_module_arguments(
@@ -472,12 +595,38 @@ impl Play {
                     .remove(Value::String("serial".into()))
                     .context("Serial cannot be omitted")
             })
-            .transpose()?;
+            .transpose()
+            .map_err(|error| {
+                if self.no_log.unwrap_or(false) {
+                    anyhow::anyhow!(
+                        "Cannot plan serial batches: output censored because no_log is enabled"
+                    )
+                } else {
+                    error
+                }
+            })?;
         let batches = crate::playbook::strategy::batches(serial.as_ref(), hosts.len())?;
-        state.stop_play = false;
+        state
+            .stop_play
+            .store(false, std::sync::atomic::Ordering::Release);
+        *state.role_exports()? = RoleExports {
+            defaults: self.role_defaults.clone(),
+            variables: self.role_vars.clone(),
+        };
         let mut failures = Vec::new();
         for batch in batches {
+            state.batch_size = batch.len();
             let batch = &hosts[batch];
+            let excluded = state.host_state()?.excluded.clone();
+            let eligible = batch
+                .iter()
+                .filter(|host| !excluded.contains(&host.name))
+                .cloned()
+                .collect::<Vec<_>>();
+            let batch = eligible.as_slice();
+            if batch.is_empty() {
+                continue;
+            }
             let mut globals = (*state.globals).clone();
             globals.insert(
                 "ansible_play_hosts_all".into(),
@@ -488,19 +637,67 @@ impl Play {
                 serde_yaml::to_value(
                     batch
                         .iter()
-                        .filter(|host| !state.excluded.contains(&host.name))
+                        .filter(|host| !excluded.contains(&host.name))
                         .map(|host| &host.name)
                         .collect::<Vec<_>>(),
                 )?,
             );
             state.globals = std::sync::Arc::new(globals);
-            if let Err(error) = self.execute_batch(batch, check_mode, forks, state) {
+            for scope in state.host_state()?.contexts.values_mut() {
+                scope.globals = state.globals.clone();
+            }
+            let executed = match self.strategy {
+                crate::playbook::Strategy::Linear => {
+                    self.execute_batch(batch, check_mode, forks, state)
+                }
+                crate::playbook::Strategy::Free => {
+                    self.execute_free_batch(batch, check_mode, forks, state)
+                }
+            };
+            if let Err(error) = executed {
                 failures.push(format!("{error:#}"));
             }
-            if state.stop_play || batch.iter().all(|host| state.excluded.contains(&host.name)) {
+            let excluded = state.host_state()?.excluded.clone();
+            if state.stop_play.load(std::sync::atomic::Ordering::Acquire)
+                || (batch.len() == state.batch_size
+                    && batch.iter().all(|host| excluded.contains(&host.name)))
+            {
                 break;
             }
         }
+        if failures.is_empty() {
+            Ok(())
+        } else {
+            bail!(failures.join("; "))
+        }
+    }
+
+    fn execute_free_batch(
+        &mut self,
+        hosts: &[Host],
+        check_mode: bool,
+        forks: usize,
+        state: &mut RunState,
+    ) -> Result<()> {
+        // Host controllers advance independently within the bounded pool.
+        // Runtime values, connections and permits are shared; each logical
+        // host retains its own task stack, handlers and failure recovery.
+        let completed = crate::scheduler::map(hosts, forks, |host| {
+            let mut play = self.clone();
+            let mut run = state.fork_for(&host.name);
+            let result = play.execute_batch(std::slice::from_ref(host), check_mode, 1, &mut run);
+            (result, run.stats)
+        });
+        let mut failures = Vec::new();
+        for (result, stats) in completed {
+            state.stats.extend(stats);
+            if let Err(error) = result {
+                failures.push(format!("{error:#}"));
+            }
+        }
+        let exports = state.role_exports()?.clone();
+        self.role_defaults = exports.defaults;
+        self.role_vars = exports.variables;
         if failures.is_empty() {
             Ok(())
         } else {
@@ -518,17 +715,6 @@ impl Play {
         let start_time = Instant::now();
         state.seen_roles.clear();
         state.ran_roles.clear();
-        if let Some(directory) = self.source_file.as_ref().and_then(|source| source.parent()) {
-            let mut globals = (*state.globals).clone();
-            globals.insert(
-                "playbook_dir".into(),
-                Value::String(directory.to_string_lossy().into_owned()),
-            );
-            state.globals = std::sync::Arc::new(globals);
-            for scope in state.contexts.values_mut() {
-                scope.globals = state.globals.clone();
-            }
-        }
         info!("PLAY [{}] on {} hosts", self.name, hosts.len());
         println!("\n{}", format!("PLAY [{}]", self.name).bold());
 
@@ -536,23 +722,27 @@ impl Play {
             .iter()
             .map(|host| (host.name.clone(), host.inventory_variables()))
             .collect();
-        for host in hosts {
-            let scope = state.contexts.entry(host.name.clone()).or_default();
-            scope.extra = state.extra.clone();
-            scope.defaults = host.defaults.clone();
-            scope.globals = state.globals.clone();
-            scope
-                .magic
-                .entry("inventory_hostname".into())
-                .or_insert_with(|| Value::String(host.name.clone()));
-            state
-                .inventory
-                .entry(host.name.clone())
-                .or_insert_with(|| host.inventory_variables());
+        {
+            let mut shared = state.host_state()?;
+            for host in hosts {
+                let scope = shared.contexts.entry(host.name.clone()).or_default();
+                scope.extra = state.extra.clone();
+                scope.defaults = host.defaults.clone();
+                scope.globals = state.globals.clone();
+                scope
+                    .magic
+                    .entry("inventory_hostname".into())
+                    .or_insert_with(|| Value::String(host.name.clone()));
+                shared
+                    .inventory
+                    .entry(host.name.clone())
+                    .or_insert_with(|| host.inventory_variables());
+            }
         }
+        let excluded = state.host_state()?.excluded.clone();
         let active_hosts: HashSet<String> = hosts
             .iter()
-            .filter(|host| !state.excluded.contains(&host.name))
+            .filter(|host| !excluded.contains(&host.name))
             .map(|host| host.name.clone())
             .collect();
         let stats: HashMap<String, HostStats> = hosts
@@ -568,8 +758,10 @@ impl Play {
         let notified_handlers: HashSet<(String, String)> = HashSet::new();
 
         let mut status = PlayStatus {
+            batch_size: state.batch_size,
             abort: false,
             fatal_observed: false,
+            fatal_peers: HashSet::new(),
             hosts,
             definitions,
             flushing: 0,
@@ -703,6 +895,14 @@ impl Play {
             .collect::<std::collections::VecDeque<_>>();
         let mut task_index = 0;
         while let Some(scheduled) = pending.pop_front() {
+            if self.strategy == crate::playbook::Strategy::Free {
+                if state.stop_play.load(std::sync::atomic::Ordering::Acquire) {
+                    break;
+                }
+                let exports = state.role_exports()?.clone();
+                self.role_defaults = exports.defaults;
+                self.role_vars = exports.variables;
+            }
             let (task, selected_hosts, cleanup) = match scheduled {
                 Scheduled::Task(task, members, cleanup) => (*task, members, cleanup),
                 Scheduled::Rescue(frame) => {
@@ -724,28 +924,32 @@ impl Play {
                             }
                             let errors = status.failures.remove(host).expect("Observed failure");
                             let last = errors.last().expect("Nonempty failures");
-                            let scope = state.contexts.entry(host.clone()).or_default();
-                            scope.registered.insert(
-                                "ansible_failed_result".into(),
-                                last.result.registered_value(),
-                            );
-                            scope.registered.insert(
-                                "ansible_failed_task".into(),
-                                Value::Mapping(Mapping::from_iter([
-                                    (
-                                        Value::String("name".into()),
-                                        Value::String(last.task.name.clone()),
-                                    ),
-                                    (
-                                        Value::String("action".into()),
-                                        Value::String(last.task.module.clone()),
-                                    ),
-                                    (
-                                        Value::String("args".into()),
-                                        Value::Mapping(last.task.args.clone()),
-                                    ),
-                                ])),
-                            );
+                            if !last.fatal_peer {
+                                status.fatal_peers.remove(host);
+                                let mut shared = state.host_state()?;
+                                let scope = shared.contexts.entry(host.clone()).or_default();
+                                scope.registered.insert(
+                                    "ansible_failed_result".into(),
+                                    last.result.registered_value(),
+                                );
+                                scope.registered.insert(
+                                    "ansible_failed_task".into(),
+                                    Value::Mapping(Mapping::from_iter([
+                                        (
+                                            Value::String("name".into()),
+                                            Value::String(last.task.name.clone()),
+                                        ),
+                                        (
+                                            Value::String("action".into()),
+                                            Value::String(last.task.module.clone()),
+                                        ),
+                                        (
+                                            Value::String("args".into()),
+                                            Value::Mapping(last.task.args.clone()),
+                                        ),
+                                    ])),
+                                );
+                            }
                             let stats = status
                                 .stats
                                 .get_mut(host)
@@ -757,7 +961,9 @@ impl Play {
                             stats.failed = stats.failed.saturating_sub(counted);
                             stats.rescued += counted;
                             status.active_hosts.insert(host.clone());
-                            state.excluded.remove(host);
+                            if !status.fatal_peers.contains(host) {
+                                state.host_state()?.excluded.remove(host);
+                            }
                             rescued.insert(host.clone());
                         }
                         for task in frame.rescue.iter().rev() {
@@ -788,7 +994,9 @@ impl Play {
                             frame.pending.insert(host.clone(), errors);
                         }
                         status.active_hosts.insert(host.clone());
-                        state.excluded.remove(&host);
+                        if !status.fatal_peers.contains(&host) {
+                            state.host_state()?.excluded.remove(&host);
+                        }
                         eligible.insert(host);
                     }
                     for task in frame.always.iter().rev() {
@@ -807,9 +1015,9 @@ impl Play {
                         }
                         status.failures.insert(host.clone(), errors);
                         status.active_hosts.remove(&host);
-                        state.excluded.insert(host);
+                        state.host_state()?.excluded.insert(host);
                     }
-                    self.apply_failure_policy(state, status, &pending);
+                    self.apply_failure_policy(state, status, &pending)?;
                     continue;
                 }
             };
@@ -993,10 +1201,26 @@ impl Play {
                                         ..Default::default()
                                     },
                                 )?;
+                                if self.strategy == crate::playbook::Strategy::Free {
+                                    let mut selected = self.clone();
+                                    selected.pre_tasks.clear();
+                                    selected.post_tasks.clear();
+                                    selected.tasks = tasks.tasks.clone();
+                                    selected.handlers = tasks.handlers.clone();
+                                    selected.validate_strategy()?;
+                                }
                                 let index = expansions.len();
                                 expansion_keys.insert(key, index);
-                                crate::vars::merge(&mut self.role_defaults, tasks.defaults);
-                                crate::vars::merge(&mut self.role_vars, tasks.variables);
+                                if self.strategy == crate::playbook::Strategy::Free {
+                                    let mut exports = state.role_exports()?;
+                                    crate::vars::merge(&mut exports.defaults, tasks.defaults);
+                                    crate::vars::merge(&mut exports.variables, tasks.variables);
+                                    self.role_defaults = exports.defaults.clone();
+                                    self.role_vars = exports.variables.clone();
+                                } else {
+                                    crate::vars::merge(&mut self.role_defaults, tasks.defaults);
+                                    crate::vars::merge(&mut self.role_vars, tasks.variables);
+                                }
                                 expansions.push((tasks.tasks, tasks.handlers, HashSet::new()));
                                 index
                             };
@@ -1044,13 +1268,14 @@ impl Play {
                         "reset_connection" => state.workers.reset(&host.name)?,
                         "flush_handlers" => self.flush_handlers(state, options, status)?,
                         "clear_host_errors" => {
+                            status.fatal_peers.clear();
                             if let Some(targets) = state
                                 .globals
                                 .get("ansible_play_hosts_all")
                                 .and_then(Value::as_sequence)
                             {
                                 for name in targets.iter().filter_map(Value::as_str) {
-                                    state.excluded.remove(name);
+                                    state.host_state()?.excluded.remove(name);
                                 }
                             }
                         }
@@ -1059,7 +1284,9 @@ impl Play {
                             status.ended.insert(host.name.clone());
                         }
                         "end_play" => {
-                            state.stop_play = true;
+                            state
+                                .stop_play
+                                .store(true, std::sync::atomic::Ordering::Release);
                             status.active_hosts.clear();
                             status
                                 .ended
@@ -1116,7 +1343,7 @@ impl Play {
                             host_stats.failed += usize::from(!result.inherited_result);
                         }
                         status.active_hosts.remove(&host.name);
-                        state.excluded.insert(host.name.clone());
+                        state.host_state()?.excluded.insert(host.name.clone());
                         status
                             .failures
                             .entry(host.name.clone())
@@ -1124,6 +1351,8 @@ impl Play {
                             .push(TaskFailure {
                                 task: effective_task.clone(),
                                 result: result.clone(),
+                                fatal_peer: false,
+                                escalated: false,
                             });
                     }
                 } else if result.skipped {
@@ -1135,7 +1364,7 @@ impl Play {
                     }
                 }
             }
-            self.apply_failure_policy(state, status, &pending);
+            self.apply_failure_policy(state, status, &pending)?;
             for (_, handlers, members) in &mut expansions {
                 for mut handler in handlers.drain(..) {
                     handler.hosts = Some(members.clone());
@@ -1160,7 +1389,37 @@ impl Play {
         state: &mut RunState,
         status: &mut PlayStatus<'_>,
         pending: &std::collections::VecDeque<Scheduled>,
-    ) {
+    ) -> Result<()> {
+        let mut triggers = Vec::new();
+        for (host, errors) in &mut status.failures {
+            for error in errors {
+                if !error.escalated
+                    && error
+                        .task
+                        .any_errors_fatal
+                        .unwrap_or(self.any_errors_fatal.unwrap_or(false))
+                {
+                    error.escalated = true;
+                    triggers.push((host.clone(), error.task.clone()));
+                }
+            }
+        }
+        for (origin, task) in triggers {
+            for host in std::mem::take(&mut status.active_hosts) {
+                let mut result = TaskResult::new(&host);
+                result.failed = true;
+                result.inherited_result = true;
+                result.msg = format!("Execution stopped because a task with any_errors_fatal failed on host '{origin}'");
+                status.fatal_peers.insert(host.clone());
+                state.host_state()?.excluded.insert(host.clone());
+                status.failures.entry(host).or_default().push(TaskFailure {
+                    task: task.clone(),
+                    result,
+                    fatal_peer: true,
+                    escalated: true,
+                });
+            }
+        }
         let unhandled = status.failures.iter().filter(|(host, errors)| {
             let terminal = errors.iter().any(|error| error.result.unreachable || error.result.uncertain);
             terminal || !pending.iter().any(|event| matches!(event,
@@ -1176,13 +1435,16 @@ impl Play {
             })
         });
         let exceeded = self.max_fail_percentage.is_some_and(|percentage| {
-            unhandled.len() as u128 * 100 > status.hosts.len() as u128 * percentage as u128
+            unhandled.len() as u128 * 100 > status.batch_size as u128 * percentage as u128
         });
         if fatal || exceeded {
             status.abort = true;
-            state.stop_play = true;
-            state.abort_book |= fatal;
+            state
+                .stop_play
+                .store(true, std::sync::atomic::Ordering::Release);
+            state.abort_book = true;
         }
+        Ok(())
     }
 
     fn handler_name(&self, handler: &Handler, state: &RunState) -> Result<String> {
@@ -1335,16 +1597,20 @@ impl Play {
                     restore.insert(host.clone(), errors);
                 }
                 status.active_hosts.insert(host.clone());
-                state.excluded.remove(host);
+                state.host_state()?.excluded.remove(host);
             }
             self.execute_sequence(vec![task], members, state, options, status)?;
+            state
+                .host_state()?
+                .excluded
+                .extend(status.fatal_peers.iter().cloned());
             for (host, mut errors) in restore {
                 if let Some(mut extra) = status.failures.remove(&host) {
                     errors.append(&mut extra);
                 }
                 status.failures.insert(host.clone(), errors);
                 status.active_hosts.remove(&host);
-                state.excluded.insert(host);
+                state.host_state()?.excluded.insert(host);
             }
         }
         status.flushing -= 1;
@@ -1387,9 +1653,27 @@ impl Play {
         let mut results = crate::scheduler::map(selected, concurrency, |&host| {
             let effective_task = play.apply_play_settings(task, host);
             let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                match (state.contexts.get(&host.name), definitions.get(&host.name)) {
-                    (Some(vars), Some(definitions)) => {
-                        let mut vars = vars.clone();
+                let _permit = if play.strategy == crate::playbook::Strategy::Free {
+                    if let Some(limit) = effective_task.throttle.filter(|limit| *limit > 0) {
+                        let identity = serde_json::to_vec(&serde_json::to_value((
+                            &effective_task.source_file,
+                            &effective_task.module,
+                            &effective_task.name,
+                            &effective_task.args,
+                            &effective_task.scope,
+                            &effective_task.throttle,
+                        ))?)?;
+                        let key = rustsible_protocol::sha256(&mut identity.as_slice())?;
+                        Some(state.throttles.acquire(key, limit)?)
+                    } else {
+                        None
+                    }
+                } else {
+                    None
+                };
+                let scope = state.host_state()?.contexts.get(&host.name).cloned();
+                match (scope, definitions.get(&host.name)) {
+                    (Some(mut vars), Some(definitions)) => {
                         vars.globals = globals
                             .as_ref()
                             .map_err(|error| {
@@ -1622,6 +1906,7 @@ mod tests {
 
     fn create_test_play() -> Play {
         Play {
+            strategy: crate::playbook::Strategy::Linear,
             name: "Test Play".to_string(),
             hosts: "localhost".to_string(),
             tasks: Vec::new(),
@@ -1805,7 +2090,8 @@ esac
         assert!(temp.path().join("release").exists());
         assert!(!temp.path().join("overflow").exists());
         for host in &hosts {
-            let result = &state.contexts[&host.name].registered["work_result"];
+            let shared = state.host_state().unwrap();
+            let result = &shared.contexts[&host.name].registered["work_result"];
             assert_eq!(result["rc"].as_i64(), Some(0));
             assert_eq!(state.stats[&host.name].ok, 3);
         }
