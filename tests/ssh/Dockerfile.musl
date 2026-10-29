@@ -1,7 +1,7 @@
 FROM alpine:3.22
 RUN --mount=type=secret,id=proxy_ca \
     if [ -f /run/secrets/proxy_ca ]; then export SSL_CERT_FILE=/run/secrets/proxy_ca; fi; \
-    apk add --no-cache openssh sudo shadow util-linux ca-certificates libcap-utils \
+    apk add --no-cache openssh sudo shadow util-linux ca-certificates libcap-utils git \
     && mkdir -p /run/sshd \
     && useradd -m -s /bin/sh deploy \
     && useradd -m -s /bin/sh app \

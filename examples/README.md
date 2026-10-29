@@ -78,6 +78,9 @@ rustsible ad-hoc localhost -i examples/inventory/hosts \
 health_host/health_port/health_url 配成隔离服务；默认地址为
 `http://127.0.0.1:8080/health`，示例不自动启动服务。
 
+`artifacts.yml` 展示固定 Git 版本和归档部署。将仓库、版本、目标路径和
+控制端归档改为隔离测试值；目标端需预装 Git，解包不调用 tar/unzip。
+
 ## 安全提示
 - 示例 inventory 只应放测试值，不要提交真实密码或私钥。
 - `package`、`service` 和 `user` 会调用目标系统工具，通常需要 `become`。

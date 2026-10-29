@@ -95,6 +95,7 @@ ansible_user=deploy
 ansible_ssh_private_key_file=$fixture_dir/key
 rustsible_known_hosts_file=$fixture_dir/known_hosts
 EOF
+if [[ $mode == artifacts ]]; then source "$repo_dir/tests/ssh/artifacts.sh"; exit 0; fi
 if [[ $mode == systems ]]; then
     if [[ $libc == musl ]]; then source "$repo_dir/tests/systems/alpine.sh"; elif [[ $libc == sysv ]]; then source "$repo_dir/tests/systems/sysv.sh"; else source "$repo_dir/tests/systems/cases.sh"; fi
     exit 0

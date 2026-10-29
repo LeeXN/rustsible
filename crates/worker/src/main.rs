@@ -1,4 +1,6 @@
 mod accounts;
+mod archive;
+mod artifacts;
 mod facts;
 mod files;
 mod filesystem;

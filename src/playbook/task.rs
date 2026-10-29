@@ -993,11 +993,17 @@ impl Task {
         }
 
         let module_name = self.normalized_module_name();
-        if matches!(module_name, "copy" | "template") {
+        if matches!(module_name, "copy" | "template")
+            || module_name == "unarchive"
+                && resolved_args
+                    .get(Value::String("remote_src".into()))
+                    .and_then(Value::as_bool)
+                    != Some(true)
+        {
             if let Some(Value::String(path)) = resolved_args.get_mut(Value::String("src".into())) {
                 *path = self
                     .source_path(
-                        if module_name == "copy" {
+                        if module_name != "template" {
                             "files"
                         } else {
                             "templates"
@@ -1358,7 +1364,8 @@ pub(crate) fn render_module_arguments(
         // are validated and preserved verbatim, never treated as templates.
         let force_string = (module_name == "template" && key == "content")
             || (module_name == "debug" && matches!(key.as_str(), "msg" | "var"));
-        let is_mode_param = matches!(module_name, "file" | "copy" | "template") && key == "mode";
+        let is_mode_param =
+            matches!(module_name, "file" | "copy" | "template" | "unarchive") && key == "mode";
 
         if (module_name == "template" && matches!(key.as_str(), "content" | "vars"))
             || (module_name == "assert" && key == "that")

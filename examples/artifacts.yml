@@ -1,0 +1,20 @@
+- hosts: all
+  gather_facts: false
+  vars:
+    source_repo: https://example.invalid/release.git
+    release_revision: v1.0.0
+    checkout_path: /srv/myapp/source
+    archive_source: release.tar.gz
+    release_path: /srv/myapp/release
+  tasks:
+    - git:
+        repo: '{{ source_repo }}'
+        dest: '{{ checkout_path }}'
+        version: '{{ release_revision }}'
+    - file:
+        path: '{{ release_path }}'
+        state: directory
+        mode: '0755'
+    - unarchive:
+        src: '{{ archive_source }}'
+        dest: '{{ release_path }}'

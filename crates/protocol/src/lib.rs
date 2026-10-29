@@ -35,6 +35,8 @@ pub const NATIVE_MODULES: &[&str] = &[
     "group",
     "wait_for",
     "uri",
+    "git",
+    "unarchive",
 ];
 
 #[derive(Serialize, Deserialize)]
@@ -142,8 +144,16 @@ impl Request {
                 bail!("Async tasks cannot receive controller file payloads");
             }
         }
-        if matches!(self.module.as_str(), "copy" | "template") != self.payload.is_some() {
-            bail!("Only copy/template requests require a streamed payload");
+        if (matches!(self.module.as_str(), "copy" | "template")
+            || self.module == "unarchive"
+                && self
+                    .args
+                    .get("remote_src")
+                    .and_then(serde_yaml::Value::as_bool)
+                    != Some(true))
+            != self.payload.is_some()
+        {
+            bail!("Streamed payload is required only by copy/template and controller-source unarchive");
         }
         if let Some(payload) = &self.payload {
             if payload.sha256.len() != 64

@@ -68,6 +68,8 @@ fn run(
         "group" => return crate::accounts::execute_group(&request.args, request.check),
         "wait_for" => return crate::wait::execute(request),
         "uri" => return crate::http::uri(request),
+        "git" => return crate::artifacts::git(request),
+        "unarchive" => return crate::artifacts::unarchive(request, scratch, payload),
         "copy" | "template" => {
             return crate::files::copy(
                 &request.args,
