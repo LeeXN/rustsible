@@ -6,6 +6,23 @@ use std::path::PathBuf;
 use std::process::Command;
 use tempfile::{NamedTempFile, TempDir};
 
+mod support;
+fn controller() -> Command {
+    let mut command = Command::new(env!("CARGO_BIN_EXE_rustsible"));
+    command.arg("--worker-dir").arg(support::worker_bundle());
+    command
+}
+fn run_playbook(file: &str, inventory: &inventory::Inventory) -> Result<()> {
+    playbook::execute_with_options(
+        file,
+        inventory,
+        &playbook::ExecutionOptions {
+            worker_dir: Some(support::worker_bundle()),
+            ..playbook::ExecutionOptions::default()
+        },
+    )
+}
+
 fn fixture_file(contents: &str) -> NamedTempFile {
     let mut file = NamedTempFile::new().expect("create temporary fixture");
     file.write_all(contents.as_bytes())
@@ -54,7 +71,7 @@ fn sources_follow_playbook_directory_and_runtime_output_is_not_retemplated() -> 
             project.path().display()
         ),
     )?;
-    let output = Command::new(env!("CARGO_BIN_EXE_rustsible"))
+    let output = controller()
         .current_dir(unrelated.path())
         .args([
             "playbook",
@@ -111,7 +128,7 @@ fn play_and_task_connection_variables_control_the_actual_transport() -> Result<(
         directory.path().display()
     ));
     let inventory = inventory::parse(inventory_file.path().to_str().unwrap())?;
-    playbook::execute(playbook.path().to_str().unwrap(), &inventory)?;
+    run_playbook(playbook.path().to_str().unwrap(), &inventory)?;
     assert_eq!(
         std::fs::read_to_string(directory.path().join("play"))?,
         "127.0.0.1"
@@ -141,7 +158,7 @@ fn invalid_or_unresolved_connection_values_fail_before_writing() -> Result<()> {
             "- hosts: localhost\n  gather_facts: false\n  tasks:\n    - copy:\n        content: unsafe\n        dest: {}\n      vars:\n        {setting}\n", marker.display()
         ));
         assert!(
-            playbook::execute(playbook.path().to_str().unwrap(), &inventory).is_err(),
+            run_playbook(playbook.path().to_str().unwrap(), &inventory).is_err(),
             "{setting}"
         );
         assert!(!marker.exists(), "{setting}");
@@ -177,7 +194,7 @@ fn facts_obey_variable_precedence_without_becoming_templates() -> Result<()> {
         directory.path().display()
     ));
     let inventory = inventory::parse(inventory_file.path().to_str().unwrap())?;
-    playbook::execute(playbook.path().to_str().unwrap(), &inventory)?;
+    run_playbook(playbook.path().to_str().unwrap(), &inventory)?;
     for (file, expected) in [("play", "play"), ("task", "task"), ("facts", "Linux")] {
         assert_eq!(
             std::fs::read_to_string(directory.path().join(file))?,
@@ -208,7 +225,7 @@ fn loop_variables_resolve_task_paths_and_connection_settings_per_item() -> Resul
         directory.path().display()
     ));
     let inventory = inventory::parse(inventory_file.path().to_str().unwrap())?;
-    playbook::execute(playbook.path().to_str().unwrap(), &inventory)?;
+    run_playbook(playbook.path().to_str().unwrap(), &inventory)?;
     for name in ["first", "second"] {
         assert_eq!(std::fs::read_to_string(directory.path().join(name))?, name);
     }
@@ -241,7 +258,7 @@ fn registered_results_survive_plays_but_play_and_task_vars_do_not() -> Result<()
         marker.display()
     ));
     let inventory = inventory::parse(inventory_file.path().to_str().unwrap())?;
-    playbook::execute(playbook_file.path().to_str().unwrap(), &inventory)?;
+    run_playbook(playbook_file.path().to_str().unwrap(), &inventory)?;
     assert_eq!(std::fs::read_to_string(marker)?, "carried");
     Ok(())
 }
@@ -266,7 +283,7 @@ fn failed_hosts_stay_excluded_in_later_plays_while_healthy_hosts_continue() -> R
         output_dir.path().display()
     ));
     let inventory = inventory::parse(inventory_file.path().to_str().unwrap())?;
-    assert!(playbook::execute(playbook_file.path().to_str().unwrap(), &inventory).is_err());
+    assert!(run_playbook(playbook_file.path().to_str().unwrap(), &inventory).is_err());
     assert!(!output_dir.path().join("bad").exists());
     assert_eq!(std::fs::read(output_dir.path().join("good"))?, b"executed");
     Ok(())
@@ -292,7 +309,7 @@ fn explicit_setup_merges_target_facts_across_plays() -> Result<()> {
         marker.display()
     ));
     let inventory = inventory::parse(inventory_file.path().to_str().unwrap())?;
-    playbook::execute(playbook_file.path().to_str().unwrap(), &inventory)?;
+    run_playbook(playbook_file.path().to_str().unwrap(), &inventory)?;
     let contents = std::fs::read_to_string(marker)?;
     let parts: Vec<_> = contents.split(':').collect();
     assert_eq!(parts[0], "Linux");
@@ -317,7 +334,7 @@ fn disabled_facts_do_not_invent_target_time() -> Result<()> {
         marker.display()
     ));
     let inventory = inventory::parse(inventory_file.path().to_str().unwrap())?;
-    playbook::execute(playbook_file.path().to_str().unwrap(), &inventory)?;
+    run_playbook(playbook_file.path().to_str().unwrap(), &inventory)?;
     assert_eq!(std::fs::read_to_string(marker)?, "absent");
     Ok(())
 }
@@ -332,7 +349,7 @@ fn explicit_setup_rejects_arguments_before_later_modifications() -> Result<()> {
         marker.display()
     ));
     let inventory = inventory::parse(inventory_file.path().to_str().unwrap())?;
-    assert!(playbook::execute(playbook_file.path().to_str().unwrap(), &inventory).is_err());
+    assert!(run_playbook(playbook_file.path().to_str().unwrap(), &inventory).is_err());
     assert!(!marker.exists());
     Ok(())
 }
@@ -349,7 +366,7 @@ fn unreachable_hosts_are_not_ignored_and_are_not_reconnected_in_later_plays() ->
     let playbook_file = fixture_file(
         "- hosts: all\n  gather_facts: false\n  tasks:\n    - command: 'true'\n      ignore_errors: true\n- hosts: all\n  tasks:\n    - debug:\n        msg: must-not-run\n",
     );
-    let output = Command::new(env!("CARGO_BIN_EXE_rustsible"))
+    let output = controller()
         .args([
             "playbook",
             playbook_file.path().to_str().unwrap(),
@@ -377,7 +394,7 @@ fn playbook_error_and_recap_do_not_leak_no_log_payloads() -> Result<()> {
     let playbook_file = fixture_file(
         "- hosts: all\n  gather_facts: false\n  tasks:\n    - shell: echo private-payload >&2; exit 1\n      no_log: true\n- hosts: all\n  gather_facts: false\n  tasks:\n    - debug:\n        msg: must-not-run\n",
     );
-    let output = Command::new(env!("CARGO_BIN_EXE_rustsible"))
+    let output = controller()
         .args([
             "playbook",
             playbook_file.path().to_str().unwrap(),
@@ -408,7 +425,7 @@ fn test_integration_simple_playbook_local() -> Result<()> {
     let inventory = inventory::parse(inventory_path.to_str().unwrap())?;
 
     println!("Executing playbook: {:?}", playbook_path);
-    playbook::execute(playbook_path.to_str().unwrap(), &inventory)?;
+    run_playbook(playbook_path.to_str().unwrap(), &inventory)?;
 
     Ok(())
 }
@@ -426,6 +443,7 @@ fn test_check_mode_never_runs_command() -> Result<()> {
     let options = playbook::ExecutionOptions {
         limit: None,
         check_mode: true,
+        worker_dir: Some(support::worker_bundle()),
         ..playbook::ExecutionOptions::default()
     };
 
@@ -445,6 +463,7 @@ fn test_limit_that_matches_nothing_is_an_error() -> Result<()> {
     let options = playbook::ExecutionOptions {
         limit: Some("does-not-exist".to_string()),
         check_mode: false,
+        worker_dir: Some(support::worker_bundle()),
         ..playbook::ExecutionOptions::default()
     };
 
@@ -465,7 +484,7 @@ fn test_failed_playbook_returns_nonzero_exit_status() -> Result<()> {
         "---\n- name: failure\n  hosts: localhost\n  tasks:\n    - name: fail deliberately\n      command: 'false'\n",
     );
 
-    let status = Command::new(env!("CARGO_BIN_EXE_rustsible"))
+    let status = controller()
         .arg("playbook")
         .arg(playbook_file.path())
         .arg("-i")
@@ -483,7 +502,7 @@ fn test_unknown_module_returns_nonzero_exit_status() -> Result<()> {
         "---\n- name: unknown module\n  hosts: localhost\n  tasks:\n    - name: must fail\n      definitely_not_a_module:\n        value: true\n",
     );
 
-    let status = Command::new(env!("CARGO_BIN_EXE_rustsible"))
+    let status = controller()
         .arg("playbook")
         .arg(playbook_file.path())
         .arg("-i")
@@ -501,7 +520,7 @@ fn playbook_cli_prints_the_complete_parse_error_chain() -> Result<()> {
         "---\n- name: unsupported pre tasks\n  hosts: localhost\n  pre_tasks: []\n  tasks: []\n",
     );
 
-    let output = Command::new(env!("CARGO_BIN_EXE_rustsible"))
+    let output = controller()
         .arg("playbook")
         .arg(playbook_file.path())
         .arg("-i")
@@ -526,7 +545,7 @@ fn test_long_task_name_does_not_panic() -> Result<()> {
     );
     let inventory = inventory::parse(inventory_file.path().to_str().unwrap())?;
 
-    playbook::execute(playbook_file.path().to_str().unwrap(), &inventory)?;
+    run_playbook(playbook_file.path().to_str().unwrap(), &inventory)?;
     Ok(())
 }
 
@@ -538,7 +557,7 @@ fn test_builtin_fqcn_is_accepted() -> Result<()> {
     );
     let inventory = inventory::parse(inventory_file.path().to_str().unwrap())?;
 
-    playbook::execute(playbook_file.path().to_str().unwrap(), &inventory)?;
+    run_playbook(playbook_file.path().to_str().unwrap(), &inventory)?;
     Ok(())
 }
 
@@ -550,7 +569,7 @@ fn gathered_architecture_is_available_to_play_variables() -> Result<()> {
     );
     let inventory = inventory::parse(inventory_file.path().to_str().unwrap())?;
 
-    playbook::execute(playbook_file.path().to_str().unwrap(), &inventory)?;
+    run_playbook(playbook_file.path().to_str().unwrap(), &inventory)?;
     Ok(())
 }
 
@@ -564,7 +583,7 @@ fn test_check_mode_cli_does_not_modify_files() -> Result<()> {
         marker.display()
     ));
 
-    let status = Command::new(env!("CARGO_BIN_EXE_rustsible"))
+    let status = controller()
         .arg("playbook")
         .arg(playbook_file.path())
         .arg("-i")
@@ -592,7 +611,7 @@ fn documented_subset_examples_remain_parseable() -> Result<()> {
         "manual/cleanup-local.yml",
     ] {
         let path = manifest_dir.join("examples").join(relative_path);
-        let error = playbook::execute(path.to_str().unwrap(), &inventory).unwrap_err();
+        let error = run_playbook(path.to_str().unwrap(), &inventory).unwrap_err();
         let message = format!("{error:#}");
         assert!(
             message.contains("No hosts matched"),
@@ -605,7 +624,7 @@ fn documented_subset_examples_remain_parseable() -> Result<()> {
 #[test]
 fn ad_hoc_setup_and_stat_support_native_argument_forms_and_json_results() -> Result<()> {
     let inventory_file = local_inventory();
-    let setup = Command::new(env!("CARGO_BIN_EXE_rustsible"))
+    let setup = controller()
         .args(["ad-hoc", "localhost", "-m", "ansible.builtin.setup", "-i"])
         .arg(inventory_file.path())
         .output()?;
@@ -621,7 +640,7 @@ fn ad_hoc_setup_and_stat_support_native_argument_forms_and_json_results() -> Res
     let directory = TempDir::new()?;
     let inspected = directory.path().join("missing file");
     let arguments = serde_json::json!({"path": inspected}).to_string();
-    let stat = Command::new(env!("CARGO_BIN_EXE_rustsible"))
+    let stat = controller()
         .args(["ad-hoc", "localhost", "-m", "stat", "-a", &arguments, "-i"])
         .arg(inventory_file.path())
         .output()?;
@@ -639,7 +658,7 @@ fn ad_hoc_setup_and_stat_support_native_argument_forms_and_json_results() -> Res
 #[test]
 fn ad_hoc_invalid_json_fails_before_opening_a_connection() -> Result<()> {
     let inventory_file = local_inventory();
-    let output = Command::new(env!("CARGO_BIN_EXE_rustsible"))
+    let output = controller()
         .args(["ad-hoc", "localhost", "-m", "stat", "-a", "{broken", "-i"])
         .arg(inventory_file.path())
         .output()?;
@@ -671,7 +690,7 @@ fn interrupted_mutation_is_uncertain_not_ignored_or_replayed() -> Result<()> {
         marker.display(),
         later.display()
     ));
-    let output = Command::new(env!("CARGO_BIN_EXE_rustsible"))
+    let output = controller()
         .args([
             "playbook",
             playbook.path().to_str().unwrap(),
@@ -696,8 +715,7 @@ fn both_frontends_reject_unknown_arguments_even_in_check_mode() -> Result<()> {
     let inventory =
         fixture_file("[all]\nnode ansible_connection=ssh ansible_host=must-not-connect.invalid\n");
     let playbook = fixture_file("- hosts: all\n  gather_facts: false\n  tasks:\n    - ansible.builtin.command:\n        cmd: echo x\n        unknown: true\n");
-    let binary = env!("CARGO_BIN_EXE_rustsible");
-    let adhoc = Command::new(binary)
+    let adhoc = controller()
         .args([
             "ad-hoc",
             "all",
@@ -710,7 +728,7 @@ fn both_frontends_reject_unknown_arguments_even_in_check_mode() -> Result<()> {
             "--check",
         ])
         .output()?;
-    let book = Command::new(binary)
+    let book = controller()
         .args([
             "playbook",
             playbook.path().to_str().unwrap(),

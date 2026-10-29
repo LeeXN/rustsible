@@ -1,40 +1,12 @@
 use super::ModuleResult;
 use crate::ssh::connection::TransportFailure;
+#[cfg(test)]
 use serde_yaml::Value;
+#[cfg(test)]
 use std::collections::HashMap;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Outcome {
-    Ok,
-    Failed,
-    Skipped,
-    Unreachable,
-    Uncertain,
-}
-impl Outcome {
-    pub fn from_flags(failed: bool, skipped: bool, unreachable: bool, uncertain: bool) -> Self {
-        if uncertain {
-            Self::Uncertain
-        } else if unreachable {
-            Self::Unreachable
-        } else if failed {
-            Self::Failed
-        } else if skipped {
-            Self::Skipped
-        } else {
-            Self::Ok
-        }
-    }
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Self::Ok => "ok",
-            Self::Failed => "failed",
-            Self::Skipped => "skipped",
-            Self::Unreachable => "unreachable",
-            Self::Uncertain => "uncertain",
-        }
-    }
-}
+pub use rustsible_protocol::Outcome;
+pub(crate) use rustsible_protocol::{insert_output_values, result_fields};
 
 /// A connection failure happens before module dispatch; it must not be
 /// confused with losing the response of a potentially modifying task.
@@ -61,104 +33,43 @@ impl std::fmt::Display for ExecutionFailure {
 }
 impl std::error::Error for ExecutionFailure {}
 
-impl ModuleResult {
-    pub fn outcome(&self) -> Outcome {
-        Outcome::from_flags(
-            self.failed || self.rc.is_some_and(|rc| rc != 0),
-            self.skipped,
-            self.unreachable,
-            self.uncertain,
-        )
-    }
-    pub fn as_value(&self) -> Value {
-        let mut values = self.values.clone();
-        insert_output_values(
-            &mut values,
-            self.stdout.clone(),
-            self.stderr.clone(),
-            self.rc,
-        );
-        Value::Mapping(result_fields(
-            self.changed,
-            self.outcome(),
-            &self.msg,
-            &values,
-        ))
-    }
-    pub(crate) fn from_error(error: anyhow::Error, may_modify: bool) -> Self {
-        let outcome = if let Some(failure) = error.downcast_ref::<ExecutionFailure>() {
-            failure.outcome
-        } else if let Some(failure) = error.downcast_ref::<TransportFailure>() {
-            if may_modify && failure.started {
-                Outcome::Uncertain
-            } else if failure.remote {
-                Outcome::Unreachable
-            } else {
-                Outcome::Failed
-            }
+pub(crate) fn from_error(error: anyhow::Error, may_modify: bool) -> ModuleResult {
+    let outcome = if let Some(failure) = error.downcast_ref::<ExecutionFailure>() {
+        failure.outcome
+    } else if let Some(failure) = error.downcast_ref::<TransportFailure>() {
+        if may_modify && failure.started {
+            Outcome::Uncertain
+        } else if failure.remote {
+            Outcome::Unreachable
         } else {
             Outcome::Failed
-        };
-        let mut messages = Vec::new();
-        for cause in error.chain() {
-            let message = cause.to_string();
-            if messages.last() != Some(&message) {
-                messages.push(message);
-            }
         }
-        let output = error.downcast_ref::<CommandOutput>();
-        Self {
-            changed: known_changed(),
-            rc: output.map(|output| output.rc),
-            stdout: output
-                .map(|output| output.stdout.clone())
-                .unwrap_or_default(),
-            stderr: output
-                .map(|output| output.stderr.clone())
-                .unwrap_or_default(),
-            failed: true,
-            uncertain: outcome == Outcome::Uncertain,
-            unreachable: outcome == Outcome::Unreachable,
-            msg: messages.join(": "),
-            ..Self::default()
+    } else {
+        Outcome::Failed
+    };
+    let mut messages = Vec::new();
+    for cause in error.chain() {
+        let message = cause.to_string();
+        if messages.last() != Some(&message) {
+            messages.push(message);
         }
     }
-}
-
-/// Extra module fields cannot override the common execution outcome when
-/// flattened into an Ansible-style registered object.
-pub(crate) fn result_fields(
-    changed: bool,
-    outcome: Outcome,
-    message: &str,
-    values: &std::collections::HashMap<String, serde_yaml::Value>,
-) -> serde_yaml::Mapping {
-    use serde_yaml::Value;
-    let mut value = values
-        .iter()
-        .map(|(key, value)| (Value::String(key.clone()), value.clone()))
-        .collect::<serde_yaml::Mapping>();
-    for (key, flag) in [
-        ("changed", changed),
-        (
-            "failed",
-            matches!(
-                outcome,
-                Outcome::Failed | Outcome::Unreachable | Outcome::Uncertain
-            ),
-        ),
-        ("skipped", outcome == Outcome::Skipped),
-        ("unreachable", outcome == Outcome::Unreachable),
-        ("uncertain", outcome == Outcome::Uncertain),
-    ] {
-        value.insert(Value::String(key.into()), Value::Bool(flag));
+    let output = error.downcast_ref::<CommandOutput>();
+    ModuleResult {
+        changed: known_changed(),
+        rc: output.map(|output| output.rc),
+        stdout: output
+            .map(|output| output.stdout.clone())
+            .unwrap_or_default(),
+        stderr: output
+            .map(|output| output.stderr.clone())
+            .unwrap_or_default(),
+        failed: true,
+        uncertain: outcome == Outcome::Uncertain,
+        unreachable: outcome == Outcome::Unreachable,
+        msg: messages.join(": "),
+        ..ModuleResult::default()
     }
-    value.insert(
-        Value::String("outcome".into()),
-        Value::String(outcome.as_str().into()),
-    );
-    value.insert(Value::String("msg".into()), Value::String(message.into()));
-    value
 }
 
 #[cfg(test)]
@@ -243,30 +154,6 @@ pub(crate) fn command_error(
     })
 }
 
-pub(crate) fn insert_output_values(
-    values: &mut HashMap<String, Value>,
-    stdout: String,
-    stderr: String,
-    rc: Option<i32>,
-) {
-    let stdout_lines = stdout
-        .lines()
-        .map(|line| Value::String(line.to_string()))
-        .collect();
-    let stderr_lines = stderr
-        .lines()
-        .map(|line| Value::String(line.to_string()))
-        .collect();
-    values.insert("stdout".to_string(), Value::String(stdout));
-    values.insert("stderr".to_string(), Value::String(stderr));
-    values.insert("stdout_lines".to_string(), Value::Sequence(stdout_lines));
-    values.insert("stderr_lines".to_string(), Value::Sequence(stderr_lines));
-    values.insert(
-        "rc".to_string(),
-        rc.map_or(Value::Null, |code| Value::Number(code.into())),
-    );
-}
-
 #[cfg(test)]
 mod accounting_tests {
     use super::*;
@@ -281,7 +168,7 @@ mod accounting_tests {
                 "available output".into(),
                 "available error".into(),
             );
-            let result = ModuleResult::from_error(error, true);
+            let result = from_error(error, true);
             assert!(result.changed);
             assert_eq!(result.rc, Some(42));
             assert_eq!(result.stdout, "available output");
@@ -303,7 +190,9 @@ mod accounting_tests {
         )
         .unwrap();
         assert_eq!(
-            invocation.execute(None, &HashMap::new()).outcome(),
+            invocation
+                .execute(None, &HashMap::new(), &crate::worker::Runtime::default())
+                .outcome(),
             Outcome::Skipped
         );
     }

@@ -5,8 +5,8 @@ use crate::modules::file::quote_posix_shell_arg;
 use crate::ssh::connection::SshConnection;
 
 /// Run a small module payload on the managed host. Python is the same remote
-/// runtime required by ansible-core, so downloads and fact discovery observe
-/// the managed host's DNS, proxy, and TLS configuration.
+/// runtime still used by the transitional downloader, which observes the
+/// managed host's DNS, proxy, and TLS configuration.
 pub(crate) fn execute_json_mapping(
     connection: &dyn SshConnection,
     script: &str,

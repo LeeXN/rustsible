@@ -153,3 +153,9 @@ mod tests {
         assert_yaml_eq(&val1, &val2);
     }
 }
+
+#[cfg(test)]
+#[path = "../../tests/support/mod.rs"]
+mod workers;
+#[cfg(test)]
+pub(crate) use workers::worker_bundle;

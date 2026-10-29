@@ -2,7 +2,7 @@ use anyhow::{bail, Context, Result};
 use serde_yaml::Value;
 use std::collections::HashMap;
 
-use super::{ModuleExecutor, ModuleResult};
+use super::ModuleResult;
 use crate::ssh::{config::ConnectionConfig, connection::Connection};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -145,7 +145,7 @@ impl Builtin {
     /// before an implementation can perform its first state change.
     pub fn validate_parameters(self, args: &Value) -> Result<()> {
         if matches!(self, Self::Command | Self::Shell) {
-            let command = super::command::CommandModule::extract_command_arg(args)?;
+            let command = super::extract_command_arg(args)?;
             if command.trim().is_empty() || command.contains('\0') {
                 bail!("Command must be non-empty without NUL bytes");
             }
@@ -347,6 +347,7 @@ impl Invocation {
         mut self,
         config: Option<&ConnectionConfig>,
         vars: &HashMap<String, Value>,
+        runtime: &crate::worker::Runtime,
     ) -> ModuleResult {
         self.check |= super::result::is_check_active();
         let _changes = super::result::ChangeScope::enter(self.check);
@@ -365,6 +366,9 @@ impl Invocation {
                 return super::debug::execute_without_connection(&self.args);
             }
             let config = config.context("Target module needs a connection configuration")?;
+            if rustsible_protocol::NATIVE_MODULES.contains(&self.module.name()) {
+                return runtime.execute(config, self.module.name(), self.args.clone(), self.check);
+            }
             let connection = Connection::from_config(config)
                 .map_err(|error| super::ExecutionFailure::unreachable(error).into_error())?;
             self.dispatch(
@@ -380,7 +384,7 @@ impl Invocation {
                 result.changed |= super::result::known_changed();
                 result
             }
-            Err(error) => ModuleResult::from_error(
+            Err(error) => crate::modules::result::from_error(
                 error,
                 self.module.check_support() != CheckSupport::ReadOnly && !self.check,
             ),
@@ -395,10 +399,9 @@ impl Invocation {
     ) -> Result<ModuleResult> {
         let args = &self.args;
         match self.module {
-            Builtin::Command => {
-                super::command::execute(connection, args, use_become, user, self.check)
+            Builtin::Command | Builtin::Shell | Builtin::Setup | Builtin::Stat => {
+                unreachable!("Native modules use the worker")
             }
-            Builtin::Shell => super::shell::execute(connection, args, use_become, user, self.check),
             Builtin::Copy => super::copy::execute(connection, args, use_become, user, self.check),
             Builtin::File => super::file::execute(connection, args, use_become, user, self.check),
             Builtin::Template => super::template::execute_with_context(
@@ -414,8 +417,6 @@ impl Invocation {
             Builtin::Systemd => {
                 super::service::execute_systemd(connection, args, use_become, user, self.check)
             }
-            Builtin::Setup => super::setup::execute(connection, use_become, user),
-            Builtin::Stat => super::stat::execute(connection, args, use_become, user, self.check),
             Builtin::GetUrl => {
                 super::get_url::execute(connection, args, use_become, user, self.check)
             }
@@ -476,7 +477,9 @@ mod tests {
             Invocation::prepare("shell", &Value::String("echo x".into()), true).unwrap();
         assert!(!invocation.needs_connection());
         assert_eq!(
-            invocation.execute(None, &HashMap::new()).outcome(),
+            invocation
+                .execute(None, &HashMap::new(), &crate::worker::Runtime::default())
+                .outcome(),
             super::super::Outcome::Skipped
         );
     }

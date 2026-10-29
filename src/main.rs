@@ -58,6 +58,9 @@ fn main() -> Result<()> {
                 limit: sub_matches.get_one::<String>("limit").cloned(),
                 check_mode: sub_matches.get_flag("check"),
                 forks,
+                worker_dir: sub_matches
+                    .get_one::<std::path::PathBuf>("worker-dir")
+                    .cloned(),
             };
             let result = playbook::execute_with_options(playbook_file, &inventory, &options);
 
@@ -98,6 +101,9 @@ fn main() -> Result<()> {
                 become_user: sub_matches.get_one::<String>("become-user").cloned(),
                 check_mode: sub_matches.get_flag("check"),
                 forks,
+                worker_dir: sub_matches
+                    .get_one::<std::path::PathBuf>("worker-dir")
+                    .cloned(),
             };
             let result = modules::run_adhoc_with_options(&hosts, module, args, &options);
             if let Err(e) = result {

@@ -557,6 +557,11 @@ pub(crate) fn validate_resolved_connection_variable(
             key
         );
     }
+    if key == "rustsible_remote_tmp"
+        && (!std::path::Path::new(value).is_absolute() || value.chars().any(char::is_control))
+    {
+        bail!("rustsible_remote_tmp must be an absolute path without control characters");
+    }
     if matches!(key, "ansible_connection" | "ansible_connection_type")
         && !matches!(
             value.trim().to_ascii_lowercase().as_str(),
@@ -577,6 +582,7 @@ pub(crate) fn validate_yaml_connection_variable(key: &str, value: &Value) -> Res
 
 pub(crate) fn validate_resolved_yaml_connection_variable(key: &str, value: &Value) -> Result<()> {
     let string_variables = [
+        "rustsible_remote_tmp",
         "ansible_host",
         "ansible_ssh_host",
         "ansible_user",

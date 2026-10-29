@@ -1,0 +1,180 @@
+mod modules;
+mod process;
+mod supervisor;
+use anyhow::{bail, Result};
+use rustsible_protocol::{
+    Hello, ModuleResult, Request, Response, BUILD_ID, MAX_REQUEST_BYTES, MAX_RESPONSE_BYTES,
+    NATIVE_MODULES, VERSION,
+};
+use std::{
+    fs,
+    io::{self, Read},
+    os::{
+        fd::FromRawFd,
+        unix::fs::{MetadataExt, PermissionsExt},
+    },
+    time::Duration,
+};
+
+fn main() {
+    // Neither panic diagnostics nor core files may expose a request's secrets.
+    std::panic::set_hook(Box::new(|_| eprintln!("Native worker internal failure")));
+    unsafe {
+        let limit = libc::rlimit {
+            rlim_cur: 0,
+            rlim_max: 0,
+        };
+        libc::setrlimit(libc::RLIMIT_CORE, &limit);
+    }
+    if run().is_err() {
+        eprintln!("Native worker protocol/execution failure");
+        std::process::exit(1);
+    }
+}
+fn run() -> Result<()> {
+    if std::env::consts::OS != "linux" {
+        bail!("Native workers require Linux");
+    }
+    let mut args = std::env::args().skip(1);
+    let action = args.next();
+    if args.next().is_some() || !matches!(action.as_deref(), Some("--handshake" | "--serve")) {
+        bail!("Expected worker --handshake or --serve");
+    }
+    if std::env::var("RUSTSIBLE_BOOTSTRAP_DIR_FD").as_deref() == Ok("3") {
+        // The bootstrap's directory handle must not leak into business tools.
+        unsafe {
+            libc::close(3);
+        }
+        std::env::remove_var("RUSTSIBLE_BOOTSTRAP_DIR_FD");
+    }
+    let _managed_directory = ManagedDirectory::detect()?;
+    supervisor::prepare()?;
+    let hello = Hello {
+        version: VERSION,
+        build_id: BUILD_ID.into(),
+        os: "linux".into(),
+        arch: std::env::consts::ARCH.into(),
+        uid: unsafe { libc::geteuid() },
+        modules: NATIVE_MODULES.iter().map(|name| (*name).into()).collect(),
+    };
+    let mut output = io::stdout().lock();
+    rustsible_protocol::write_frame(&mut output, &hello, MAX_RESPONSE_BYTES)?;
+    if action.as_deref() == Some("--handshake") {
+        return Ok(());
+    }
+    // No buffering: the supervisor must see EOF as soon as the controller dies.
+    let descriptor = unsafe { libc::fcntl(0, libc::F_DUPFD_CLOEXEC, 3) };
+    if descriptor < 0 {
+        return Err(io::Error::last_os_error().into());
+    }
+    let mut input = Input(unsafe { fs::File::from_raw_fd(descriptor) });
+    loop {
+        let mut first = [0];
+        match input.read(&mut first) {
+            Ok(0) => return Ok(()),
+            Ok(_) => {}
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => return Ok(()),
+            Err(error) => return Err(error.into()),
+        }
+        let request: Request = match rustsible_protocol::read_frame(
+            &mut first.as_slice().chain(&mut input),
+            MAX_REQUEST_BYTES,
+        ) {
+            Ok(request) => request,
+            Err(_) => {
+                rustsible_protocol::write_frame(
+                    &mut output,
+                    &Response::new(ModuleResult {
+                        failed: true,
+                        msg: "Invalid worker request frame".into(),
+                        ..ModuleResult::default()
+                    }),
+                    MAX_RESPONSE_BYTES,
+                )?;
+                return Ok(());
+            }
+        };
+        if let Err(error) = request.validate() {
+            rustsible_protocol::write_frame(
+                &mut output,
+                &Response::new(ModuleResult {
+                    failed: true,
+                    msg: error.to_string(),
+                    ..ModuleResult::default()
+                }),
+                MAX_RESPONSE_BYTES,
+            )?;
+            return Ok(());
+        }
+        let execution = supervisor::run(
+            Duration::from_millis(request.timeout_ms),
+            request.managed,
+            matches!(request.module.as_str(), "command" | "shell") && !request.check,
+            |scratch| modules::execute(&request, scratch),
+        )?;
+        rustsible_protocol::write_frame(
+            &mut output,
+            &Response::new(execution.result),
+            MAX_RESPONSE_BYTES,
+        )?;
+        if execution.cancelled {
+            return Ok(());
+        }
+    }
+}
+
+/// The bootstrap normally removes its directory. On abrupt SSH disconnect its
+/// shell may die before EXIT runs, so the worker also owns a bounded cleanup.
+struct ManagedDirectory(Option<std::path::PathBuf>);
+impl ManagedDirectory {
+    fn detect() -> Result<Self> {
+        let executable = std::env::current_exe()?;
+        let directory = executable.parent().filter(|directory| {
+            directory
+                .file_name()
+                .and_then(|name| name.to_str())
+                .and_then(|name| name.strip_prefix(".rustsible-worker-"))
+                .is_some_and(|suffix| {
+                    suffix.len() >= 10 && suffix.bytes().all(|byte| byte.is_ascii_alphanumeric())
+                })
+        });
+        if let Some(directory) = directory {
+            let metadata = fs::symlink_metadata(directory)?;
+            if metadata.is_dir()
+                && metadata.uid() == unsafe { libc::geteuid() }
+                && metadata.permissions().mode() & 0o777 == 0o700
+            {
+                return Ok(Self(Some(directory.to_path_buf())));
+            }
+        }
+        Ok(Self(None))
+    }
+}
+impl Drop for ManagedDirectory {
+    fn drop(&mut self) {
+        if let Some(directory) = &self.0 {
+            if fs::remove_dir_all(directory)
+                .is_err_and(|error| error.kind() != io::ErrorKind::NotFound)
+            {
+                eprintln!("Native worker private-directory cleanup failed");
+            }
+        }
+    }
+}
+struct Input(fs::File);
+impl Read for Input {
+    fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
+        loop {
+            if supervisor::interrupted() {
+                return Err(io::Error::new(
+                    io::ErrorKind::ConnectionAborted,
+                    "Worker cancelled",
+                ));
+            }
+            match self.0.read(buffer) {
+                Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+                result => return result,
+            }
+        }
+    }
+}

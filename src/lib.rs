@@ -4,3 +4,5 @@ pub mod modules;
 pub mod playbook;
 pub mod ssh;
 pub mod testing;
+
+pub(crate) mod worker;
