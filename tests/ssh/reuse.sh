@@ -28,3 +28,38 @@ docker exec "$container" sh -eu -c '
     [ -z "$(find /tmp -type d -name ".rustsible-worker-*")" ]
 '
 printf 'SSH task reuse/recovery passed (%s/%s): three identities, imported sources, role dependencies/params/templates, handler phases/listen, dynamic conditions, rescue/always, check and cleanup\n' "$target_arch" "$libc"
+
+cat > "$fixture_dir/inherited-inventory" <<EOF
+node ansible_connection=ssh ansible_host=127.0.0.1 ansible_port=$port ansible_user=deploy ansible_ssh_private_key_file=$fixture_dir/key rustsible_known_hosts_file=$fixture_dir/known_hosts
+EOF
+cat > "$fixture_dir/inherited.yml" <<'EOF'
+- hosts: all
+  gather_facts: false
+  become: true
+  become_user: root
+  tasks:
+    - block:
+        - command: id -un
+          register: inherited_identity
+        - copy:
+            content: '{{ inherited_identity.stdout }}'
+            dest: /srv/rustsible/app/reuse/inherited-identity
+      become: true
+      become_user: app
+    - block:
+        - command: id -un
+          register: direct_identity
+        - copy:
+            content: '{{ direct_identity.stdout }}'
+            dest: /srv/rustsible/plain/reuse/inherited-identity
+      become: false
+EOF
+rustsible playbook "$fixture_dir/inherited.yml" -i "$fixture_dir/inherited-inventory" > "$fixture_dir/inherited.log"
+docker exec "$container" sh -eu -c '
+    [ "$(cat /srv/rustsible/app/reuse/inherited-identity)" = app ]
+    [ "$(stat -c %U /srv/rustsible/app/reuse/inherited-identity)" = app ]
+    [ "$(cat /srv/rustsible/plain/reuse/inherited-identity)" = deploy ]
+    [ "$(stat -c %U /srv/rustsible/plain/reuse/inherited-identity)" = deploy ]
+    [ -z "$(find /tmp -type d -name ".rustsible-worker-*")" ]
+'
+printf 'SSH lexical become inheritance passed (%s/%s): app block and explicit false override play root defaults\n' "$target_arch" "$libc"

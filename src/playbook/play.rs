@@ -1192,19 +1192,19 @@ impl Play {
         crate::vars::merge(&mut defaults, effective_task.scope.defaults.clone());
         effective_task.scope.defaults = defaults;
         effective_task.become_override = effective_task.become_override.or(self.become_override);
-        effective_task.become_user_override = task
+        effective_task.become_user_override = effective_task
             .become_user_override
             .clone()
             .or_else(|| self.become_user_override.clone());
         let mut environment = self.environment.clone();
         environment.extend(effective_task.environment.clone());
         effective_task.environment = environment;
-        effective_task.is_become = task
+        effective_task.is_become = effective_task
             .become_override
             .or(self.become_override)
             .or_else(|| host.get_become())
             .unwrap_or(false);
-        effective_task.become_user = task
+        effective_task.become_user = effective_task
             .become_user_override
             .clone()
             .or_else(|| self.become_user_override.clone())
@@ -1619,6 +1619,27 @@ esac
         let task_override = play.apply_play_settings(&task_override, &host);
         assert!(task_override.is_become);
         assert_eq!(task_override.become_user, "task-user");
+    }
+
+    #[test]
+    fn lexical_become_settings_survive_play_defaults_and_child_false() {
+        let host = create_local_host();
+        let mut play = create_test_play();
+        play.become_override = Some(true);
+        play.become_user_override = Some("root".into());
+        let mut parent = create_command_task("Block", "true");
+        parent.become_override = Some(true);
+        parent.become_user_override = Some("app".into());
+        let mut child = create_command_task("Child", "true");
+        child.inherit(&parent);
+        let inherited = play.apply_play_settings(&child, &host);
+        assert_eq!(inherited.become_user_override.as_deref(), Some("app"));
+        assert_eq!(inherited.become_user, "app");
+        assert!(inherited.is_become);
+        child.become_override = Some(false);
+        let disabled = play.apply_play_settings(&child, &host);
+        assert!(!disabled.is_become);
+        assert_eq!(disabled.become_override, Some(false));
     }
 
     #[test]
