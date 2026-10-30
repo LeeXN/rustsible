@@ -48,6 +48,7 @@ cat > "$fixture_dir/release.yml" <<'YAML'
         that: inventory_hostname == 'node1' or hostvars.node1.batch_done | default(false)
     - command:
         argv: [cat, /srv/rustsible/rollout/config]
+        strip_empty_ends: false
       register: previous_configuration
       changed_when: false
       no_log: true
@@ -122,16 +123,18 @@ rustsible playbook "$fixture_dir/release.yml" "${release_options[@]}" --diff > "
 [[ $(grep -c 'changed=0 unreachable=0 failed=0' "$fixture_dir/release-second.log") == 3 ]]
 for index in 0 1 2; do
     server=${rollout_containers[$index]}; user=${users[$index]}; name=node$((index + 1))
+    config_sha=$(printf 'release-v1|release-secret-canary|%s\n' "$name" | sha256sum); config_sha=${config_sha%% *}
     docker exec "$server" sh -eu -c '
         [ "$(cat /srv/rustsible/rollout/config)" = "release-v1|release-secret-canary|$1" ]
         cmp /srv/rustsible/rollout/config /srv/rustsible/rollout/applied
+        [ "$(sha256sum /srv/rustsible/rollout/config | cut -d " " -f 1)" = "$4" ]
         [ "$(sha256sum /srv/rustsible/rollout/artifact | cut -d " " -f 1)" = "$3" ]
         [ "$(stat -c %U:%a /srv/rustsible/rollout/config)" = "$2:755" ]
         [ "$(stat -c %U:%a /srv/rustsible/rollout/artifact)" = "$2:755" ]
         [ -z "$(find /tmp -name ".rustsible-worker-*")" ]
         ! command -v python3
         ! command -v curl
-    ' sh "$name" "$user" "$payload_sha"
+    ' sh "$name" "$user" "$payload_sha" "$config_sha"
 done
 # Failure happens after deployment and the real reload. Rescue must restore the
 # previous protected config, reload it, and let the remaining host finish.
@@ -141,12 +144,13 @@ grep -Eq '^node2[[:space:]]+.*unreachable=0 failed=0 .*rescued=1' "$fixture_dir/
 for index in 0 1 2; do
     server=${rollout_containers[$index]}; name=node$((index + 1)); version=release-v2
     if (( index == 1 )); then version=release-v1; fi
+    config_sha=$(printf '%s|release-secret-canary|%s\n' "$version" "$name" | sha256sum); config_sha=${config_sha%% *}
     docker exec "$server" sh -eu -c '
         [ "$(cat /srv/rustsible/rollout/config)" = "$2|release-secret-canary|$1" ]
-        # Command output retains its newline, so rollback restores exact bytes.
+        [ "$(sha256sum /srv/rustsible/rollout/config | cut -d " " -f 1)" = "$3" ]
         cmp /srv/rustsible/rollout/config /srv/rustsible/rollout/applied
         if [ "$1" = node2 ]; then [ "$(cat /srv/rustsible/rollout/rescued)" = rescued ]; else [ ! -e /srv/rustsible/rollout/rescued ]; fi
-    ' sh "$name" "$version"
+    ' sh "$name" "$version" "$config_sha"
 done
 cat > "$fixture_dir/background.yml" <<EOF
 - hosts: rollout
