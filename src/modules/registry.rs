@@ -306,7 +306,7 @@ impl Invocation {
             }
             Ok(launched)
         })();
-        let completed = match result {
+        let mut completed = match result {
             Ok(mut result) => {
                 result.failed |= result.rc.is_some_and(|rc| rc != 0);
                 result.changed |= super::result::known_changed();
@@ -329,6 +329,11 @@ impl Invocation {
                 result
             }
         };
+        if runtime.diff_enabled() {
+            completed.limit_diff();
+        } else {
+            completed.values.remove("diff");
+        }
         runtime
             .extensions
             .notify(&crate::extensions::compiled::Completion {

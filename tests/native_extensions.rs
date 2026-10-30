@@ -145,12 +145,16 @@ fn native_extension_crashes_and_timeout_reap_detached_descendants() -> Result<()
             "fixture.native.timeout",
             serde_json::json!({"path":path}),
             false,
-            1500,
+            // Cold native ARM runners also hash and start the controller and
+            // peer under concurrent test load. Leave startup headroom while
+            // staying below the fixture's 30-second business operation.
+            15000,
         )?,
         None,
     )?;
     assert!(result.failed && result.uncertain, "{}", result.msg);
-    let pid = fs::read_to_string(&path)?;
+    let pid = fs::read_to_string(&path)
+        .context("Detached fixture child did not start before the extension deadline")?;
     assert!(!Path::new(&format!("/proc/{}", pid.trim())).exists());
     std::thread::sleep(Duration::from_millis(5));
     Ok(())
@@ -268,6 +272,26 @@ fn configured_native_modules_run_through_ad_hoc_playbook_and_async() -> Result<(
         String::from_utf8_lossy(&actual.stderr)
     );
     assert_eq!(fs::read_to_string(&path)?, "playbook-native");
+    let large = serde_json::json!({"path":path,"content":"é".repeat(40000)}).to_string();
+    let output = Command::new(env!("CARGO_BIN_EXE_rustsible"))
+        .arg("--worker-dir")
+        .arg(support::worker_bundle())
+        .args(["ad-hoc", "localhost", "-i"])
+        .arg(&inventory)
+        .arg("--collections-path")
+        .arg(&collections)
+        .args(["-m", "fixture.native.write", "-a"])
+        .arg(large)
+        .arg("--diff")
+        .output()?;
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(fs::metadata(&path)?.len(), 80000);
+    assert!(output.stdout.len() < 4096);
+    assert!(String::from_utf8_lossy(&output.stdout).contains("content_omitted"));
     Ok(())
 }
 
