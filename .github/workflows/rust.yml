@@ -197,6 +197,8 @@ jobs:
         with:
           pattern: native-*
           path: target/native
+      - name: Restore executable mode on downloaded acceptance fixtures
+        run: chmod +x target/native/native-*/examples/http_fixture
       - name: Enable the explicitly emulated foreign controller case
         uses: docker/setup-qemu-action@v3
         with:
