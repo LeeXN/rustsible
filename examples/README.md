@@ -1,106 +1,33 @@
-# Rustsible 示例
+[English / 简体中文](README.zh-CN.md)
 
-这个目录展示 Rustsible 当前注册的模块和 playbook 写法。项目并非 Ansible 的
-完整替代品；运行示例前，请先使用 `--check`，并把 inventory 中的占位主机和
-凭据替换为测试环境配置。
+# Rustsible examples
 
-## 目录
+Run from the repository or extracted bundle root. Both languages use the same configuration assets; actual execution requires a fresh private directory. Every example supports offline syntax inspection, which does not establish readiness of missing external prerequisites.
 
-```text
-examples/
-├── inventory/hosts
-├── playbooks/
-│   ├── test_all_features.yml
-│   ├── test_all_modules.yml
-│   ├── test_command.yml
-│   ├── test_lineinfile.yml
-│   ├── test_package.yml
-│   ├── test_service.yml
-│   ├── test_shell.yml
-│   └── test_user.yml
-└── templates/motd.j2
-```
+| Scenario | Behavior and prerequisites |
+|---|---|
+| [quickstart](quickstart/playbook.yml) | Local files, handler, exact second-run idempotence; demo_root required. |
+| [inventory](inventory/hosts) | INI local group selection; no remote address or credential. |
+| [variables](variables/playbook.yml) | Typed loops and facts across plays; existing demo_root. |
+| [files](files/playbook.yml) | Template and line repair; demo_root required. |
+| [roles](roles/main.yml) | Static import, role, handlers and intentional rescue; demo_output required. |
+| [selection](selection/playbook.yml) | deploy/diagnostics tags; no target writes. |
+| [rolling](rolling/playbook.yml) | Three logical local hosts; demo_root is a fresh path prefix. SSH requires your reviewed inventory. |
+| [async](async/playbook.yml) | Native job launch/query/cleanup; fresh demo_root. |
+| [assertions](assertions/playbook.yml) | Boolean conditions and deliberate fail/rescue; no business files. |
+| [vault](vault/playbook.yml) | Prepared encrypted vault_variables with example_value; existing demo_root. |
+| [http](http/playbook.yml) | Requires your isolated health_host/health_port/health_url service; no server installed automatically. |
+| [artifacts](artifacts/playbook.yml) | Requires reviewed source_repo/release_revision/archive_source, Git on target, demo_root. |
+| [native-collection](native-collection/README.md) | Explicitly build/install the sample native collection; see its README. |
 
-`test_all_features.yml` 和 `test_package.yml` 是迁移审查素材，刻意保留了
-`file.recurse` 参数和 `regex_replace` 过滤器等当前未支持的功能，不能视为可运行验收。其余文件
-用于当前子集的示例，但也不构成完整兼容性保证。遇到不支持的模块、关键字或表达式时，
-Rustsible 会返回错误，而不会静默忽略。
-
-`reuse/main.yml` 展示 playbook 导入、角色模板与参数、动态任务文件、listen
-handler 和 block/rescue/always。用本地 inventory 运行，文件仅写入
-`/tmp/rustsible-reuse-demo`；可用 `-e demo_output=/其他测试目录` 改路径。
-`--check` 下 command 不执行，救援分支不会为了示例而制造失败。
-
-`rolling/playbook.yml` 与 `rolling/inventory` 展示三台逻辑主机按 `[1, 2]`
-滚动执行、批次内 run_once、配置 handler、健康读取和委派到控制端的回执。
-默认 inventory 使用 local，文件仅写入 `/tmp/rustsible-rolling-demo*`。
-替换成 SSH inventory 后可用于隔离目标；三台独立 SSH 服务器的验收在
-`tests/ssh/strategy.sh`。运行示例：
+## Local start
 
 ```bash
-rustsible playbook examples/rolling/playbook.yml -i examples/rolling/inventory --check
-rustsible playbook examples/rolling/playbook.yml -i examples/rolling/inventory
+demo_root=$(mktemp -d)
+rustsible playbook examples/quickstart/playbook.yml -i examples/quickstart/inventory.yml -e "demo_root=$demo_root" --check --diff
+rustsible playbook examples/quickstart/playbook.yml -i examples/quickstart/inventory.yml -e "demo_root=$demo_root"
+rustsible playbook examples/quickstart/playbook.yml -i examples/quickstart/inventory.yml -e "demo_root=$demo_root"
+rustsible playbook examples/quickstart/cleanup.yml -i examples/quickstart/inventory.yml -e "demo_root=$demo_root"
 ```
 
-`async/playbook.yml` 与 `async/inventory` 展示后台启动、下一任务解锁执行、
-until 查询和显式清理。默认文件位于 `/tmp/rustsible-async-demo`，可用
-`-e demo_root=/其他测试目录` 改路径；全局 `--check` 不启动任务。
-
-```bash
-rustsible playbook examples/async/playbook.yml -i examples/async/inventory --check
-rustsible playbook examples/async/playbook.yml -i examples/async/inventory
-```
-
-`assertions.yml` 展示原始布尔表达式、断言消息和 fail/rescue。使用本地
-inventory 即可验证，不创建业务文件。`group` 会修改目标组数据库，完整的
-创建、GID 更新、幂等、删除和 check 场景在隔离 SSH fixture 中运行。
-
-## 运行
-
-```bash
-# 先预览，不写入目标机器
-rustsible playbook examples/playbooks/test_command.yml \
-  -i examples/inventory/hosts --limit localhost --check
-
-# 确认目标和变更后再执行
-rustsible playbook examples/playbooks/test_command.yml \
-  -i examples/inventory/hosts --limit localhost
-
-# 临时命令
-rustsible ad-hoc localhost -i examples/inventory/hosts \
-  -m command -a "uptime"
-```
-
-`command` 按参数列表执行，不解释管道或重定向；默认展开环境变量，但不会启动 shell。需要这些 shell
-语法时请显式使用 `shell`。远程 SSH 默认严格校验 host key。
-
-`network.yml` 展示 TCP 就绪等待和 HTTP 健康查询重试。实际执行前将
-health_host/health_port/health_url 配成隔离服务；默认地址为
-`http://127.0.0.1:8080/health`，示例不自动启动服务。
-
-`artifacts.yml` 展示固定 Git 版本和归档部署。将仓库、版本、目标路径和
-控制端归档改为隔离测试值；目标端需预装 Git，解包不调用 tar/unzip。
-
-`selection.yml` 可用 `--tags deploy` 选择部署任务，或 `--tags diagnostics`
-显式选择默认跳过的诊断任务。`--list-tasks`/`--list-hosts`/`--syntax-check`
-只读取控制端内容，输出 JSON；`--check --diff` 可预演支持的文件差异。
-
-`vault.yml` 读取 `-e vault_variables=/绝对路径/vars.yml` 指定的变量文件，
-并以 0600 部署 `example_value`。先准备仅含演示数据的变量文件，再加密：
-
-```bash
-(umask 077; printf 'example_value: example-only\n' > /tmp/vault-example-vars.yml)
-rustsible vault encrypt /tmp/vault-example-vars.yml --vault-id prod@prompt
-rustsible playbook examples/vault.yml -i examples/inventory/hosts --limit localhost \
-  -e vault_variables=/tmp/vault-example-vars.yml --vault-id prod@prompt --check --diff
-```
-
-密码在终端内隐藏输入；示例通过 no_log 遮蔽结果，不附带真实密码或凭证。
-
-## 安全提示
-- 示例 inventory 只应放测试值，不要提交真实密码或私钥。
-- `package`、`service` 和 `user` 会调用目标系统工具，通常需要 `become`。
-- `--check` 是最佳努力的预测，不替代隔离环境中的实际验证。
-- 修改用户、服务、软件包或 `/etc` 下文件前，请准备可恢复方案。
-
-`native-collection/` 提供 module/inventory/lookup/filter、角色及 playbook 的完整原生集合，构建、打包和显式安装步骤见其 README。
+Other state modules have complete playbooks in the [module reference](../docs/en/reference/modules.md). Account/package/service recipes require disposable targets. Historical “all features” material is removed; minimal rejected-input regressions live in tests/fixtures, not public tutorials. Rust helper programs are development/test tools, excluded from offline user examples.

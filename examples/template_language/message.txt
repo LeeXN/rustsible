@@ -1,1 +1,0 @@
-This source is resolved beside site.yml, regardless of the launch directory.

@@ -1,0 +1,34 @@
+- name: Deploy a local configuration
+  hosts: all
+  gather_facts: false
+  pre_tasks:
+    - assert:
+        that:
+          - demo_root is defined
+          - demo_root != '/'
+  tasks:
+    - file:
+        path: '{{ demo_root }}/app'
+        state: directory
+        mode: '0700'
+    - copy:
+        content: "application=rustsible\nenabled=true\n"
+        dest: '{{ demo_root }}/app/config'
+        mode: '0600'
+      notify: configuration changed
+    - stat:
+        path: '{{ demo_root }}/app/config'
+        checksum_algorithm: sha256
+      register: config
+      when: not ansible_check_mode
+    - assert:
+        that:
+          - config.stat.exists
+          - config.stat.mode == '0600'
+      when: not ansible_check_mode
+  handlers:
+    - name: configuration changed
+      copy:
+        content: applied
+        dest: '{{ demo_root }}/app/applied'
+        mode: '0600'
