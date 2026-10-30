@@ -35,7 +35,7 @@ stat: exists; when present isreg/isdir/islnk/mode/uid/gid/size/inode/dev/nlink/m
 
 ## Example
 
-The example is a complete playbook. Supply inventory, required variables/files and prepared target resources. Account/package/service examples require an isolated privileged target; example.invalid URLs are placeholders. Do not execute these blocks blindly. 
+The example is a complete playbook. Supply inventory, required variables/files and prepared target resources. Account/package/service examples require an isolated privileged target; example.invalid URLs are placeholders. Do not execute these blocks blindly.
 
 ```yaml
 - hosts: all

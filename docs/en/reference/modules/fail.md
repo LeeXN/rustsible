@@ -34,7 +34,7 @@ common failed result. Absent/conditional fields must be tested before access. Al
 
 ## Example
 
-The example is a complete playbook. Supply inventory, required variables/files and prepared target resources. Account/package/service examples require an isolated privileged target; example.invalid URLs are placeholders. Do not execute these blocks blindly. 
+The example is a complete playbook. Supply inventory, required variables/files and prepared target resources. Account/package/service examples require an isolated privileged target; example.invalid URLs are placeholders. Do not execute these blocks blindly.
 
 ```yaml
 - hosts: all
