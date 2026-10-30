@@ -14,6 +14,47 @@
 
 rustsible-collection.json 包含 format1、namespace/name/version、extensions；每项含 definition（FQCN、kind、check/diff/async/mutates 能力、参数类型/required）及按 x86_64/aarch64 索引的相对路径/SHA256。不能替换保留内置命名空间；module 按真实目标选架构，inventory/lookup/filter 需要控制端架构。
 
+<a id="manifest-example"></a>
+
+## 最小清单
+
+自定义 exists 程序应复制到 bin/exists-x86_64，并将下例全零摘要替换为实际字节的 sha256sum；ARM 目标添加 aarch64 产物。示例 collection_manifest 工具生成的是既有 probe/inventory/lookup/filter 目录，不是这个自定义 exists 定义。使用 cargo build -p rustsible-native-example --example minimal_module --release --target TARGET 构建，再打包、安装审查后的集合目录。
+
+```json
+{
+  "format": 1,
+  "namespace": "example",
+  "name": "native",
+  "version": "0.1.0",
+  "extensions": [
+    {
+      "definition": {
+        "name": "example.native.exists",
+        "kind": "module",
+        "capabilities": {
+          "check": true,
+          "diff": false,
+          "async": false,
+          "mutates": false
+        },
+        "parameters": {
+          "path": {
+            "type": "string",
+            "required": true
+          }
+        }
+      },
+      "artifacts": {
+        "x86_64": {
+          "path": "bin/exists-x86_64",
+          "sha256": "0000000000000000000000000000000000000000000000000000000000000000"
+        }
+      }
+    }
+  ]
+}
+```
+
 <a id="providers"></a>
 
 ## 提供器约定

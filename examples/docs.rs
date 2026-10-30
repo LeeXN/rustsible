@@ -365,6 +365,18 @@ fn check(root: &Path, offline: bool) -> Result<()> {
             }
         }
     }
+    if !offline {
+        let example =
+            fs::read_to_string(root.join("crates/native-example/examples/minimal_module.rs"))?;
+        let actual = example
+            .split_once("use anyhow")
+            .context("Minimal SDK source needs its import")?;
+        let snippet = format!("use anyhow{}", actual.1);
+        let guide = fs::read_to_string(root.join("docs/en/development/native-extensions.md"))?;
+        if !guide.contains(snippet.trim()) {
+            bail!("SDK snippet drifted from its compiled source")
+        }
+    }
     let parameter_rows = Regex::new(r"(?m)^\| `([^`]+)` \|")?;
     for lang in LANGS {
         for module in Builtin::ALL {

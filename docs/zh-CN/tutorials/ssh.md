@@ -6,7 +6,7 @@
 
 ## 准备隔离目标
 
-准备一次性 Linux 主机、已有登录账号和通过可信渠道核验的主机密钥。替换所有示例地址与路径；下列地址仅用于文档。site.yml 是你审查后的 playbook，不会自动生成。
+准备一次性 Linux 主机、已有登录账号和通过可信渠道核验的主机密钥。替换所有示例地址与路径；下列地址仅用于文档。按下文完整示例创建 site.yml。
 
 <a id="inventory"></a>
 
@@ -26,6 +26,34 @@ all:
         rustsible_known_hosts_file: /secure/known_hosts
 ```
 
+<a id="playbook"></a>
+
+## 准备 site.yml
+
+将下列文件保存在 inventory.yml 旁。选择属于目标执行身份的独立 demo_root；示例会创建它，不要指向无关的已有目录。不涉及软件包、服务或系统账号变更。
+
+```yaml
+- hosts: web
+  gather_facts: false
+  tasks:
+    - file:
+        path: '{{ demo_root }}'
+        state: directory
+        mode: '0700'
+    - copy:
+        content: "managed=rustsible\n"
+        dest: '{{ demo_root }}/config'
+        mode: '0600'
+    - stat:
+        path: '{{ demo_root }}/config'
+        checksum_algorithm: sha256
+      register: installed
+      when: not ansible_check_mode
+    - assert:
+        that: installed.stat.mode == '0600'
+      when: not ansible_check_mode
+```
+
 <a id="run"></a>
 
 ## 先验证身份再部署
@@ -33,8 +61,8 @@ all:
 ```bash
 rustsible ad-hoc web -i inventory.yml -m command -a 'id -un'
 rustsible playbook site.yml -i inventory.yml --list-hosts
-rustsible playbook site.yml -i inventory.yml --check --diff
-rustsible playbook site.yml -i inventory.yml --private-key /secure/deploy-key
+rustsible playbook site.yml -i inventory.yml -e demo_root=/tmp/reviewed-app-demo --check --diff
+rustsible playbook site.yml -i inventory.yml -e demo_root=/tmp/reviewed-app-demo --private-key /secure/deploy-key
 ```
 
 <a id="privilege"></a>

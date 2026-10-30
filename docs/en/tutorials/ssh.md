@@ -6,7 +6,7 @@
 
 ## Prepare an isolated target
 
-Use a disposable Linux host, an existing login account and a host key verified through a trusted channel. Replace every example address/path. The address below is documentation-only. site.yml is your reviewed playbook, not an automatically created file.
+Use a disposable Linux host, an existing login account and a host key verified through a trusted channel. Replace every example address/path. The address below is documentation-only. Create site.yml using the complete example below.
 
 <a id="inventory"></a>
 
@@ -26,6 +26,34 @@ all:
         rustsible_known_hosts_file: /secure/known_hosts
 ```
 
+<a id="playbook"></a>
+
+## Create site.yml
+
+Save the following beside inventory.yml. Choose a scratch demo_root owned by the remote execution identity; the example creates it but must not be pointed at an unrelated existing directory. No package, service or system-account mutation is involved.
+
+```yaml
+- hosts: web
+  gather_facts: false
+  tasks:
+    - file:
+        path: '{{ demo_root }}'
+        state: directory
+        mode: '0700'
+    - copy:
+        content: "managed=rustsible\n"
+        dest: '{{ demo_root }}/config'
+        mode: '0600'
+    - stat:
+        path: '{{ demo_root }}/config'
+        checksum_algorithm: sha256
+      register: installed
+      when: not ansible_check_mode
+    - assert:
+        that: installed.stat.mode == '0600'
+      when: not ansible_check_mode
+```
+
 <a id="run"></a>
 
 ## Verify identity, then deploy
@@ -33,8 +61,8 @@ all:
 ```bash
 rustsible ad-hoc web -i inventory.yml -m command -a 'id -un'
 rustsible playbook site.yml -i inventory.yml --list-hosts
-rustsible playbook site.yml -i inventory.yml --check --diff
-rustsible playbook site.yml -i inventory.yml --private-key /secure/deploy-key
+rustsible playbook site.yml -i inventory.yml -e demo_root=/tmp/reviewed-app-demo --check --diff
+rustsible playbook site.yml -i inventory.yml -e demo_root=/tmp/reviewed-app-demo --private-key /secure/deploy-key
 ```
 
 <a id="privilege"></a>

@@ -14,6 +14,47 @@ Extensions are explicitly trusted ELF executables, not a sandbox. stdin/stdout c
 
 rustsible-collection.json has format1, namespace/name/version and extensions. Each entry includes definition (FQCN, kind, capabilities check/diff/async/mutates, parameter types/required) and artifacts indexed by x86_64/aarch64 with relative path/SHA256. Reserved builtin namespaces cannot be replaced. Modules select the real target architecture; inventory/lookup/filter require the controller architecture.
 
+<a id="manifest-example"></a>
+
+## Minimal manifest
+
+For the custom exists program, copy its binary to bin/exists-x86_64 and replace the zero checksum below with sha256sum of those exact bytes. Add an aarch64 artifact for ARM targets. The sample collection_manifest tool generates the shipped probe/inventory/lookup/filter catalogue, not this custom exists definition. Build the example with cargo build -p rustsible-native-example --example minimal_module --release --target TARGET, then pack/install this reviewed collection directory.
+
+```json
+{
+  "format": 1,
+  "namespace": "example",
+  "name": "native",
+  "version": "0.1.0",
+  "extensions": [
+    {
+      "definition": {
+        "name": "example.native.exists",
+        "kind": "module",
+        "capabilities": {
+          "check": true,
+          "diff": false,
+          "async": false,
+          "mutates": false
+        },
+        "parameters": {
+          "path": {
+            "type": "string",
+            "required": true
+          }
+        }
+      },
+      "artifacts": {
+        "x86_64": {
+          "path": "bin/exists-x86_64",
+          "sha256": "0000000000000000000000000000000000000000000000000000000000000000"
+        }
+      }
+    }
+  ]
+}
+```
+
 <a id="providers"></a>
 
 ## Provider contracts

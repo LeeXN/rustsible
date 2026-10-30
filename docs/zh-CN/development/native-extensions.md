@@ -21,6 +21,54 @@ fn main() -> anyhow::Result<()> {
 }
 ```
 
+<a id="minimal"></a>
+
+## 最小自定义模块
+
+下例是完整模块，声明严格参数并返回 exists 布尔值；权限错误不会被伪装成文件缺失。它作为 rustsible-native-example 的 minimal_module example 编译，两种语言引用相同源码。
+
+```rust
+use anyhow::Result;
+use rustsible_protocol::{
+    extension::{serve, Capabilities, Definition, Kind, Parameter, ParameterType},
+    ModuleResult,
+};
+use std::collections::{BTreeMap, HashMap};
+fn main() -> Result<()> {
+    let definition = Definition {
+        name: "example.native.exists".into(),
+        kind: Kind::Module,
+        capabilities: Capabilities {
+            check: true,
+            diff: false,
+            asynchronous: false,
+            mutates: false,
+        },
+        parameters: BTreeMap::from([(
+            "path".into(),
+            Parameter {
+                kind: ParameterType::String,
+                required: true,
+            },
+        )]),
+    };
+    serve(&[definition], |_, call| {
+        let path = call.args["path"]
+            .as_str()
+            .expect("SDK validates the schema");
+        let exists = match std::fs::metadata(path) {
+            Ok(_) => true,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => false,
+            Err(error) => return Err(error.into()),
+        };
+        Ok(ModuleResult {
+            values: HashMap::from([("exists".into(), serde_yaml::Value::Bool(exists))]),
+            ..Default::default()
+        })
+    })
+}
+```
+
 <a id="build"></a>
 
 ## 构建与打包
