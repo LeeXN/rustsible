@@ -185,7 +185,8 @@ jobs:
 
   offline-packages:
     name: Final offline deployment (${{ matrix.arch }})
-    needs: [quality, ssh]
+    # SSH jobs produce the binaries consumed by these scenarios.
+    needs: ssh
     strategy:
       fail-fast: false
       matrix:
