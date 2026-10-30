@@ -25,6 +25,38 @@ pub fn parse_inventory(inventory_path: &str) -> Result<Inventory> {
     }
 
     let content = crate::vault::Vault::current().read_text(path)?;
+    if let Ok(Value::Mapping(config)) = serde_yaml::from_str::<Value>(&content) {
+        if let Some(plugin) = config
+            .get(Value::String("plugin".into()))
+            .and_then(Value::as_str)
+        {
+            let mut args = config.clone();
+            args.remove(Value::String("plugin".into()));
+            let args = crate::data::materialize(&Value::Mapping(args))?;
+            let result = crate::extensions::Registry::current().invoke(
+                plugin,
+                rustsible_protocol::extension::Kind::Inventory,
+                args,
+            )?;
+            let output = result
+                .values
+                .get("inventory")
+                .context("Native inventory omitted its inventory mapping")?;
+            let mut inventory = parse_yaml(&serde_yaml::to_string(output)?)?;
+            for host in inventory.hosts.values_mut() {
+                for value in host.variables.values_mut() {
+                    *value = crate::data::native(value.clone());
+                }
+            }
+            for group in inventory.groups.values_mut() {
+                for value in group.variables.values_mut() {
+                    *value = crate::data::native(value.clone());
+                }
+            }
+            finish_inventory(&mut inventory)?;
+            return Ok(inventory);
+        }
+    }
     let format = detect_format(path, &content);
     info!(
         "Parsing {} inventory file: {}",
@@ -568,6 +600,10 @@ pub(crate) fn validate_resolved_connection_variable(
             value.trim().to_ascii_lowercase().as_str(),
             "local" | "ssh" | "smart" | "paramiko"
         )
+        && !crate::extensions::Registry::current()
+            .components()
+            .connections
+            .contains_key(value)
     {
         bail!("unsupported connection type for {}", key);
     }

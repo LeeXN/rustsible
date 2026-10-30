@@ -121,6 +121,14 @@ jobs:
         run: bash tests/ssh/run.sh target/${{ matrix.target }}/release/rustsible target/workers vault glibc target/${{ matrix.target }}/release/examples/prompt_fixture
       - name: Vault deployment on musl without Python
         run: bash tests/ssh/run.sh target/${{ matrix.target }}/release/rustsible target/workers vault musl target/${{ matrix.target }}/release/examples/prompt_fixture
+      - name: Assemble the native example collection without executing its programs
+        run: |
+          cp -R examples/native-collection "${{ runner.temp }}/native-example-collection"
+          cargo run --locked -p rustsible-native-example --example collection_manifest -- "${{ runner.temp }}/native-example-collection" ${{ matrix.arch }}=target/${{ matrix.target }}/release/rustsible-example-extension
+      - name: Native collections, providers and async over SSH
+        run: bash tests/ssh/run.sh target/${{ matrix.target }}/release/rustsible target/workers extensions glibc "${{ runner.temp }}/native-example-collection"
+      - name: Native collections without Python or curl on musl
+        run: bash tests/ssh/run.sh target/${{ matrix.target }}/release/rustsible target/workers extensions musl "${{ runner.temp }}/native-example-collection"
       - name: Native execution without Python or curl (glibc)
         run: bash tests/ssh/run.sh target/${{ matrix.target }}/release/rustsible target/workers native glibc target/${{ matrix.target }}/release/examples/http_fixture
       - name: Native execution without Python or curl (musl)
@@ -137,6 +145,7 @@ jobs:
           path: |
             target/${{ matrix.target }}/release/rustsible
             target/${{ matrix.target }}/release/rustsible-worker
+            target/${{ matrix.target }}/release/rustsible-example-extension
           if-no-files-found: error
 
   system-tools:
@@ -182,12 +191,18 @@ jobs:
           for arch in x86_64 aarch64; do
             bash scripts/package.sh target/native/native-$arch/rustsible "$RUNNER_TEMP/rustsible-packages/$arch" target/native/native-x86_64/rustsible-worker target/native/native-aarch64/rustsible-worker
           done
+      - name: Build and verify a dual architecture native collection package
+        run: |
+          cp -R examples/native-collection "$RUNNER_TEMP/native-example"
+          cargo run --locked -p rustsible-native-example --example collection_manifest -- "$RUNNER_TEMP/native-example" x86_64=target/native/native-x86_64/rustsible-example-extension aarch64=target/native/native-aarch64/rustsible-example-extension
+          "$RUNNER_TEMP/rustsible-packages/x86_64/rustsible" collection pack "$RUNNER_TEMP/native-example" --output "$RUNNER_TEMP/rustsible-packages/example.native-0.1.0.tar.gz"
+          "$RUNNER_TEMP/rustsible-packages/x86_64/rustsible" collection verify "$RUNNER_TEMP/rustsible-packages/example.native-0.1.0.tar.gz"
       - name: Run the extracted package offline without Python or curl
         run: |
           mkdir "$RUNNER_TEMP/rustsible-extracted"
           tar -xzf "$RUNNER_TEMP/rustsible-packages/x86_64.tar.gz" -C "$RUNNER_TEMP/rustsible-extracted"
           docker pull alpine:3.22
-          docker run --rm --network none --mount type=bind,src="$RUNNER_TEMP/rustsible-extracted/x86_64",dst=/release,readonly alpine:3.22 sh -eu -c '
+          docker run --rm --network none --mount type=bind,src="$RUNNER_TEMP/rustsible-extracted/x86_64",dst=/release,readonly --mount type=bind,src="$RUNNER_TEMP/rustsible-packages/example.native-0.1.0.tar.gz",dst=/native.tar.gz,readonly alpine:3.22 sh -eu -c '
             ! command -v python3
             ! command -v curl
             cd /release
@@ -195,6 +210,8 @@ jobs:
             printf "localhost ansible_connection=local\n" > /tmp/inventory
             ./rustsible ad-hoc localhost -m setup -i /tmp/inventory
             ./rustsible ad-hoc localhost -m stat -a "path=/etc/passwd checksum_algorithm=sha256" -i /tmp/inventory
+            ./rustsible collection install /native.tar.gz --path /tmp/collections
+            ./rustsible ad-hoc localhost -m example.native.probe -a "path=/etc/passwd" -i /tmp/inventory --collections-path /tmp/collections
             [ -z "$(find /tmp -name ".rustsible-worker-*")" ]
           '
       - uses: actions/upload-artifact@v4

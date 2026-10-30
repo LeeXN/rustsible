@@ -226,3 +226,6 @@ if "$binary" playbook -i "$fixture_dir/inventory" "$fixture_dir/non_boolean.yml"
 fi
 [[ ! -e $fixture_dir/result/unsafe-condition ]]
 printf 'Ansible 2.21.0 comparison passed: templates/types, native files, retries/conditions, environment, command prediction, facts, variables, imports/roles, handlers/rescue, serial/run_once, failure thresholds, delegation, free strategy native async/poll/status, assertions, target wait/HTTP readiness Git/archive deployment inherited/static/dynamic tags and bidirectional Vault encryption\n'
+
+source "$repo_dir/tests/reference/collections.sh"
+printf "Pinned Ansible 2.21 declarative collection comparison passed\n"

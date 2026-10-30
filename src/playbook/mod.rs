@@ -33,6 +33,7 @@ pub struct ExecutionOptions {
     pub tags: TagSelection,
     pub credentials: crate::ssh::credentials::Credentials,
     pub vault: std::sync::Arc<crate::vault::Vault>,
+    pub extensions: std::sync::Arc<crate::extensions::Registry>,
     pub forks: usize,
     pub worker_dir: Option<std::path::PathBuf>,
     pub extra_vars: Vec<String>,
@@ -49,6 +50,7 @@ impl Default for ExecutionOptions {
             tags: TagSelection::default(),
             credentials: Default::default(),
             vault: crate::vault::Vault::current(),
+            extensions: crate::extensions::Registry::current(),
             forks: 5,
             worker_dir: None,
             extra_vars: Vec::new(),
@@ -79,7 +81,7 @@ fn load(
         },
     )?;
     let mut inventory = inventory.clone();
-    let playbook_source = std::path::Path::new(playbook_file).canonicalize()?;
+    let playbook_source = parser::source_path(playbook_file)?;
     if inventory.source.as_ref().and_then(|path| path.parent()) != playbook_source.parent() {
         inventory
             .load_variable_files(playbook_source.parent().expect("Canonical playbook parent"))?;
@@ -102,6 +104,7 @@ pub fn execute_with_options(
     options: &ExecutionOptions,
 ) -> Result<()> {
     let _vault = options.vault.enter();
+    let _extensions = options.extensions.enter();
     options
         .vault
         .protect(execute_in_scope(playbook_file, inventory, options))
@@ -145,10 +148,12 @@ fn execute_in_scope(
         crate::worker::Runtime::new(options.worker_dir.clone())
             .with_credentials(options.credentials.clone())
             .with_vault(options.vault.clone())
+            .with_extensions(options.extensions.clone())
             .with_diff(options.diff),
     );
     state.extra = std::sync::Arc::new(extra);
     state.tags = std::sync::Arc::new(options.tags.clone());
+    state.set_execution_modes(options.check_mode, options.diff);
     state.prepare(
         &inventory,
         playbook_source.parent().context("Playbook has no parent")?,
@@ -221,6 +226,7 @@ pub fn inspect(
     mode: Inspection,
 ) -> Result<serde_json::Value> {
     let _vault = options.vault.enter();
+    let _extensions = options.extensions.enter();
     options
         .vault
         .protect(inspect_in_scope(file, inventory, options, mode))
@@ -338,15 +344,17 @@ fn inspect_task(
     }
     let dynamic = matches!(task.module.as_str(), "include_tasks" | "include_role");
     if !dynamic {
-        let builtin = crate::modules::registry::Builtin::lookup(&task.module)?;
+        let builtin = crate::extensions::Registry::current().module(&task.module, &[])?;
         // Syntax validates names and argument keys even when values need facts;
         // normal shared validation checks resolved types before real execution.
         for key in task.args.keys().filter_map(serde_yaml::Value::as_str) {
             if !(builtin.parameters().contains(&key)
                 || matches!(
-                    builtin,
-                    crate::modules::registry::Builtin::Command
-                        | crate::modules::registry::Builtin::Shell
+                    builtin.builtin(),
+                    Some(
+                        crate::modules::registry::Builtin::Command
+                            | crate::modules::registry::Builtin::Shell
+                    )
                 ) && key == "_raw_params")
                 && builtin != crate::modules::registry::Builtin::SetFact
             {

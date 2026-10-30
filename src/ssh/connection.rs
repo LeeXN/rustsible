@@ -66,6 +66,7 @@ fn set_pipe_nonblocking<T>(_pipe: &T) -> io::Result<()> {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ConnectionKind {
+    Compiled,
     Local,
     Ssh,
 }
@@ -85,6 +86,14 @@ fn connection_kind_config(host: &ConnectionConfig) -> Result<ConnectionKind> {
         return match connection.trim().to_ascii_lowercase().as_str() {
             "local" => Ok(ConnectionKind::Local),
             "ssh" | "smart" | "paramiko" => Ok(ConnectionKind::Ssh),
+            other
+                if crate::extensions::Registry::current()
+                    .components()
+                    .connections
+                    .contains_key(other) =>
+            {
+                Ok(ConnectionKind::Compiled)
+            }
             other => bail!("Unsupported connection type: {other}"),
         };
     }
@@ -538,10 +547,16 @@ pub trait SshConnection {
     ) -> Result<(i32, String, String)>;
 }
 
+/// A trusted transport keeps the same bounded framed worker protocol. Dropping
+/// its session must cancel synchronous work and release the remote bootstrap.
+pub trait WorkerConnection: SshConnection {
+    fn start_worker(&self, command: &str) -> Result<crate::worker::transport::Session>;
+}
 /// A connection selected for one inventory host.
 pub enum Connection {
     Local(LocalConnection),
     Ssh(SshClient),
+    Compiled(Box<dyn WorkerConnection>),
 }
 
 impl Connection {
@@ -549,8 +564,21 @@ impl Connection {
         Self::from_config(&ConnectionConfig::from_host(host)?)
     }
 
-    pub(crate) fn from_config(config: &ConnectionConfig) -> Result<Self> {
+    pub fn from_config(config: &ConnectionConfig) -> Result<Self> {
         match connection_kind_config(config)? {
+            ConnectionKind::Compiled => {
+                let registry = crate::extensions::Registry::current();
+                let name = config
+                    .get_variable("ansible_connection")
+                    .or_else(|| config.get_variable("ansible_connection_type"))
+                    .context("Missing compiled connection name")?;
+                let factory = registry
+                    .components()
+                    .connections
+                    .get(name.as_ref())
+                    .context("Missing compiled connection factory")?;
+                factory(config)
+            }
             ConnectionKind::Local => Ok(Self::Local(LocalConnection::from_config(config)?)),
             ConnectionKind::Ssh => Ok(Self::Ssh(SshClient::from_config(config)?)),
         }
@@ -558,6 +586,7 @@ impl Connection {
 
     pub(crate) fn start_worker(&self, command: &str) -> Result<crate::worker::transport::Session> {
         match self {
+            Self::Compiled(connection) => connection.start_worker(command),
             Self::Local(_) => crate::worker::transport::Session::local(command),
             Self::Ssh(client) => {
                 client.session.set_blocking(false);
@@ -605,6 +634,7 @@ impl Connection {
         match self {
             Self::Local(connection) => connection,
             Self::Ssh(connection) => connection,
+            Self::Compiled(connection) => connection.as_ref(),
         }
     }
 }

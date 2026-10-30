@@ -8,7 +8,7 @@ use std::{
     io::{self, Read},
     os::{
         fd::{AsRawFd, FromRawFd},
-        unix::net::UnixDatagram,
+        unix::{fs::PermissionsExt, net::UnixDatagram},
     },
     sync::atomic::{AtomicBool, Ordering},
     time::{Duration, Instant},
@@ -209,7 +209,9 @@ fn run_core(
         return Err(io::Error::last_os_error()).context("Cannot establish request subreaper");
     }
     let mut builder = tempfile::Builder::new();
-    builder.prefix(".rustsible-request-");
+    builder
+        .prefix(".rustsible-request-")
+        .permissions(fs::Permissions::from_mode(0o700));
     let executable = std::env::current_exe()?;
     // The bootstrap shell owns the enclosing private directory and removes it
     // even if the worker is killed before Rust can drop its request scratch.

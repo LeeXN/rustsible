@@ -84,6 +84,9 @@ impl fmt::Debug for YamlObject {
 }
 impl YamlObject {
     fn convert(&self, value: &Value) -> JinjaValue {
+        if let Some(value) = crate::data::literal(value) {
+            return jinja(value);
+        }
         if crate::vault::is_value(value) {
             return match self.vault.materialize(value) {
                 Ok(value) => jinja(&value),
@@ -150,7 +153,9 @@ fn validate(value: &Value, depth: usize) -> Result<()> {
                 validate(value, depth + 1)?;
             }
         }
-        Value::Tagged(_) if !crate::vault::is_value(value) => {
+        Value::Tagged(_)
+            if !crate::vault::is_value(value) && crate::data::literal(value).is_none() =>
+        {
             bail!("Unsupported YAML tag in template variables")
         }
         _ => {}

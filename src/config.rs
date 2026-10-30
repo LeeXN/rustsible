@@ -15,6 +15,7 @@ pub struct Config {
     pub inventory: Option<PathBuf>,
     pub worker_dir: Option<PathBuf>,
     pub role_paths: Vec<PathBuf>,
+    pub collection_paths: Vec<PathBuf>,
     pub forks: Option<usize>,
     pub verbosity: Option<u8>,
     defaults: HashMap<String, Value>,
@@ -61,6 +62,7 @@ impl Config {
             ("ANSIBLE_INVENTORY", "defaults", "inventory"),
             ("ANSIBLE_FORKS", "defaults", "forks"),
             ("ANSIBLE_ROLES_PATH", "defaults", "roles_path"),
+            ("ANSIBLE_COLLECTIONS_PATH", "defaults", "collections_path"),
             ("ANSIBLE_VERBOSITY", "defaults", "verbosity"),
             ("ANSIBLE_REMOTE_USER", "defaults", "remote_user"),
             ("ANSIBLE_PRIVATE_KEY_FILE", "defaults", "private_key_file"),
@@ -138,6 +140,11 @@ impl Config {
         match (section, key) {
             ("defaults", "inventory") => self.inventory = Some(resolve_path(base, value)?),
             ("defaults", "worker_dir") => self.worker_dir = Some(resolve_path(base, value)?),
+            ("defaults", "collections_path") => {
+                self.collection_paths = std::env::split_paths(value)
+                    .map(|path| resolve_path(base, &path.to_string_lossy()))
+                    .collect::<Result<Vec<_>>>()?;
+            }
             ("defaults", "roles_path") => {
                 self.role_paths = std::env::split_paths(value)
                     .map(|path| resolve_path(base, &path.to_string_lossy()))

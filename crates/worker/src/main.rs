@@ -12,8 +12,8 @@ mod modules;
 mod packages;
 mod process;
 mod services;
-mod staging;
-mod supervisor;
+use rustsible_native::staging;
+use rustsible_native::supervisor;
 mod tools;
 mod wait;
 use anyhow::{bail, Result};
@@ -191,15 +191,13 @@ fn run() -> Result<()> {
         let execution = supervisor::run(
             Duration::from_millis(timeout),
             request.managed,
-            request.asynchronous.is_some()
-                || rustsible_protocol::registry::Builtin::lookup(&request.module)?
-                    .may_modify(&request.args, request.check),
+            request.may_modify()?,
             !request.check
                 && (request.asynchronous.is_some()
                     || matches!(request.module.as_str(), "service" | "systemd" | "package")),
             |scratch| {
                 if request.asynchronous.is_some() {
-                    jobs::start(&request)
+                    jobs::start(&request, payload.as_ref().map(|file| file.path()))
                 } else {
                     modules::execute(&request, scratch, payload.as_ref().map(|file| file.path()))
                 }

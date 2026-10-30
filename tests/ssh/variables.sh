@@ -38,7 +38,12 @@ family=Debian
 [[ $libc != musl ]] || family=Alpine
 docker exec "$container" sh -eu -c '
     for name in plain root app; do
-        [ "$(cat "/srv/rustsible/$name/variables")" = "$1|$2|first,second|0012|extra|file|$1|facts.rustsible.test" ]
+        actual=$(cat "/srv/rustsible/$name/variables")
+        expected="$1|$2|first,second|0012|extra|file|$1|facts.rustsible.test"
+        if [ "$actual" != "$expected" ]; then
+            printf "Public fixture facts mismatch for %s: expected <%s>, actual <%s>\n" "$name" "$expected" "$actual" >&2
+            exit 1
+        fi
     done
 ' sh "$target_arch" "$family"
 # An inventory connection variable outranks keywords; configuration defaults

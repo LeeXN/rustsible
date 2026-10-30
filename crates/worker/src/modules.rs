@@ -46,6 +46,41 @@ fn run(
         // tool or HTTP client starts; the persistent worker never inherits it.
         std::env::set_var(name, value);
     }
+    if let Some(definition) = &request.extension {
+        use std::io::Seek;
+        request.validate_module_parameters()?;
+        let payload = payload.context("Missing native extension artifact")?;
+        let path = scratch.join("native-extension");
+        let mut source = File::open(payload)?;
+        let sha256 = &request
+            .payload
+            .as_ref()
+            .context("Missing extension artifact checksum")?
+            .sha256;
+        rustsible_protocol::extension::verify_binary(
+            &mut source,
+            sha256,
+            std::env::consts::ARCH,
+            "Native extension",
+        )?;
+        source.rewind()?;
+        let mut output = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o700)
+            .open(&path)?;
+        std::io::copy(&mut source, &mut output)?;
+        output.sync_all()?;
+        drop(output);
+        return Ok(rustsible_native::rpc::execute(
+            &rustsible_native::rpc::Invocation {
+                program: path,
+                sha256: sha256.clone(),
+                definition: definition.clone(),
+                call: request.extension_call()?,
+            },
+        ));
+    }
     let args = request
         .args
         .as_mapping()

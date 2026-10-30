@@ -8,6 +8,7 @@ pub fn build_cli() -> Command {
         .arg_required_else_help(true)
         .args(vault_args())
         .subcommand(vault_command())
+        .subcommand(collection_command())
         .arg(
             Arg::new("config")
                 .long("config")
@@ -25,7 +26,7 @@ pub fn build_cli() -> Command {
                 .value_parser(clap::value_parser!(std::path::PathBuf)),
         )
         .subcommand(
-            Command::new("playbook").args(vault_args())
+            Command::new("playbook").arg(collections_arg()).args(vault_args())
                 .arg(extra_vars_arg())
                 .args(connection_args())
                 .arg(Arg::new("diff").long("diff").action(ArgAction::SetTrue).help("Show bounded structured differences from supported modules"))
@@ -78,7 +79,7 @@ pub fn build_cli() -> Command {
                 ),
         )
         .subcommand(
-            Command::new("ad-hoc").args(vault_args())
+            Command::new("ad-hoc").arg(collections_arg()).args(vault_args())
                 .arg(extra_vars_arg())
                 .args(connection_args())
                 .arg(Arg::new("diff").long("diff").action(ArgAction::SetTrue).help("Show bounded structured differences from supported modules"))
@@ -158,7 +159,7 @@ pub fn build_cli() -> Command {
                 ),
         )
         .subcommand(
-            Command::new("inventory-debug").args(vault_args())
+            Command::new("inventory-debug").arg(collections_arg()).args(vault_args())
                 .about("Debug and display information about inventory files")
                 .arg(
                     Arg::new("inventory")
@@ -183,6 +184,44 @@ fn extra_vars_arg() -> Arg {
         .action(ArgAction::Append)
         .value_name("VARS")
         .help("Extra variables as name=value, a YAML/JSON mapping, or @file")
+}
+
+fn collection_command() -> Command {
+    let input = || {
+        Arg::new("input")
+            .required(true)
+            .index(1)
+            .value_parser(clap::value_parser!(std::path::PathBuf))
+    };
+    Command::new("collection")
+        .about("Package, verify or install a native collection")
+        .subcommand_required(true)
+        .subcommand(
+            Command::new("pack").arg(input()).arg(
+                Arg::new("output")
+                    .long("output")
+                    .required(true)
+                    .value_parser(clap::value_parser!(std::path::PathBuf)),
+            ),
+        )
+        .subcommand(Command::new("verify").arg(input()))
+        .subcommand(
+            Command::new("install").arg(input()).arg(
+                Arg::new("path")
+                    .long("path")
+                    .value_name("DIRECTORY")
+                    .value_parser(clap::value_parser!(std::path::PathBuf)),
+            ),
+        )
+}
+
+fn collections_arg() -> Arg {
+    Arg::new("collections-path")
+        .long("collections-path")
+        .action(ArgAction::Append)
+        .value_parser(clap::value_parser!(std::path::PathBuf))
+        .value_name("DIRECTORY")
+        .help("Explicit collection root; authorizes its declared native executables")
 }
 
 fn vault_args() -> [Arg; 3] {

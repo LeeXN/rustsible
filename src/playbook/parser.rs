@@ -200,6 +200,12 @@ fn expand_role(
 
 impl Loader<'_> {
     fn find_role(&self, name: &str) -> Result<std::path::PathBuf> {
+        if name.split('.').count() == 3 && !name.contains('/') {
+            return crate::extensions::Registry::current()
+                .role(name)?
+                .canonicalize()
+                .map_err(Into::into);
+        }
         let mut roots = vec![self.playbook_dir.join("roles")];
         if self.options.role_paths.is_empty() {
             if let Some(home) = std::env::var_os("HOME") {
@@ -270,6 +276,11 @@ impl Loader<'_> {
             bail!("Role name must be nonempty without NUL");
         }
         let path = self.find_role(&name)?;
+        let collections = crate::extensions::Registry::current()
+            .owning_collection(&path)
+            .into_iter()
+            .collect::<Vec<_>>();
+        let _search = crate::extensions::enter_search(&collections);
         let mut chain = self.options.scope.parent_roles.clone();
         if let Some(parent) = &self.options.scope.role_path {
             chain.push(parent.clone());
@@ -345,11 +356,17 @@ impl Loader<'_> {
         }
         options.scope.parent_roles = chain;
         options.scope.role_path = Some(path.clone());
+        options.scope.collections = collections;
+        let basename = path
+            .file_name()
+            .context("Role has no name")?
+            .to_string_lossy();
         options.scope.role_name = Some(
-            path.file_name()
-                .context("Role has no name")?
-                .to_string_lossy()
-                .into_owned(),
+            if let Some(collection) = options.scope.collections.first() {
+                format!("{collection}.{basename}")
+            } else {
+                basename.into_owned()
+            },
         );
         options.scope.allow_duplicates = duplicate;
         let mut settings = spec.settings.effective();
@@ -491,10 +508,23 @@ struct Loader<'a> {
 
 /// Static imports are expanded before a host can be contacted. Each leaf keeps
 /// its real source path; the stack guards ancestry, not repeated sibling use.
+pub(crate) fn source_path(playbook_path: &str) -> Result<std::path::PathBuf> {
+    let path = if Path::new(playbook_path).is_file() {
+        Path::new(playbook_path).canonicalize()?
+    } else if playbook_path.split('.').count() == 3 && !playbook_path.contains('/') {
+        crate::extensions::Registry::current()
+            .playbook(playbook_path)?
+            .canonicalize()?
+    } else {
+        Path::new(playbook_path)
+            .canonicalize()
+            .context("Cannot resolve playbook source path")?
+    };
+    Ok(path)
+}
+
 pub fn parse_playbook(playbook_path: &str, options: &ParseOptions) -> Result<Playbook> {
-    let path = Path::new(playbook_path)
-        .canonicalize()
-        .context("Cannot resolve playbook source path")?;
+    let path = source_path(playbook_path)?;
     let mut loader = Loader {
         exports: Expansion::default(),
         options,
@@ -513,6 +543,7 @@ pub(crate) fn expand_tasks(
     request: &crate::playbook::task::IncludeRequest,
     options: &ParseOptions,
 ) -> Result<Expansion> {
+    let _search = crate::extensions::enter_search(&request.parent.scope.collections);
     if request.kind == crate::playbook::task::IncludeKind::Role {
         return expand_role(request, options);
     }
@@ -833,6 +864,7 @@ const SUPPORTED_PLAY_KEYWORDS: &[&str] = &[
     "gather_facts",
     "gather_subset",
     "gather_timeout",
+    "collections",
     "tags",
 ];
 
@@ -841,7 +873,6 @@ const UNSUPPORTED_PLAY_KEYWORDS: &[&str] = &[
     "become_flags",
     "become_method",
     "check_mode",
-    "collections",
     "debugger",
     "diff",
     "fact_path",
@@ -922,6 +953,9 @@ impl TaskKind {
 impl Loader<'_> {
     /// Parse an individual play from a YAML mapping.
     fn parse_play(&mut self, play_map: Mapping, ordinal: usize, source: &Path) -> Result<Play> {
+        let collections =
+            crate::extensions::parse_search(play_map.get(Value::String("collections".into())))?;
+        let _search = crate::extensions::enter_search(&collections);
         debug!("Parsing play definition");
         validate_play_keys(&play_map)?;
         let previous_exports = std::mem::take(&mut self.exports);
@@ -1047,18 +1081,11 @@ impl Loader<'_> {
             handlers.len()
         );
 
-        let strategy = match parse_optional_nonempty_string(&play_map, "strategy", "Play")?
-            .as_deref()
-            .unwrap_or("linear")
-        {
-            "linear" | "ansible.builtin.linear" | "ansible.legacy.linear" => {
-                crate::playbook::Strategy::Linear
-            }
-            "free" | "ansible.builtin.free" | "ansible.legacy.free" => {
-                crate::playbook::Strategy::Free
-            }
-            strategy => bail!("Unsupported strategy: {strategy}"),
-        };
+        let strategy = crate::playbook::Strategy::parse(
+            parse_optional_nonempty_string(&play_map, "strategy", "Play")?
+                .as_deref()
+                .unwrap_or("linear"),
+        )?;
         let play = Play {
             strategy,
             name,
@@ -1177,6 +1204,7 @@ impl Loader<'_> {
                     parse_task_parts(attrs, TaskKind::Task, "block".into(), Mapping::new())?;
                 header.source_file = Some(source.to_path_buf());
                 header.scope = self.options.scope.clone();
+                header.scope.collections = crate::extensions::search();
                 header.scope.ancestors = self.stack.clone();
                 let mut tasks = self
                     .task_list(
@@ -1297,6 +1325,7 @@ impl Loader<'_> {
             };
             handler.task.source_file = Some(source.to_path_buf());
             handler.task.scope = self.options.scope.clone();
+            handler.task.scope.collections = crate::extensions::search();
             handler.task.scope.source_index = index;
             handler.task.scope.ancestors = self.stack.clone();
             parsed.push(handler);
@@ -1503,14 +1532,18 @@ fn parse_module(task_map: &Mapping, kind: TaskKind) -> Result<(String, Mapping)>
 }
 
 fn parse_module_args(module: &str, value: &Value) -> Result<(String, Mapping)> {
-    let normalized = if matches!(
+    let resolved = if matches!(
         short_name(module),
         "import_tasks" | "include_tasks" | "include_role" | "import_role"
     ) {
-        short_name(module)
+        short_name(module).to_owned()
     } else {
-        crate::modules::registry::Builtin::lookup(module)?.name()
+        crate::extensions::Registry::current()
+            .module(module, &crate::extensions::search())?
+            .name()
+            .to_owned()
     };
+    let normalized = resolved.as_str();
     let mut args = Mapping::new();
     match value {
         Value::Null => {}
@@ -1550,7 +1583,19 @@ fn parse_module_args(module: &str, value: &Value) -> Result<(String, Mapping)> {
             module
         ),
     }
-    Ok((module.to_string(), args))
+    Ok((
+        if crate::modules::registry::Builtin::lookup(&resolved).is_ok()
+            || matches!(
+                normalized,
+                "import_tasks" | "include_tasks" | "include_role" | "import_role"
+            )
+        {
+            module.to_string()
+        } else {
+            resolved
+        },
+        args,
+    ))
 }
 
 fn parse_environment(map: &Mapping) -> Result<Mapping> {

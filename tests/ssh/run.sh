@@ -97,6 +97,7 @@ ansible_user=deploy
 ansible_ssh_private_key_file=$fixture_dir/key
 rustsible_known_hosts_file=$fixture_dir/known_hosts
 EOF
+if [[ $mode == extensions ]]; then source "$repo_dir/tests/ssh/extensions.sh"; exit 0; fi
 if [[ $mode == vault ]]; then source "$repo_dir/tests/ssh/vault.sh"; exit 0; fi
 if [[ $mode == operator ]]; then source "$repo_dir/tests/ssh/operator.sh"; exit 0; fi
 if [[ $mode == artifacts ]]; then source "$repo_dir/tests/ssh/artifacts.sh"; exit 0; fi

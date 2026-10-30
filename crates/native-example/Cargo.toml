@@ -1,0 +1,18 @@
+[package]
+name = "rustsible-native-example"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+publish = false
+[dependencies]
+anyhow = "1.0"
+serde_json = "1.0"
+serde_yaml = "0.9"
+rustsible-protocol = { path = "../protocol" }
+libc = "0.2"
+[[bin]]
+name = "rustsible-example-extension"
+path = "src/main.rs"
+[[bin]]
+name = "rustsible-extension-fixture"
+path = "src/fixture.rs"

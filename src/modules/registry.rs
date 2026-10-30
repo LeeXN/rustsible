@@ -8,7 +8,7 @@ use crate::ssh::config::ConnectionConfig;
 pub use rustsible_protocol::registry::{Builtin, CheckSupport};
 
 pub struct Invocation {
-    pub module: Builtin,
+    pub module: crate::extensions::Module,
     args: Value,
     check: bool,
     environment: std::collections::BTreeMap<String, String>,
@@ -18,8 +18,8 @@ pub struct Invocation {
 
 impl Invocation {
     pub fn prepare(name: &str, args: &Value, check: bool) -> Result<Self> {
-        let module = Builtin::lookup(name)?;
-        let args = if matches!(module, Builtin::Command | Builtin::Shell) {
+        let module = crate::extensions::Registry::current().module(name, &[])?;
+        let args = if matches!(module.builtin(), Some(Builtin::Command | Builtin::Shell)) {
             if let Some(raw) = args.get("_raw_params") {
                 let mut mapping = args
                     .as_mapping()
@@ -84,22 +84,28 @@ impl Invocation {
     }
     fn skip_check(&self) -> bool {
         self.check
-            && (matches!(self.module, Builtin::WaitFor | Builtin::Uri)
+            && (matches!(self.module.builtin(), Some(Builtin::WaitFor | Builtin::Uri))
                 || self.asynchronous.is_some()
-                || (matches!(self.module, Builtin::Command | Builtin::Shell)
-                    && self.args.get("creates").is_none()
+                || (matches!(
+                    self.module.builtin(),
+                    Some(Builtin::Command | Builtin::Shell)
+                ) && self.args.get("creates").is_none()
                     && self.args.get("removes").is_none()))
     }
     pub fn needs_connection(&self) -> bool {
-        !matches!(
-            self.module,
-            Builtin::Debug
-                | Builtin::Assert
-                | Builtin::Fail
-                | Builtin::SetFact
-                | Builtin::IncludeVars
-                | Builtin::Meta
-        ) && !self.skip_check()
+        !matches!(self.module, crate::extensions::Module::Action(_))
+            && !matches!(
+                self.module.builtin(),
+                Some(
+                    Builtin::Debug
+                        | Builtin::Assert
+                        | Builtin::Fail
+                        | Builtin::SetFact
+                        | Builtin::IncludeVars
+                        | Builtin::Meta
+                )
+            )
+            && !self.skip_check()
     }
     pub(crate) fn execute(
         mut self,
@@ -127,11 +133,24 @@ impl Invocation {
             };
         }
         let result = (|| {
+            if let crate::extensions::Module::Action(action) = &self.module {
+                if self.timeout_ms.is_some() {
+                    bail!("In-process compiled actions do not support task timeout");
+                }
+                let call = rustsible_protocol::extension::Call::new(
+                    &action.definition,
+                    self.args.clone(),
+                    self.check,
+                    runtime.diff_enabled() && action.definition.capabilities.diff,
+                    30000,
+                );
+                return (action.execute)(&call, vars);
+            }
             if self.module == Builtin::Debug {
                 return super::debug::execute_without_connection(&self.args);
             }
-            if matches!(self.module, Builtin::Assert | Builtin::Fail) {
-                return super::assertion::execute(self.module, &self.args, vars);
+            if let Some(builtin @ (Builtin::Assert | Builtin::Fail)) = self.module.builtin() {
+                return super::assertion::execute(builtin, &self.args, vars);
             }
             if self.module == Builtin::IncludeVars {
                 return crate::vars::include(&self.args);
@@ -221,6 +240,10 @@ impl Invocation {
                 self.check,
                 timeout_ms,
             );
+            if let crate::extensions::Module::Native(native) = &self.module {
+                request.module = "__native_extension".into();
+                request.extension = Some(native.definition.clone());
+            }
             request.environment = self.environment.clone();
             request.asynchronous = self
                 .asynchronous
@@ -237,7 +260,10 @@ impl Invocation {
                 )?;
                 return runtime.execute_request(config, request, Some(&mut source));
             }
-            if matches!(self.module, Builtin::Copy | Builtin::Template) {
+            if matches!(
+                self.module.builtin(),
+                Some(Builtin::Copy | Builtin::Template)
+            ) {
                 let mut args = self.args.clone();
                 let mut source = if self.module == Builtin::Template {
                     crate::worker::Source::bytes(super::template::render(&args, vars)?.into_bytes())
@@ -280,7 +306,7 @@ impl Invocation {
             }
             Ok(launched)
         })();
-        match result {
+        let mut completed = match result {
             Ok(mut result) => {
                 result.failed |= result.rc.is_some_and(|rc| rc != 0);
                 result.changed |= super::result::known_changed();
@@ -302,7 +328,26 @@ impl Invocation {
                 runtime.vault.protect_result(&mut result);
                 result
             }
+        };
+        if runtime.diff_enabled() {
+            completed.limit_diff();
+        } else {
+            completed.values.remove("diff");
         }
+        runtime
+            .extensions
+            .notify(&crate::extensions::compiled::Completion {
+                host: vars
+                    .get("inventory_hostname")
+                    .and_then(Value::as_str)
+                    .unwrap_or("")
+                    .to_owned(),
+                module: self.module.name().to_owned(),
+                outcome: completed.outcome(),
+                changed: completed.changed,
+                check: self.check,
+            });
+        completed
     }
     fn poll(
         &self,

@@ -2,8 +2,8 @@
 //! native executable extensions. No transport or playbook implementation lives here.
 mod args;
 pub mod change;
+pub mod extension;
 pub mod param;
-pub mod protection;
 pub mod registry;
 mod result;
 use anyhow::{bail, Context, Result};
@@ -13,7 +13,7 @@ use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::io::{Read, Write};
 
-pub const VERSION: u32 = 5;
+pub const VERSION: u32 = 6;
 pub const BUILD_ID: &str = env!("RUSTSIBLE_BUILD_ID");
 pub const MAX_REQUEST_BYTES: usize = 16 * 1024 * 1024;
 // JSON escaping can expand a bounded 16 MiB command response sixfold.
@@ -38,6 +38,7 @@ pub const NATIVE_MODULES: &[&str] = &[
     "uri",
     "git",
     "unarchive",
+    "__native_extension",
 ];
 
 #[derive(Serialize, Deserialize)]
@@ -47,6 +48,7 @@ pub struct Request {
     pub build_id: String,
     pub module: String,
     pub args: serde_yaml::Value,
+    pub extension: Option<extension::Definition>,
     pub check: bool,
     pub diff: bool,
     pub timeout_ms: u64,
@@ -103,6 +105,7 @@ impl Request {
             build_id: BUILD_ID.into(),
             module: module.into(),
             args,
+            extension: None,
             check,
             diff: false,
             timeout_ms,
@@ -112,7 +115,7 @@ impl Request {
             asynchronous: None,
         }
     }
-    pub fn validate(&self) -> Result<()> {
+    pub fn validate_envelope(&self) -> Result<()> {
         if self.version != VERSION {
             bail!("Worker protocol version mismatch");
         }
@@ -134,36 +137,37 @@ impl Request {
                 bail!("Invalid environment name or NUL byte in value");
             }
         }
-        if !NATIVE_MODULES.contains(&self.module.as_str()) {
-            bail!("Unsupported native module: {}", self.module);
+        if let Some(definition) = &self.extension {
+            if self.module != "__native_extension" || definition.kind != extension::Kind::Module {
+                bail!("Invalid native extension module request");
+            }
+            definition.validate_call(&self.extension_call()?)?;
+            if self.asynchronous.is_some() && !definition.capabilities.asynchronous {
+                bail!("Native extension does not support async");
+            }
+        } else {
+            if !NATIVE_MODULES.contains(&self.module.as_str()) {
+                bail!("Unsupported native module: {}", self.module);
+            }
+            registry::Builtin::lookup(&self.module)?.validate_capabilities(
+                self.check,
+                self.diff,
+                self.asynchronous.is_some(),
+            )?;
         }
-        registry::Builtin::lookup(&self.module)?.validate_capabilities(
-            self.check,
-            self.diff,
-            self.asynchronous.is_some(),
-        )?;
         if let Some(asynchronous) = &self.asynchronous {
             asynchronous.validate()?;
             if self.check {
                 bail!("Async tasks cannot start in check mode");
             }
-            registry::Builtin::lookup(&self.module)?.validate_capabilities(false, false, true)?;
-            if self.payload.is_some() {
+            if self.extension.is_none() && self.payload.is_some() {
                 bail!("Async tasks cannot receive controller file payloads");
             }
         }
-        if (matches!(self.module.as_str(), "copy" | "template")
-            || self.module == "unarchive"
-                && self
-                    .args
-                    .get("remote_src")
-                    .and_then(serde_yaml::Value::as_bool)
-                    != Some(true))
-            != self.payload.is_some()
-        {
-            bail!("Streamed payload is required only by copy/template and controller-source unarchive");
-        }
         if let Some(payload) = &self.payload {
+            if self.extension.is_some() && payload.size > 256 * 1024 * 1024 {
+                bail!("Native extension exceeds 256 MiB");
+            }
             if payload.sha256.len() != 64
                 || !payload.sha256.bytes().all(|byte| byte.is_ascii_hexdigit())
             {
@@ -171,6 +175,61 @@ impl Request {
             }
         }
         Ok(())
+    }
+    pub fn validate(&self) -> Result<()> {
+        self.validate_envelope()?;
+        let streamed = self.extension.is_some()
+            || matches!(self.module.as_str(), "copy" | "template")
+            || self.module == "unarchive"
+                && self
+                    .args
+                    .get("remote_src")
+                    .and_then(serde_yaml::Value::as_bool)
+                    != Some(true);
+        if streamed != self.payload.is_some() {
+            bail!("Unexpected or missing streamed module payload");
+        }
+        Ok(())
+    }
+    pub fn may_modify(&self) -> Result<bool> {
+        Ok(self.asynchronous.is_some()
+            || if let Some(definition) = &self.extension {
+                !self.check && definition.capabilities.mutates
+            } else {
+                registry::Builtin::lookup(&self.module)?.may_modify(&self.args, self.check)
+            })
+    }
+    pub fn supports_diff(&self) -> Result<bool> {
+        Ok(if let Some(definition) = &self.extension {
+            definition.capabilities.diff
+        } else {
+            registry::Builtin::lookup(&self.module)?.supports_diff()
+        })
+    }
+    pub fn validate_module_parameters(&self) -> Result<()> {
+        if let Some(definition) = &self.extension {
+            definition.validate_call(&self.extension_call()?)
+        } else {
+            registry::Builtin::lookup(&self.module)?.validate_parameters(&self.args)
+        }
+    }
+    pub fn extension_call(&self) -> Result<extension::Call> {
+        let definition = self
+            .extension
+            .as_ref()
+            .context("Missing native extension definition")?;
+        let mut call = extension::Call::new(
+            definition,
+            self.args.clone(),
+            self.check,
+            self.diff,
+            self.timeout_ms,
+        );
+        call.no_log = self
+            .asynchronous
+            .as_ref()
+            .is_some_and(|specification| specification.no_log);
+        Ok(call)
     }
 }
 

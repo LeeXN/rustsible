@@ -219,6 +219,13 @@ impl RunState {
             .lock()
             .map_err(|_| anyhow::anyhow!("Host runtime state was poisoned"))
     }
+    pub(crate) fn set_execution_modes(&mut self, check: bool, diff: bool) {
+        self.globals = std::sync::Arc::new(HashMap::from([
+            ("ansible_check_mode".into(), Value::Bool(check)),
+            ("ansible_diff_mode".into(), Value::Bool(diff)),
+        ]));
+    }
+
     pub(crate) fn prepare(
         &mut self,
         inventory: &crate::inventory::Inventory,
@@ -226,13 +233,14 @@ impl RunState {
         config: Option<&std::path::Path>,
     ) -> Result<()> {
         let groups = inventory.group_members();
-        let mut globals = HashMap::from([
+        let mut globals = (*self.globals).clone();
+        globals.extend(HashMap::from([
             ("groups".into(), serde_yaml::to_value(&groups)?),
             (
                 "playbook_dir".into(),
                 Value::String(playbook_dir.to_string_lossy().into_owned()),
             ),
-        ]);
+        ]));
         if let Some(source) = &inventory.source {
             globals.insert(
                 "inventory_file".into(),
@@ -475,7 +483,7 @@ impl RunState {
 
 impl Play {
     pub(crate) fn validate_strategy(&self) -> Result<()> {
-        if self.strategy != crate::playbook::Strategy::Free {
+        if self.strategy.engine() != crate::playbook::Strategy::Free {
             return Ok(());
         }
         if self.run_once.unwrap_or(false)
@@ -534,6 +542,8 @@ impl Play {
         state: &mut RunState,
     ) -> Result<()> {
         self.validate_strategy()?;
+        let ordered_hosts = self.strategy.order(hosts)?;
+        let hosts = ordered_hosts.as_slice();
         if forks == 0 {
             bail!("Play requires forks to be greater than zero");
         }
@@ -661,12 +671,15 @@ impl Play {
             for scope in state.host_state()?.contexts.values_mut() {
                 scope.globals = state.globals.clone();
             }
-            let executed = match self.strategy {
+            let executed = match self.strategy.engine() {
                 crate::playbook::Strategy::Linear => {
                     self.execute_batch(batch, check_mode, forks, state)
                 }
                 crate::playbook::Strategy::Free => {
                     self.execute_free_batch(batch, check_mode, forks, state)
+                }
+                crate::playbook::Strategy::Compiled(_) => {
+                    bail!("Compiled strategy is not registered")
                 }
             };
             if let Err(error) = executed {
@@ -699,6 +712,7 @@ impl Play {
         // host retains its own task stack, handlers and failure recovery.
         let completed = crate::scheduler::map(hosts, forks, |host| {
             let _vault = state.workers.vault.enter();
+            let _extensions = state.workers.extensions.enter();
             let mut play = self.clone();
             let mut run = state.fork_for(&host.name);
             let result = play.execute_batch(std::slice::from_ref(host), check_mode, 1, &mut run);
@@ -915,7 +929,7 @@ impl Play {
             .collect::<std::collections::VecDeque<_>>();
         let mut task_index = 0;
         while let Some(scheduled) = pending.pop_front() {
-            if self.strategy == crate::playbook::Strategy::Free {
+            if self.strategy.engine() == crate::playbook::Strategy::Free {
                 if state.stop_play.load(std::sync::atomic::Ordering::Acquire) {
                     break;
                 }
@@ -1236,7 +1250,7 @@ impl Play {
                                         ..Default::default()
                                     },
                                 )?;
-                                if self.strategy == crate::playbook::Strategy::Free {
+                                if self.strategy.engine() == crate::playbook::Strategy::Free {
                                     let mut selected = self.clone();
                                     selected.pre_tasks.clear();
                                     selected.post_tasks.clear();
@@ -1246,7 +1260,7 @@ impl Play {
                                 }
                                 let index = expansions.len();
                                 expansion_keys.insert(key, index);
-                                if self.strategy == crate::playbook::Strategy::Free {
+                                if self.strategy.engine() == crate::playbook::Strategy::Free {
                                     let mut exports = state.role_exports()?;
                                     crate::vars::merge(&mut exports.defaults, tasks.defaults);
                                     crate::vars::merge(&mut exports.variables, tasks.variables);
@@ -1689,9 +1703,10 @@ impl Play {
         };
         let mut results = crate::scheduler::map(selected, concurrency, |&host| {
             let _vault = state.workers.vault.enter();
+            let _extensions = state.workers.extensions.enter();
             let effective_task = play.apply_play_settings(task, host);
             let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                let _permit = if play.strategy == crate::playbook::Strategy::Free {
+                let _permit = if play.strategy.engine() == crate::playbook::Strategy::Free {
                     if let Some(limit) = effective_task.throttle.filter(|limit| *limit > 0) {
                         let identity = serde_json::to_vec(&serde_json::to_value((
                             &effective_task.source_file,

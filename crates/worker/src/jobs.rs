@@ -26,6 +26,7 @@ use std::{
 const FORMAT: u32 = 1;
 const STATUS: &str = "status.json";
 const PROGRAM: &str = "worker";
+const EXTENSION_PROGRAM: &str = "extension";
 
 #[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -228,6 +229,7 @@ impl Directory {
     fn remove(&self) -> Result<()> {
         self.unlink(STATUS)?;
         self.unlink(PROGRAM)?;
+        self.unlink(EXTENSION_PROGRAM)?;
         let base = self
             .base
             .as_ref()
@@ -264,8 +266,8 @@ impl Drop for Startup<'_> {
     }
 }
 
-pub fn start(request: &Request) -> ModuleResult {
-    match start_job(request) {
+pub fn start(request: &Request, payload: Option<&Path>) -> ModuleResult {
+    match start_job(request, payload) {
         Ok(result) => result,
         Err(error) => ModuleResult {
             failed: true,
@@ -278,13 +280,13 @@ pub fn start(request: &Request) -> ModuleResult {
         },
     }
 }
-fn start_job(request: &Request) -> Result<ModuleResult> {
+fn start_job(request: &Request, payload: Option<&Path>) -> Result<ModuleResult> {
     let specification = request
         .asynchronous
         .as_ref()
         .context("Missing async specification")?;
     request.validate()?;
-    Builtin::lookup(&request.module)?.validate_parameters(&request.args)?;
+    request.validate_module_parameters()?;
     let job = Directory::open(specification.directory.as_deref(), &specification.jid, true)?;
     let mut startup = Startup {
         job: &job,
@@ -299,6 +301,28 @@ fn start_job(request: &Request) -> Result<ModuleResult> {
     std::io::copy(&mut File::open("/proc/self/exe")?, &mut program)?;
     program.sync_all()?;
     drop(program);
+    if request.extension.is_some() {
+        let mut source = File::open(payload.context("Missing async native extension artifact")?)?;
+        let checksum = &request
+            .payload
+            .as_ref()
+            .context("Missing extension checksum")?
+            .sha256;
+        rustsible_protocol::extension::verify_binary(
+            &mut source,
+            checksum,
+            std::env::consts::ARCH,
+            "Native extension",
+        )?;
+        let mut target = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o700)
+            .custom_flags(libc::O_NOFOLLOW)
+            .open(job.location(EXTENSION_PROGRAM))?;
+        std::io::copy(&mut source, &mut target)?;
+        target.sync_all()?;
+    }
     job.save(&State {
         version: FORMAT,
         jid: job.jid.clone(),
@@ -406,7 +430,7 @@ pub fn supervise(descriptor: RawFd, jid: &str) -> Result<()> {
     if specification.jid != jid {
         bail!("Async job identity mismatch");
     }
-    Builtin::lookup(&request.module)?.validate_parameters(&request.args)?;
+    request.validate_module_parameters()?;
     crate::supervisor::prepare_detached()?;
     let mut state = job.load()?;
     state.started = true;
@@ -441,7 +465,17 @@ pub fn supervise(descriptor: RawFd, jid: &str) -> Result<()> {
         Duration::from_millis(specification.timeout_ms),
         true,
         matches!(request.module.as_str(), "service" | "systemd" | "package"),
-        |scratch| crate::modules::execute(&request, scratch, None),
+        |scratch| {
+            crate::modules::execute(
+                &request,
+                scratch,
+                request
+                    .extension
+                    .as_ref()
+                    .map(|_| job.location(EXTENSION_PROGRAM))
+                    .as_deref(),
+            )
+        },
     )?;
     let mut result = execution.result;
     if execution.timed_out {
@@ -459,6 +493,7 @@ pub fn supervise(descriptor: RawFd, jid: &str) -> Result<()> {
     state.finished = true;
     job.save(&state)?;
     job.unlink(PROGRAM)?;
+    job.unlink(EXTENSION_PROGRAM)?;
     Ok(())
 }
 

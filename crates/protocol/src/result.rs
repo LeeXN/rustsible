@@ -56,6 +56,37 @@ pub struct ModuleResult {
 }
 
 impl ModuleResult {
+    /// Providers share the same display bounds as builtin diff producers. Keep
+    /// binary/large strings as digests and cap aggregate structure size too.
+    pub fn limit_diff(&mut self) {
+        fn summary(bytes: &[u8]) -> Value {
+            let mut input = bytes;
+            let digest = crate::sha256(&mut input).expect("Reading an in-memory diff cannot fail");
+            serde_yaml::to_value(
+                serde_json::json!({"size":bytes.len(),"sha256":digest,"content_omitted":true}),
+            )
+            .expect("Diff summary is serializable")
+        }
+        fn bound(value: &mut Value) {
+            match value {
+                Value::String(text) if text.len() > 64 * 1024 || text.contains('\0') => {
+                    *value = summary(text.as_bytes())
+                }
+                Value::Sequence(values) => values.iter_mut().for_each(bound),
+                Value::Mapping(values) => values.values_mut().for_each(bound),
+                _ => {}
+            }
+        }
+        if let Some(diff) = self.values.get_mut("diff") {
+            bound(diff);
+            if let Ok(bytes) = serde_json::to_vec(diff) {
+                if bytes.len() > 128 * 1024 {
+                    *diff = summary(&bytes);
+                }
+            }
+        }
+    }
+
     pub fn displayed(&self) -> Self {
         if !self.no_log {
             return self.clone();
@@ -155,4 +186,30 @@ pub fn insert_output_values(
         "rc".to_string(),
         rc.map_or(Value::Null, |code| Value::Number(code.into())),
     );
+}
+
+#[cfg(test)]
+mod diff_tests {
+    use super::*;
+    #[test]
+    fn external_diff_cannot_exceed_builtin_text_binary_or_aggregate_display_bounds() {
+        let mut result = ModuleResult::default();
+        result.values.insert("diff".into(),serde_yaml::to_value(serde_json::json!({"before":"é".repeat(40000),"after":"binary\0data","marker":"retained"})).unwrap());
+        result.limit_diff();
+        let diff = &result.values["diff"];
+        assert_eq!(diff["before"]["size"].as_u64(), Some(80000));
+        assert_eq!(diff["before"]["sha256"].as_str().unwrap().len(), 64);
+        assert_eq!(diff["after"]["content_omitted"].as_bool(), Some(true));
+        assert_eq!(diff["marker"].as_str(), Some("retained"));
+        result.values.insert(
+            "diff".into(),
+            serde_yaml::to_value(vec!["a".repeat(1000); 200]).unwrap(),
+        );
+        result.limit_diff();
+        assert_eq!(
+            result.values["diff"]["content_omitted"].as_bool(),
+            Some(true)
+        );
+        assert!(serde_json::to_vec(&result.values["diff"]).unwrap().len() < 1024);
+    }
 }

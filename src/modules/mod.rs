@@ -28,6 +28,7 @@ pub struct AdHocOptions {
     pub diff: bool,
     pub credentials: crate::ssh::credentials::Credentials,
     pub vault: std::sync::Arc<crate::vault::Vault>,
+    pub extensions: std::sync::Arc<crate::extensions::Registry>,
     pub background: u64,
     pub poll: u64,
     pub forks: usize,
@@ -46,6 +47,7 @@ impl Default for AdHocOptions {
             diff: false,
             credentials: Default::default(),
             vault: crate::vault::Vault::current(),
+            extensions: crate::extensions::Registry::current(),
             background: 0,
             poll: 15,
             forks: 5,
@@ -70,6 +72,7 @@ pub fn run_adhoc_with_options(
     options: &AdHocOptions,
 ) -> Result<()> {
     let _vault = options.vault.enter();
+    let _extensions = options.extensions.enter();
     options
         .vault
         .protect(run_adhoc_in_scope(hosts, module_name, args, options))
@@ -105,7 +108,8 @@ fn run_adhoc_in_scope(
         ));
     }
 
-    let module_name = registry::Builtin::lookup(module_name)?.name();
+    let resolved_module = crate::extensions::Registry::current().module(module_name, &[])?;
+    let module_name = resolved_module.name();
     // Parse CLI syntax once. Render and validate per host before opening its
     // connection, because extra/inventory variables can change argument types.
     let module_args = prepare_adhoc_args(module_name, args)?;
@@ -138,8 +142,10 @@ fn run_adhoc_in_scope(
         crate::worker::Runtime::new(options.worker_dir.clone())
             .with_credentials(options.credentials.clone())
             .with_vault(options.vault.clone())
+            .with_extensions(options.extensions.clone())
             .with_diff(options.diff),
     );
+    state.set_execution_modes(options.check_mode, options.diff);
     state.prepare(
         inventory,
         &std::env::current_dir()?,
@@ -149,6 +155,7 @@ fn run_adhoc_in_scope(
     let runtime = &state.workers;
     let executions = crate::scheduler::map(hosts, options.forks, |host| {
         let _vault = state.workers.vault.enter();
+        let _extensions = state.workers.extensions.enter();
         let start_time = Instant::now();
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             let mut variables = state.variables_for(&host.name, &globals)?;
@@ -302,9 +309,11 @@ struct HostExecution {
 }
 
 fn prepare_adhoc_args(module_name: &str, args: &str) -> Result<Value> {
-    let module = registry::Builtin::lookup(module_name)?;
-    match module {
-        registry::Builtin::Command | registry::Builtin::Shell => parse_command_adhoc_args(args),
+    let module = crate::extensions::Registry::current().module(module_name, &[])?;
+    match module.builtin() {
+        Some(registry::Builtin::Command | registry::Builtin::Shell) => {
+            parse_command_adhoc_args(args)
+        }
         _ => parse_mapping_adhoc_args(args, module == registry::Builtin::Setup),
     }
 }
@@ -395,6 +404,7 @@ fn execute_adhoc_module(
         &crate::worker::Runtime::new(options.worker_dir.clone())
             .with_credentials(options.credentials.clone())
             .with_vault(options.vault.clone())
+            .with_extensions(options.extensions.clone())
             .with_diff(options.diff),
         &variables,
     )
@@ -714,6 +724,7 @@ mod tests {
             diff: false,
             credentials: Default::default(),
             vault: crate::vault::Vault::current(),
+            extensions: crate::extensions::Registry::current(),
             forks: 5,
             ..AdHocOptions::default()
         };

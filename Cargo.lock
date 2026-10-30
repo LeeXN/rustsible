@@ -1538,6 +1538,7 @@ dependencies = [
  "colored",
  "ctr",
  "env_logger",
+ "flate2",
  "getrandom 0.4.3",
  "hmac",
  "libc",
@@ -1548,6 +1549,8 @@ dependencies = [
  "proptest",
  "regex",
  "rpassword",
+ "rustsible-native",
+ "rustsible-native-example",
  "rustsible-protocol",
  "serde",
  "serde_json",
@@ -1555,8 +1558,35 @@ dependencies = [
  "sha-crypt",
  "sha2",
  "ssh2",
+ "tar",
  "tempfile",
  "zeroize",
+]
+
+[[package]]
+name = "rustsible-native"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "flate2",
+ "libc",
+ "rustsible-protocol",
+ "serde",
+ "serde_json",
+ "tar",
+ "tempfile",
+ "zip",
+]
+
+[[package]]
+name = "rustsible-native-example"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "libc",
+ "rustsible-protocol",
+ "serde_json",
+ "serde_yaml",
 ]
 
 [[package]]
@@ -1564,7 +1594,6 @@ name = "rustsible-protocol"
 version = "0.1.0"
 dependencies = [
  "anyhow",
- "libc",
  "regex",
  "serde",
  "serde_json",
@@ -1584,6 +1613,7 @@ dependencies = [
  "regex",
  "reqwest",
  "rustls",
+ "rustsible-native",
  "rustsible-protocol",
  "serde",
  "serde_json",
