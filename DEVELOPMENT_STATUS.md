@@ -24,7 +24,7 @@
 | 19 CLI/tags/diff | 已实现并验证 | [#21](https://github.com/LeeXN/rustsible/pull/21)， tags/skip-tags、静态继承/动态 apply、handler 及过滤 rescue；无连接的 JSON 语法/列表、结构化有界 diff/no_log、隐藏 SSH/sudo 提示和私钥优先级；真实 PTY、固定 Ansible 2.21 对照及 87.03% 覆盖率；[双架构 CI 40941504804](https://github.com/LeeXN/rustsible/actions/runs/40941504804) 八作业通过，glibc/musl SSH 三身份、预演、清理及离线包有实证；协议 v5 |
 | 20 Vault | 已实现并验证 | [#22](https://github.com/LeeXN/rustsible/pull/22)，AES256 1.1/1.2、HMAC 先验、密码来源/ID、CLI 四入口、内存加载与惰性 !vault、普通数据不重渲染；固定参考双向验证、覆盖率门禁；[双架构 CI 40961978764](https://github.com/LeeXN/rustsible/actions/runs/40961978764) 八作业通过，glibc/musl 三身份、写满保留 inode/capabilities、无 Python 控制端；修复异步原子快照/监督进程退出观察竞态 |
 | 21 collections 与原生扩展 | 实现并验收中 | 受控搜索/FQCN/角色与 playbook、原生模块及 inventory/lookup/filter、打包/安装/校验和外部授权记录；编译期 action/callback/connection/become/strategy 已接入并有真实执行测试；崩溃/超时/脱离会话后代回收、check/async/数据不重渲染已有本地证据；真实 SSH、参考及最终双架构 CI 待完成，协议 v6 |
-| 22 完整发布验收 | 待实施 | 组合部署、Vault/异步/离线 collection、跨架构最终包和完整支持矩阵 |
+| 22 完整发布验收 | 实现并验收中 | 三机组合部署脚本、Vault/异步/离线 collection、跨架构最终包、RELEASE.json/build-info 和支持矩阵已编写；按最终压缩包启动的真实运行与双架构 CI 待完成，未将配置存在计作通过 |
 
 当前验证包括 fmt、Clippy、全量测试、超过 80% 的行覆盖率、release 构建；真实 x86_64 SSH 的 deploy/root/app、check 前后业务状态一致、幂等、facts/register、权限/属主和清理；固定 ansible-core 2.21.0 的模板及条件对照；非法参数修改前失败，实际中断任务只执行一次、阻止后续循环项/后续 play。普通 Cargo 测试与参考环境分开。依赖审计保留既有 unsafe-libyaml 停止维护警告。
 

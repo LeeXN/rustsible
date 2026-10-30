@@ -10,6 +10,15 @@ fn main() -> Result<()> {
         return result;
     }
     let matches = cli::build_cli().get_matches();
+    if matches.subcommand_name() == Some("build-info") {
+        println!(
+            "{}",
+            serde_json::to_string(
+                &serde_json::json!({"version":env!("CARGO_PKG_VERSION"),"build_id":rustsible_protocol::BUILD_ID,"protocol_version":rustsible_protocol::VERSION,"arch":std::env::consts::ARCH,"os":std::env::consts::OS})
+            )?
+        );
+        return Ok(());
+    }
     let vault = rustsible::vault::Vault::from_cli(&matches)?;
     let _scope = vault.enter();
     if let Some(("vault", sub)) = matches.subcommand() {
