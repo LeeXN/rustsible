@@ -3,7 +3,6 @@
   serial: '{{ deployment_batches }}'
   vars:
     deployment_batches: [1, 2]
-    demo_root: /tmp/rustsible-rolling-demo
   pre_tasks:
     - file:
         path: '{{ demo_root }}-{{ inventory_hostname }}'
@@ -23,6 +22,7 @@
     - command:
         argv: [cat, '{{ demo_root }}-{{ inventory_hostname }}/config']
       register: health
+      when: not ansible_check_mode
       changed_when: false
       failed_when: health.stdout != ('host=' ~ inventory_hostname ~ '; leader=' ~ leader.stdout)
     - copy:

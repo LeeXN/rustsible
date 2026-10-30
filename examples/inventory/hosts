@@ -1,34 +1,5 @@
-# Inventory file example for Rustsible
-# This file follows the Ansible inventory format
-
-# Local host for testing
+[local]
 localhost ansible_connection=local
 
-# Web server group
-[webservers]
-web1.example.com
-web2.example.com ansible_ssh_user=webadmin
-
-# Database server group
-[dbservers]
-db1.example.com ansible_ssh_user=dbadmin
-db2.example.com:2222 ansible_ssh_user=dbadmin
-db1 ansible_host=192.168.1.201 ansible_user=admin
-db2 ansible_host=192.168.1.202 ansible_user=admin
-
-[test]
-localhost
-# Group variables
-[webservers:vars]
-http_port=80
-https_port=443
-
-[dbservers:vars]
-db_port=5432
-backup_enabled=true
-
-# All servers
-[all:vars]
-ansible_ssh_user=admin
-# Use an absolute path; Rustsible does not expand '~' in inventory values.
-ansible_ssh_private_key_file=/home/admin/.ssh/id_rsa
+[web:children]
+local

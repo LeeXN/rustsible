@@ -1850,19 +1850,18 @@ fn documented_subset_examples_remain_parseable() -> Result<()> {
     let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     let inventory = inventory::Inventory::new();
     for relative_path in [
-        "playbooks/test_all_modules.yml",
-        "playbooks/test_command.yml",
-        "playbooks/test_lineinfile.yml",
-        "playbooks/test_service.yml",
-        "playbooks/test_shell.yml",
-        "playbooks/test_user.yml",
-        "manual/local-smoke.yml",
-        "manual/cleanup-local.yml",
-        "reuse/main.yml",
+        "quickstart/playbook.yml",
+        "quickstart/cleanup.yml",
+        "files/playbook.yml",
+        "variables/playbook.yml",
+        "roles/main.yml",
         "rolling/playbook.yml",
         "async/playbook.yml",
-        "assertions.yml",
-        "network.yml",
+        "assertions/playbook.yml",
+        "http/playbook.yml",
+        "selection/playbook.yml",
+        "vault/playbook.yml",
+        "artifacts/playbook.yml",
     ] {
         let path = manifest_dir.join("examples").join(relative_path);
         let error = run_playbook(path.to_str().unwrap(), &inventory).unwrap_err();
@@ -2450,7 +2449,7 @@ fn reusable_deployment_example_predicts_new_directories_without_creating_busines
     let inventory = local_inventory();
     let output = controller()
         .arg("playbook")
-        .arg(PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("examples/reuse/main.yml"))
+        .arg(PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("examples/roles/main.yml"))
         .arg("-i")
         .arg(inventory.path())
         .arg("-e")

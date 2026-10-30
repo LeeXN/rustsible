@@ -1,0 +1,10 @@
+- hosts: all
+  gather_facts: false
+  tasks:
+    - assert:
+        that:
+          - demo_root is defined
+          - demo_root != '/'
+    - file:
+        path: '{{ demo_root }}/app'
+        state: absent

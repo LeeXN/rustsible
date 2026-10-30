@@ -1,4 +1,0 @@
-- import_playbook: deploy.yml
-  vars:
-    demo_output: /tmp/rustsible-reuse-demo
-

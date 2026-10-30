@@ -1,0 +1,14 @@
+- hosts: all
+  gather_facts: false
+  tasks:
+    - git:
+        repo: '{{ source_repo }}'
+        dest: '{{ demo_root }}/source'
+        version: '{{ release_revision }}'
+    - file:
+        path: '{{ demo_root }}/release'
+        state: directory
+        mode: '0700'
+    - unarchive:
+        src: '{{ archive_source }}'
+        dest: '{{ demo_root }}/release'

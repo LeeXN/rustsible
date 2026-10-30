@@ -1,0 +1,9 @@
+- hosts: all
+  gather_facts: false
+  vars_files: ['{{ vault_variables }}']
+  tasks:
+    - copy:
+        content: '{{ example_value }}'
+        dest: '{{ demo_root }}/vault-config'
+        mode: '0600'
+      no_log: true

@@ -1,0 +1,18 @@
+- hosts: all
+  gather_facts: false
+  vars:
+    application_name: rustsible
+  tasks:
+    - file:
+        path: '{{ demo_root }}/files'
+        state: directory
+        mode: '0700'
+    - template:
+        src: config.j2
+        dest: '{{ demo_root }}/files/config'
+        mode: '0600'
+    - lineinfile:
+        path: '{{ demo_root }}/managed-lines'
+        regexp: '^enabled='
+        line: enabled=true
+        create: true

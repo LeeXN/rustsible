@@ -1,12 +1,21 @@
-- name: Inspect variable sources without changing the target
-  hosts: all
-  vars_files: [data.yml]
+- hosts: all
+  gather_facts: false
+  vars:
+    message: hello
+    selected: [one, two]
   tasks:
-    - include_vars:
-        file: data.yml
-        name: deployment
     - set_fact:
-        prepared_hosts: '{{ prepared_hosts | default([]) + [item] }}'
-      loop: '{{ groups.all }}'
-    - debug:
-        msg: '{{ inventory_hostname }}: {{ deployment.application }} on {{ ansible_distribution }} {{ ansible_distribution_version }}; hosts={{ prepared_hosts | join(",") }}'
+        persistent_message: '{{ message }}'
+    - copy:
+        content: '{{ item }}'
+        dest: '{{ demo_root }}/{{ item }}'
+        mode: '0600'
+      loop: '{{ selected }}'
+      register: written
+    - assert:
+        that: written.results | length == 2
+- hosts: all
+  gather_facts: false
+  tasks:
+    - assert:
+        that: persistent_message == 'hello'

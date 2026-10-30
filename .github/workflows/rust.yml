@@ -36,6 +36,8 @@ jobs:
         run: cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
       - name: Build native test workers
         run: cargo build --workspace --locked
+      - name: Verify bilingual documentation and generated references
+        run: cargo run --locked --example docs -- --check
       - name: Run tests
         run: cargo test --workspace --all-targets --all-features --locked
       - name: Install cargo-llvm-cov
@@ -237,6 +239,17 @@ jobs:
             cd /release
             sha256sum -c SHA256SUMS
             printf "localhost ansible_connection=local\n" > /tmp/inventory
+            test -f docs/en/index.md
+            test -f docs/zh-CN/index.md
+            test -f README.zh-CN.md
+            ./rustsible playbook examples/quickstart/playbook.yml -i examples/quickstart/inventory.yml -e demo_root=/tmp/offline-doc-demo --check
+            [ ! -e /tmp/offline-doc-demo/app ]
+            ./rustsible playbook examples/quickstart/playbook.yml -i examples/quickstart/inventory.yml -e demo_root=/tmp/offline-doc-demo
+            [ "$(cat /tmp/offline-doc-demo/app/applied)" = applied ]
+            ./rustsible playbook examples/quickstart/playbook.yml -i examples/quickstart/inventory.yml -e demo_root=/tmp/offline-doc-demo > /tmp/offline-doc-second.log
+            grep -q "changed=0 unreachable=0 failed=0" /tmp/offline-doc-second.log
+            ./rustsible playbook examples/quickstart/cleanup.yml -i examples/quickstart/inventory.yml -e demo_root=/tmp/offline-doc-demo
+            [ ! -e /tmp/offline-doc-demo/app ]
             ./rustsible ad-hoc localhost -m setup -i /tmp/inventory
             ./rustsible ad-hoc localhost -m stat -a "path=/etc/passwd checksum_algorithm=sha256" -i /tmp/inventory
             ./rustsible collection install /native.tar.gz --path /tmp/collections

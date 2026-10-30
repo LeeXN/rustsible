@@ -18,9 +18,9 @@ install -m 0755 -- "$controller" "$output/rustsible"
 cd -- "$repo_dir"
 cargo run --locked -p rustsible-protocol --example worker_manifest -- "$output/workers" "x86_64=$x86_worker" "aarch64=$arm_worker"
 cargo run --locked -p rustsible-protocol --example release_manifest -- "$output"
-install -m 0644 -- "$repo_dir/README.md" "$repo_dir/LICENSE" "$repo_dir/NATIVE_EXTENSIONS.md" "$repo_dir/SUPPORT_MATRIX.md" "$repo_dir/DEVELOPMENT_STATUS.md" "$output/"
+cargo run --locked --example docs -- --package "$output"
 cd -- "$output"
-sha256sum rustsible RELEASE.json README.md LICENSE NATIVE_EXTENSIONS.md SUPPORT_MATRIX.md DEVELOPMENT_STATUS.md workers/manifest.json workers/rustsible-worker-linux-* > SHA256SUMS
+find . -type f ! -name SHA256SUMS -print0 | sort -z | xargs -0 sha256sum > SHA256SUMS
 sha256sum -c SHA256SUMS
 cd -- "$(dirname -- "$output")"
 tar -czf "$output.tar.gz" -- "$(basename -- "$output")"
