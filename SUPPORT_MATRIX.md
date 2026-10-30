@@ -37,7 +37,7 @@
 - command/shell 缺少 creates/removes 时 check 跳过；不会执行命令。shell 解释用户明确提供的 shell 程序，其余系统工具使用参数数组。
 - wait_for/uri 在 check 下跳过。async 在 check 下跳过且不创建后台任务。async 不是控制端上传的后台化方式；copy/template 和控制端 unarchive payload 不支持 async。
 - diff 由支持模块结构化返回，文本每侧最多 64 KiB；大文件/二进制只显示摘要；no_log 及受保护 Vault 输入隐藏敏感内容。
-- package 支持实际系统上的 apt、dnf、yum、apk、pacman、zypper；service 支持实际 systemd、OpenRC、SysV、Upstart。缺少工具时报错，不自动安装；check 不刷新缓存或改变服务状态。
+- package 支持实际系统上的 apt、dnf、yum、apk、pacman、zypper；service 支持实际 systemd、OpenRC、SysV、Upstart。缺少工具时报错，不自动安装；check 不刷新缓存或改变服务状态。 APT/APK 与 systemd/OpenRC/SysV 有双架构真实验收；DNF/Yum/Pacman/Zypper 与 Upstart 的现有真实验收仅覆盖 x86_64，不将其 aarch64 后端列为已验收。
 - git 支持固定 revision/分支/标签、update、保留本地修改的拒绝行为；unarchive 支持 tar、tar.gz、ZIP，拒绝链接、设备、越界写入，预解码后再安装。
 - setup 的 subset/filter 只支持注册表明确列出的平台、发行版、系统、架构、主机名、网络和时间 facts；不伪造控制端时间，不包含整个 Ansible facts 集合。
 - get_url/uri 使用目标端 DNS、代理与证书信任；响应/内容匹配有明确边界。大文件下载、文件传输以流传递，不塞入协议 JSON。
