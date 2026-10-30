@@ -185,8 +185,6 @@ jobs:
 
   offline-packages:
     name: Final offline deployment (${{ matrix.arch }})
-    env:
-      RUSTSIBLE_ACCEPTANCE_OUTPUT: ${{ runner.temp }}/rustsible-acceptance
     needs: [quality, ssh]
     strategy:
       fail-fast: false
@@ -245,11 +243,15 @@ jobs:
             [ -z "$(find /tmp -name ".rustsible-worker-*")" ]
           '
       - name: Full deployment from the extracted native release (glibc and musl)
+        env:
+          RUSTSIBLE_ACCEPTANCE_OUTPUT: ${{ runner.temp }}/rustsible-acceptance
         run: |
           for libc in glibc musl; do
             bash tests/ssh/run.sh "$RUNNER_TEMP/rustsible-extracted/${{ matrix.arch }}/rustsible" "$RUNNER_TEMP/rustsible-extracted/${{ matrix.arch }}/workers" release "$libc" "target/native/native-${{ matrix.arch }}/examples/http_fixture" "$RUNNER_TEMP/native-example"
           done
       - name: Foreign controller operates a native target using the other worker architecture
+        env:
+          RUSTSIBLE_ACCEPTANCE_OUTPUT: ${{ runner.temp }}/rustsible-acceptance
         run: |
           tar -xzf "$RUNNER_TEMP/rustsible-packages/${{ matrix.other }}.tar.gz" -C "$RUNNER_TEMP/rustsible-extracted"
           bash tests/ssh/run.sh "$RUNNER_TEMP/rustsible-extracted/${{ matrix.other }}/rustsible" "$RUNNER_TEMP/rustsible-extracted/${{ matrix.other }}/workers" cross glibc "${{ matrix.other }}"
