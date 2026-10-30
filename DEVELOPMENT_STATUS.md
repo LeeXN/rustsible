@@ -1,6 +1,6 @@
 # 分阶段计划的实现状态
 
-当前已实现并验证计划 **01–19**，以及文件安全补充修复。**M1、M2、M3 已达成；完整的 22 项计划尚未完成。**
+计划 **01–21** 已实现并通过对应验收，M1、M2、M3 已达成。第 22 项及 M4 的完成状态以 [PR #24 的本提交检查记录](https://github.com/LeeXN/rustsible/pull/24/checks) 为准：九个必需作业全部成功，并保留最终发布包与目标证据。
 
 | 计划项 | 交付 | 证据 |
 | --- | --- | --- |
@@ -26,10 +26,10 @@
 | 21 collections 与原生扩展 | 已实现并验证 | [#23](https://github.com/LeeXN/rustsible/pull/23)，受控搜索/FQCN/角色/playbook、原生 module/inventory/lookup/filter、打包/安装/校验和集合外授权记录；编译期 action/callback/connection/become/strategy 真实接入；版本/崩溃/超时/后代回收、check/diff/async、数据不重渲染；本地行覆盖率 87.19%；[双架构 CI 40978538184](https://github.com/LeeXN/rustsible/actions/runs/40978538184) 八作业通过，包括 glibc/musl SSH 三身份、无 Python/curl 控制端、固定参考与离线双架构集合；协议 v6 |
 | 22 完整发布验收 | 见 [#24 检查记录](https://github.com/LeeXN/rustsible/pull/24/checks) | 三机下载校验→role/Vault 配置→handler→滚动/健康→救援，首次/幂等/check/异步与清理；最终压缩包及目标证据由本提交 CI 产出；完成标准是两种原生架构的全部九作业成功，QEMU 控制端跨架构场景单独标注；源码、RELEASE.json/build-info、双 worker 与校验清单相互核对 |
 
-当前验证包括 fmt、Clippy、全量测试、超过 80% 的行覆盖率、release 构建；真实 x86_64 SSH 的 deploy/root/app、check 前后业务状态一致、幂等、facts/register、权限/属主和清理；固定 ansible-core 2.21.0 的模板及条件对照；非法参数修改前失败，实际中断任务只执行一次、阻止后续循环项/后续 play。普通 Cargo 测试与参考环境分开。依赖审计保留既有 unsafe-libyaml 停止维护警告。
+当前验证包括 fmt、Clippy、全量测试、超过 80% 的行覆盖率、release 构建；真实 x86_64/aarch64 SSH 的 deploy/root/app、check 前后业务状态一致、幂等、facts/register、权限/属主和清理；固定 ansible-core 2.21.0 的模板及条件对照；非法参数修改前失败，实际中断任务只执行一次、阻止后续循环项/后续 play。普通 Cargo 测试与参考环境分开。依赖审计保留既有 unsafe-libyaml 停止维护警告。
 
-已有独立原生 worker、版本化协议、清单生成器与双架构离线包脚本。全部内置目标模块均走原生 worker，不调用 Python；get_url 使用原生 Rustls HTTP。无 Python/curl 的 Debian/Alpine、真实 systemd/OpenRC/SysV、双架构与离线包验收通过。DNF/Yum 自身可能依赖操作系统 Python，不属于 Rustsible 的运行依赖。22 的最终发布组合验收仍需后续能力完成后执行。
+已有独立原生 worker、版本化协议、清单生成器与双架构离线包脚本。全部内置目标模块均走原生 worker，不调用 Python；get_url 使用原生 Rustls HTTP。无 Python/curl 的 Debian/Alpine、真实 systemd/OpenRC/SysV、双架构与离线包验收通过。DNF/Yum 自身可能依赖操作系统 Python，不属于 Rustsible 的运行依赖。22 的最终组合场景、源码与产物对应关系由最终发布 CI 和可下载目标证据记录。
 
 已启用 ubuntu-24.04 / ubuntu-24.04-arm 的完整质量门禁与真实 SSH 作业，两种架构都已实际完成 glibc/musl 的原生执行、三身份与密码 sudo、check、noexec、中断及后代回收；musl 场景也在目标环境运行了静态控制端。双架构包包含相同构建的两个 worker，解包后在断网的无 Python/curl 容器中实际完成 setup/stat。不能用交叉编译或工作流配置本身代替运行结果。
 
-后续仍按原计划完整推进。06 的执行链和离线包单独审查，便于先固化安全与取消边界；依赖紧密的后续项目可合成一个 PR：07–08（文件下载与其余模块原生迁移）、09–10（连接/调度/执行条件）、11–13（变量来源/roles/失败处理）、14–15（发布编排/异步）、16–19（常用模块/CLI）、20–22（Vault/原生扩展/完整发布验收）。这些分组不缩减原计划中的功能与验收范围。
+本计划采用分阶段的独立 PR 交付，具体合入记录与验收证据见上表。当前模块、平台、配置和扩展边界见 [SUPPORT_MATRIX.md](SUPPORT_MATRIX.md)；未覆盖的特定后端与架构组合不会因整体 CI 成功而被计为已验收。
