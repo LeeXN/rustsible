@@ -185,6 +185,8 @@ jobs:
 
   offline-packages:
     name: Final offline deployment (${{ matrix.arch }})
+    env:
+      RUSTSIBLE_ACCEPTANCE_OUTPUT: ${{ runner.temp }}/rustsible-acceptance
     needs: [quality, ssh]
     strategy:
       fail-fast: false
@@ -251,6 +253,11 @@ jobs:
         run: |
           tar -xzf "$RUNNER_TEMP/rustsible-packages/${{ matrix.other }}.tar.gz" -C "$RUNNER_TEMP/rustsible-extracted"
           bash tests/ssh/run.sh "$RUNNER_TEMP/rustsible-extracted/${{ matrix.other }}/rustsible" "$RUNNER_TEMP/rustsible-extracted/${{ matrix.other }}/workers" cross glibc "${{ matrix.other }}"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: release-target-evidence-${{ matrix.arch }}
+          path: ${{ runner.temp }}/rustsible-acceptance
+          if-no-files-found: error
       - uses: actions/upload-artifact@v4
         with:
           name: offline-linux-packages-${{ matrix.arch }}

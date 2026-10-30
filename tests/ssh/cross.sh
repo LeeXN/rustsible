@@ -38,3 +38,17 @@ for pair in plain:deploy root:root app:app; do
     ' sh "$name" "$user" "$expected_controller" "$target_arch"
 done
 printf 'Cross-architecture release passed: QEMU %s controller -> native %s SSH worker, three identities, check, idempotence and cleanup\n' "$expected_controller" "$target_arch"
+if [[ -n ${RUSTSIBLE_ACCEPTANCE_OUTPUT:-} ]]; then
+    evidence_dir=$RUSTSIBLE_ACCEPTANCE_OUTPUT/cross-$expected_controller-to-$target_arch
+    mkdir -p "$evidence_dir"
+    printf '%s\n' "$controller_info" > "$evidence_dir/controller.json"
+    cp "$fixture_dir"/cross-*.log "$evidence_dir/"
+    docker exec "$container" sh -eu -c '
+        printf "native_target_arch="; uname -m
+        for name in plain root app; do
+            stat -c "%n:%u:%g:%a" "/srv/rustsible/$name/cross"
+            sha256sum "/srv/rustsible/$name/cross"
+        done
+        printf "bootstrap_directories="; find /tmp -name ".rustsible-worker-*" | wc -l
+    ' > "$evidence_dir/target.txt"
+fi

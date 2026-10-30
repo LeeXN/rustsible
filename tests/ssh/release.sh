@@ -201,3 +201,25 @@ for server in "${rollout_containers[@]}"; do
 done
 if grep -Eq 'release-secret-canary|release-vault-password' "$fixture_dir"/release-*.log; then echo 'Protected release input leaked into output' >&2; exit 1; fi
 printf 'Release deployment scenario passed: native %s/%s, three SSH servers, identities, checksum, roles, Vault, handlers, rolling, health, rescue, async and cleanup\n' "$target_arch" "$libc"
+# Keep target evidence outside the temporary fixture, without decrypted content,
+# credentials or private inventory. Publication happens only after leak checks.
+if [[ -n ${RUSTSIBLE_ACCEPTANCE_OUTPUT:-} ]]; then
+    evidence_dir=$RUSTSIBLE_ACCEPTANCE_OUTPUT/$target_arch-$libc
+    mkdir -p "$evidence_dir"
+    "$controller_binary" build-info > "$evidence_dir/controller.json"
+    cp "$fixture_dir/release-before" "$evidence_dir/check-before.txt"
+    cp "$fixture_dir/release-after" "$evidence_dir/check-after.txt"
+    cp "$fixture_dir"/release-*.log "$evidence_dir/"
+    for index in 0 1 2; do
+        server=${rollout_containers[$index]}
+        docker exec "$server" sh -eu -c '
+            printf "target_arch="; uname -m
+            printf "config_uid_gid_mode="; stat -c "%u:%g:%a" /srv/rustsible/rollout/config
+            printf "artifact_uid_gid_mode="; stat -c "%u:%g:%a" /srv/rustsible/rollout/artifact
+            sha256sum /srv/rustsible/rollout/config /srv/rustsible/rollout/applied /srv/rustsible/rollout/artifact
+            printf "bootstrap_directories="; find /tmp -name ".rustsible-worker-*" | wc -l
+            printf "remaining_async_jobs="
+            find /root/.rustsible_async /home/deploy/.rustsible_async /home/app/.rustsible_async -mindepth 1 -maxdepth 1 -type d 2>/dev/null | wc -l
+        ' > "$evidence_dir/node$((index + 1)).txt"
+    done
+fi

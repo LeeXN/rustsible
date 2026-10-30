@@ -72,3 +72,5 @@ free 不支持 run_once/any_errors_fatal/max_fail_percentage 组合，执行前�
 全局 --check 不能由 task check_mode:false 取消；允许临时引导上传并清理，禁止业务修改和异步启动。修改中断后结果无法确认则报告 uncertain，不自动重放。原子文件替换保留未指定权限/属主及保护元数据，失败保留原文件；无法安全处理时明确报错。
 
 CI 的 ubuntu-24.04 与 ubuntu-24.04-arm 分别提供原生 x86_64/aarch64 运行证据，glibc/musl SSH 测试覆盖 deploy/root/app。systemd/OpenRC/SysV/Upstart 与包管理器另有真实运行环境，不用普通容器模拟代替服务验收。最终包组合场景验证下载校验→角色→Vault 模板→handler→三机滚动→健康检查→救援；检查实际目标字节、权限、身份及清理。跨架构控制场景单独注明 QEMU 控制端与原生目标，不能代替上述双架构原生执行证据。进度和通过的确切 CI 提交见 DEVELOPMENT_STATUS.md；未通过项不得标为完成。
+
+最终 CI 的 `release-target-evidence-ARCH` 产物保存控制端身份、check 前后快照、各目标的 UID/GID/mode 与 SHA-256、引导目录及异步残留计数和通过遮蔽检查的场景日志。记录不包含解密配置、密码或私钥。
