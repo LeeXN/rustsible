@@ -22,6 +22,8 @@ jobs:
     runs-on: ${{ matrix.runner }}
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
         with:
@@ -48,6 +50,8 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
       - uses: taiki-e/install-action@cargo-audit
       - name: Audit Cargo.lock
         run: cargo audit
@@ -67,6 +71,8 @@ jobs:
     runs-on: ${{ matrix.runner }}
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: ${{ matrix.target }}
@@ -155,6 +161,8 @@ jobs:
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: x86_64-unknown-linux-musl
@@ -191,6 +199,8 @@ jobs:
     runs-on: ${{ matrix.runner }}
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - uses: actions/download-artifact@v4
@@ -207,6 +217,7 @@ jobs:
         run: |
           for arch in x86_64 aarch64; do
             bash scripts/package.sh target/native/native-$arch/rustsible "$RUNNER_TEMP/rustsible-packages/$arch" target/native/native-x86_64/rustsible-worker target/native/native-aarch64/rustsible-worker
+            jq -e --arg source "${{ github.event.pull_request.head.sha || github.sha }}" '.source_commit == $source and .controller.build.build_id == $source and .workers.build_id == $source' "$RUNNER_TEMP/rustsible-packages/$arch/RELEASE.json"
           done
       - name: Build and verify a dual architecture native collection package
         run: |
@@ -251,6 +262,8 @@ jobs:
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - uses: astral-sh/setup-uv@v10.3.3
