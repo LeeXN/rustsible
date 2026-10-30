@@ -15,13 +15,13 @@ Rustsible currently provides:
 - playbook imports, task includes, roles, blocks, variables, loops, conditions, registered results, handlers, and `become` support;
 - ad-hoc module execution;
 - local command execution and remote execution through SSH;
-- playbook support for `command`, `shell`, `debug`, `copy`, `file`, `template`, `lineinfile`, `user`, `service`, `systemd`, `stat`, `get_url`, and `package`;
+- 25 built-in modules, with their exact parameter and capability table in [SUPPORT_MATRIX.md](SUPPORT_MATRIX.md);
 - short module names and the `ansible.builtin.*` / `ansible.legacy.*` name prefixes;
-- playbook `--limit`, `--check`, and `--forks` options.
+- tags, diff, syntax/list inspection, Vault and explicitly authorized native collections.
 
-The default `linear` strategy retains task barriers; `free` lets hosts advance independently. Both bound active host controllers with `--forks` (default 5). Most state-management modules and remote commands assume a POSIX shell, and the `package`, `service`, and `user` modules target Linux-style system tools. Linux is the primary supported and tested platform; Windows support is not claimed.
+The default `linear` strategy retains task barriers; `free` lets hosts advance independently. Both bound active host controllers with `--forks` (default 5). Most state-management modules and remote commands assume a POSIX shell, and the `package`, `service`, and `user` modules target Linux-style system tools. Control and target platforms are Linux x86_64 and aarch64, verified in glibc/musl environments.
 
-Module names and common parameters resemble Ansible, but their complete argument schemas, facts, plugin system, transports, strategy engine, Vault support, and all Ansible edge cases are not implemented. Idempotency and check-mode prediction can also differ from Ansible.
+Compatibility follows the explicitly declared subset of ansible-core 2.21.0 in [SUPPORT_MATRIX.md](SUPPORT_MATRIX.md). Vault and native extensions are implemented within that scope; Python plugins and the full Galaxy ecosystem are not supported. [NATIVE_EXTENSIONS.md](NATIVE_EXTENSIONS.md) documents the interfaces and a complete example collection.
 
 Playbook fact gathering follows the ansible-core 2.21 default: facts are gathered
 unless a play sets `gather_facts: false`. Fact gathering, `stat`, `command`, and
@@ -42,8 +42,7 @@ A single expression preserves its type (`{{ '0012' }}` stays a string); mixed
 text stays text. Only variable definitions resolve references recursively,
 with cycle detection. Runtime results and rendered output are never executed
 again as templates. Conditions must return booleans; the string `'false'` is
-rejected. Use Jinja positional defaults such as `default([])` rather than the
-former Tera spelling `default(value=[])`. Relative `copy.src` and `template.src`
+rejected. Use Jinja positional defaults such as `default([])`. Relative `copy.src` and `template.src`
 paths are anchored to the task's source file, independent of the launch directory.
 
 Inventory host/group variables each use a single typed table. Variable order
@@ -602,7 +601,7 @@ capability policy, dispatcher, and common result conversion. Unsupported keys
 and wrong types fail before dispatch, including during check mode. The check
 policy is read-only for `debug/setup/stat`, predictive for state modules, and
 skip for commands without a safe prediction. Async support follows the module
-capability declarations above. Diff remains unsupported and is rejected.
+capability declarations above. Diff is available on the declared file/artifact modules and is censored by no_log and protected Vault input.
 
 Results distinguish `ok`, `failed`, `skipped`, `unreachable`, and `uncertain`
 through `outcome` and the `failed/skipped/unreachable/uncertain` flags. `rc`, output, and confirmed
@@ -751,12 +750,13 @@ cargo build --workspace --locked
 cargo test --workspace --all-targets --all-features --locked
 cargo llvm-cov --workspace --all-targets --all-features --locked --fail-under-lines 80
 cargo build --workspace --release --all-features --locked
+cargo audit
 ```
 
 To run a focused test, pass its name to Cargo, for example:
 
 ```bash
-cargo test modules::file
+cargo test -p rustsible-protocol extension::tests
 ```
 
 For a staged hands-on acceptance run covering local execution, SSH, check mode,
@@ -814,6 +814,5 @@ Rustsible is available under the [MIT License](LICENSE).
 
 Rustsible is inspired by [Ansible](https://github.com/ansible/ansible) and uses names familiar to Ansible users. It is an independent implementation and is not affiliated with or endorsed by Red Hat or the Ansible project.
 
-Native collections and explicitly configured executable extensions are described in [NATIVE_EXTENSIONS.md](NATIVE_EXTENSIONS.md), with a complete [example collection](examples/native-collection/README.md). Python plugins are rejected; external code is never authorized merely by appearing in a repository.
 
 The declared module parameters, playbook subset, configuration and safety differences are recorded in [SUPPORT_MATRIX.md](SUPPORT_MATRIX.md). Offline packages contain `RELEASE.json` and `SHA256SUMS`; `rustsible build-info` prints the controller identity as JSON without loading configuration or contacting targets.
