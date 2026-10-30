@@ -113,9 +113,11 @@ release_snapshot() {
 release_options=(-i "$fixture_dir/rollout-inventory" --collections-path "$fixture_dir/collections" --vault-id "release@$fixture_dir/vault-password")
 release_snapshot > "$fixture_dir/release-before"
 rustsible playbook "$fixture_dir/release.yml" "${release_options[@]}" --check --diff > "$fixture_dir/release-check.log"
+[[ $(grep -c 'unreachable=0 failed=0 .*rescued=0' "$fixture_dir/release-check.log") == 3 ]]
 release_snapshot > "$fixture_dir/release-after"
 diff -u "$fixture_dir/release-before" "$fixture_dir/release-after"
 rustsible playbook "$fixture_dir/release.yml" "${release_options[@]}" --diff > "$fixture_dir/release-first.log"
+[[ $(grep -c 'unreachable=0 failed=0 .*rescued=0' "$fixture_dir/release-first.log") == 3 ]]
 rustsible playbook "$fixture_dir/release.yml" "${release_options[@]}" --diff > "$fixture_dir/release-second.log"
 [[ $(grep -c 'changed=0 unreachable=0 failed=0' "$fixture_dir/release-second.log") == 3 ]]
 for index in 0 1 2; do
@@ -134,6 +136,8 @@ done
 # Failure happens after deployment and the real reload. Rescue must restore the
 # previous protected config, reload it, and let the remaining host finish.
 rustsible playbook "$fixture_dir/release.yml" "${release_options[@]}" -e deployment_version=release-v2 -e failure_host=node2 > "$fixture_dir/release-rescue.log"
+grep -Eq '^node2[[:space:]]+.*unreachable=0 failed=0 .*rescued=1' "$fixture_dir/release-rescue.log"
+[[ $(grep -c 'unreachable=0 failed=0 .*rescued=0' "$fixture_dir/release-rescue.log") == 2 ]]
 for index in 0 1 2; do
     server=${rollout_containers[$index]}; name=node$((index + 1)); version=release-v2
     if (( index == 1 )); then version=release-v1; fi
