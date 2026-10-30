@@ -1,4 +1,4 @@
-# This runs only extracted release binaries. All servers use the native runner
+# CI supplies extracted release binaries. All servers use the native runner
 # architecture; controller emulation is a separate, explicitly named CI case.
 source "$repo_dir/tests/ssh/rollout-setup.sh"
 collection_source=$(realpath -- "$6")
@@ -190,10 +190,10 @@ rustsible playbook "$fixture_dir/query/status.yml" -i "$fixture_dir/query/invent
 for server in "${rollout_containers[@]}"; do
     docker exec "$server" sh -eu -c '
         [ -z "$(find /tmp -name ".rustsible-worker-*")" ]
-        for home in /root /home/deploy /home/app; do
-            if [ -d "$home/.rustsible_async" ]; then [ -z "$(ls -A "$home/.rustsible_async")" ]; fi
+        for job_home in /root /home/deploy /home/app; do
+            if [ -d "$job_home/.rustsible_async" ]; then [ -z "$(ls -A "$job_home/.rustsible_async")" ]; fi
         done
     '
 done
 if grep -Eq 'release-secret-canary|release-vault-password' "$fixture_dir"/release-*.log; then echo 'Protected release input leaked into output' >&2; exit 1; fi
-printf 'Extracted release deployment passed: native %s/%s, three SSH servers, identities, checksum, roles, Vault, handlers, rolling, health, rescue, async and cleanup\n' "$target_arch" "$libc"
+printf 'Release deployment scenario passed: native %s/%s, three SSH servers, identities, checksum, roles, Vault, handlers, rolling, health, rescue, async and cleanup\n' "$target_arch" "$libc"
