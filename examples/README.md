@@ -22,7 +22,7 @@ examples/
 ```
 
 `test_all_features.yml` 和 `test_package.yml` 是迁移审查素材，刻意保留了
-`group` 等尚未实现的 Ansible 功能，当前会被明确拒绝。其余文件
+`file.recurse` 参数和 `regex_replace` 过滤器等当前未支持的功能，不能视为可运行验收。其余文件
 用于当前子集的示例，但也不构成完整兼容性保证。遇到不支持的模块、关键字或表达式时，
 Rustsible 会返回错误，而不会静默忽略。
 
@@ -102,3 +102,5 @@ rustsible playbook examples/vault.yml -i examples/inventory/hosts --limit localh
 - `package`、`service` 和 `user` 会调用目标系统工具，通常需要 `become`。
 - `--check` 是最佳努力的预测，不替代隔离环境中的实际验证。
 - 修改用户、服务、软件包或 `/etc` 下文件前，请准备可恢复方案。
+
+`native-collection/` 提供 module/inventory/lookup/filter、角色及 playbook 的完整原生集合，构建、打包和显式安装步骤见其 README。

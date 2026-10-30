@@ -9,7 +9,7 @@
 建议准备：
 
 - 控制机：当前稳定版 Rust、`cargo-audit`、`cargo-llvm-cov`；
-- 本地目标：Linux/macOS 上的 `localhost`；
+- 本地目标：Linux 上的 `localhost`；
 - 远程目标：至少两台一次性 Linux VM，用于 SSH、并发和 host pattern；
 - 普通 SSH 用户、可用的 sudo 配置、已人工核验的 SSH host-key 指纹；
 - 每一步保存命令、退出码、stdout/stderr 和目标机变更前后状态。
@@ -18,10 +18,14 @@
 
 ```bash
 cargo fmt --all -- --check
-cargo clippy --all-targets --all-features --locked -- -D warnings
-cargo test --all-targets --all-features --locked
-cargo build --release --all-features --locked
-target/release/rustsible --version
+cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
+cargo build --workspace --all-features --locked
+cargo test --workspace --all-targets --all-features --locked
+cargo llvm-cov --workspace --all-targets --all-features --locked --fail-under-lines 80
+cargo build --workspace --release --all-features --locked
+cargo audit
+cargo run --locked -p rustsible-protocol --example worker_manifest -- target/release/workers "$(uname -m)=target/release/rustsible-worker"
+target/release/rustsible build-info
 ```
 
 预期：所有命令退出码为 0，release 二进制位于
@@ -272,3 +276,9 @@ target/release/rustsible ad-hoc manual_remote -i /tmp/manual-remote.ini \
 target/release/rustsible playbook examples/manual/cleanup-local.yml \
   -i examples/manual/inventory-local.ini
 ```
+
+## 最终发布组合验收
+
+完整支持范围见 [SUPPORT_MATRIX.md](SUPPORT_MATRIX.md)。CI 在两个原生架构的 runner 上从最终压缩包解包启动控制端，逐项检查 `RELEASE.json`、`SHA256SUMS`、三台 SSH 主机与三种身份、首次部署/幂等/check、Vault、原生集合、下载校验、handler、滚动发布、健康检查、失败救援、异步查询及清理。脚本在 `tests/ssh/release.sh`；准备静态 HTTP fixture 和示例集合后，通过 `tests/ssh/run.sh CONTROLLER WORKERS release LIBC HTTP_FIXTURE COLLECTION_SOURCE` 运行。
+
+`tests/ssh/cross.sh` 单独记录 QEMU 外架构控制端操作原生 SSH 目标的证据；这种模拟控制端的组合场景不能代替双架构原生执行。双架构与完整发布证据以确切 CI 提交为准，进度见 [DEVELOPMENT_STATUS.md](DEVELOPMENT_STATUS.md)，没有通过的步骤不能计作完成。

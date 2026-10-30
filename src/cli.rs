@@ -7,6 +7,7 @@ pub fn build_cli() -> Command {
         .subcommand_required(true)
         .arg_required_else_help(true)
         .args(vault_args())
+        .subcommand(Command::new("build-info").about("Print release build identity as JSON without loading configuration"))
         .subcommand(vault_command())
         .subcommand(collection_command())
         .arg(

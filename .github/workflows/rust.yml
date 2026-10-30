@@ -22,6 +22,8 @@ jobs:
     runs-on: ${{ matrix.runner }}
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
         with:
@@ -48,6 +50,8 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
       - uses: taiki-e/install-action@cargo-audit
       - name: Audit Cargo.lock
         run: cargo audit
@@ -67,6 +71,8 @@ jobs:
     runs-on: ${{ matrix.runner }}
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: ${{ matrix.target }}
@@ -146,6 +152,7 @@ jobs:
             target/${{ matrix.target }}/release/rustsible
             target/${{ matrix.target }}/release/rustsible-worker
             target/${{ matrix.target }}/release/rustsible-example-extension
+            target/${{ matrix.target }}/release/examples/http_fixture
           if-no-files-found: error
 
   system-tools:
@@ -154,6 +161,8 @@ jobs:
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: x86_64-unknown-linux-musl
@@ -175,21 +184,41 @@ jobs:
         run: bash tests/managers/upstart.sh target/native/rustsible target/workers target/x86_64-unknown-linux-musl/release/examples/http_fixture
 
   offline-packages:
-    name: Dual architecture offline packages
-    needs: [quality, ssh]
-    runs-on: ubuntu-24.04
+    name: Final offline deployment (${{ matrix.arch }})
+    # SSH jobs produce the binaries consumed by these scenarios.
+    needs: ssh
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-24.04
+            arch: x86_64
+            other: aarch64
+          - runner: ubuntu-24.04-arm
+            arch: aarch64
+            other: x86_64
+    runs-on: ${{ matrix.runner }}
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - uses: actions/download-artifact@v4
         with:
           pattern: native-*
           path: target/native
+      - name: Restore executable mode on downloaded acceptance fixtures
+        run: chmod +x target/native/native-*/examples/http_fixture
+      - name: Enable the explicitly emulated foreign controller case
+        uses: docker/setup-qemu-action@v3
+        with:
+          platforms: arm64,amd64
       - name: Package both controllers with both static workers
         run: |
           for arch in x86_64 aarch64; do
             bash scripts/package.sh target/native/native-$arch/rustsible "$RUNNER_TEMP/rustsible-packages/$arch" target/native/native-x86_64/rustsible-worker target/native/native-aarch64/rustsible-worker
+            jq -e --arg source "${{ github.event.pull_request.head.sha || github.sha }}" '.source_commit == $source and .controller.build.build_id == $source and .workers.build_id == $source' "$RUNNER_TEMP/rustsible-packages/$arch/RELEASE.json"
           done
       - name: Build and verify a dual architecture native collection package
         run: |
@@ -200,9 +229,9 @@ jobs:
       - name: Run the extracted package offline without Python or curl
         run: |
           mkdir "$RUNNER_TEMP/rustsible-extracted"
-          tar -xzf "$RUNNER_TEMP/rustsible-packages/x86_64.tar.gz" -C "$RUNNER_TEMP/rustsible-extracted"
+          tar -xzf "$RUNNER_TEMP/rustsible-packages/${{ matrix.arch }}.tar.gz" -C "$RUNNER_TEMP/rustsible-extracted"
           docker pull alpine:3.22
-          docker run --rm --network none --mount type=bind,src="$RUNNER_TEMP/rustsible-extracted/x86_64",dst=/release,readonly --mount type=bind,src="$RUNNER_TEMP/rustsible-packages/example.native-0.1.0.tar.gz",dst=/native.tar.gz,readonly alpine:3.22 sh -eu -c '
+          docker run --rm --network none --mount type=bind,src="$RUNNER_TEMP/rustsible-extracted/${{ matrix.arch }}",dst=/release,readonly --mount type=bind,src="$RUNNER_TEMP/rustsible-packages/example.native-0.1.0.tar.gz",dst=/native.tar.gz,readonly alpine:3.22 sh -eu -c '
             ! command -v python3
             ! command -v curl
             cd /release
@@ -214,9 +243,27 @@ jobs:
             ./rustsible ad-hoc localhost -m example.native.probe -a "path=/etc/passwd" -i /tmp/inventory --collections-path /tmp/collections
             [ -z "$(find /tmp -name ".rustsible-worker-*")" ]
           '
+      - name: Full deployment from the extracted native release (glibc and musl)
+        env:
+          RUSTSIBLE_ACCEPTANCE_OUTPUT: ${{ runner.temp }}/rustsible-acceptance
+        run: |
+          for libc in glibc musl; do
+            bash tests/ssh/run.sh "$RUNNER_TEMP/rustsible-extracted/${{ matrix.arch }}/rustsible" "$RUNNER_TEMP/rustsible-extracted/${{ matrix.arch }}/workers" release "$libc" "target/native/native-${{ matrix.arch }}/examples/http_fixture" "$RUNNER_TEMP/native-example"
+          done
+      - name: Foreign controller operates a native target using the other worker architecture
+        env:
+          RUSTSIBLE_ACCEPTANCE_OUTPUT: ${{ runner.temp }}/rustsible-acceptance
+        run: |
+          tar -xzf "$RUNNER_TEMP/rustsible-packages/${{ matrix.other }}.tar.gz" -C "$RUNNER_TEMP/rustsible-extracted"
+          bash tests/ssh/run.sh "$RUNNER_TEMP/rustsible-extracted/${{ matrix.other }}/rustsible" "$RUNNER_TEMP/rustsible-extracted/${{ matrix.other }}/workers" cross glibc "${{ matrix.other }}"
       - uses: actions/upload-artifact@v4
         with:
-          name: offline-linux-packages
+          name: release-target-evidence-${{ matrix.arch }}
+          path: ${{ runner.temp }}/rustsible-acceptance
+          if-no-files-found: error
+      - uses: actions/upload-artifact@v4
+        with:
+          name: offline-linux-packages-${{ matrix.arch }}
           path: ${{ runner.temp }}/rustsible-packages/*.tar.gz
           if-no-files-found: error
 
@@ -225,6 +272,8 @@ jobs:
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - uses: astral-sh/setup-uv@v10.3.3
